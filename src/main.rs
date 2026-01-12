@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -25,6 +26,8 @@ struct App {
     cmd_tx: Option<mpsc::Sender<state::ProviderCommand>>,
     upcoming_refresh: Duration,
     last_upcoming_refresh: Instant,
+    detail_refresh: Duration,
+    last_detail_refresh: HashMap<String, Instant>,
 }
 
 impl App {
@@ -34,12 +37,19 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(60)
             .max(10);
+        let detail_refresh = std::env::var("DETAILS_POLL_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(30);
         Self {
             state: AppState::new(),
             should_quit: false,
             cmd_tx,
             upcoming_refresh: Duration::from_secs(upcoming_refresh),
             last_upcoming_refresh: Instant::now(),
+            detail_refresh: Duration::from_secs(detail_refresh),
+            last_detail_refresh: HashMap::new(),
         }
     }
 
@@ -51,7 +61,7 @@ impl App {
                 let match_id = self.state.selected_match_id();
                 if self.state.pulse_view == PulseView::Live {
                     self.state.screen = Screen::Terminal { match_id };
-                    self.request_match_details();
+                    self.request_match_details(true);
                 }
             }
             KeyCode::Char('b') | KeyCode::Esc => self.state.screen = Screen::Pulse,
@@ -71,28 +81,44 @@ impl App {
                     self.request_upcoming(true);
                 }
             }
-            KeyCode::Char('i') | KeyCode::Char('I') => self.request_match_details(),
+            KeyCode::Char('i') | KeyCode::Char('I') => self.request_match_details(true),
             KeyCode::Char('?') => self.state.help_overlay = !self.state.help_overlay,
             _ => {}
         }
     }
 
-    fn request_match_details(&mut self) {
+    fn request_match_details(&mut self, announce: bool) {
         let Some(match_id) = self.state.selected_match_id() else {
-            self.state.push_log("[INFO] No match selected for details");
+            if announce {
+                self.state.push_log("[INFO] No match selected for details");
+            }
             return;
         };
+        self.request_match_details_for(&match_id, announce);
+    }
+
+    fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
         let Some(tx) = &self.cmd_tx else {
-            self.state.push_log("[INFO] Match details fetch unavailable");
+            if announce {
+                self.state.push_log("[INFO] Match details fetch unavailable");
+            }
             return;
         };
         if tx
-            .send(state::ProviderCommand::FetchMatchDetails { fixture_id: match_id })
+            .send(state::ProviderCommand::FetchMatchDetails {
+                fixture_id: match_id.to_string(),
+            })
             .is_err()
         {
-            self.state.push_log("[WARN] Match details request failed");
+            if announce {
+                self.state.push_log("[WARN] Match details request failed");
+            }
         } else {
-            self.state.push_log("[INFO] Match details request sent");
+            if announce {
+                self.state.push_log("[INFO] Match details request sent");
+            }
+            self.last_detail_refresh
+                .insert(match_id.to_string(), Instant::now());
         }
     }
 
@@ -124,6 +150,35 @@ impl App {
         }
         if self.last_upcoming_refresh.elapsed() >= self.upcoming_refresh {
             self.request_upcoming(false);
+        }
+    }
+
+    fn maybe_refresh_match_details(&mut self) {
+        match self.state.screen {
+            Screen::Pulse => {
+                if self.state.pulse_view != PulseView::Live {
+                    return;
+                }
+            }
+            Screen::Terminal { .. } => {}
+        }
+
+        let live_matches: Vec<String> = self
+            .state
+            .filtered_matches()
+            .into_iter()
+            .filter(|m| m.is_live)
+            .map(|m| m.id.clone())
+            .collect();
+
+        for match_id in live_matches {
+            let last = self.last_detail_refresh.get(&match_id);
+            let should_fetch = last
+                .map(|t| t.elapsed() >= self.detail_refresh)
+                .unwrap_or(true);
+            if should_fetch {
+                self.request_match_details_for(&match_id, false);
+            }
         }
     }
 }
@@ -173,6 +228,7 @@ fn run_app<B: Backend>(
         }
 
         app.maybe_refresh_upcoming();
+        app.maybe_refresh_match_details();
 
         terminal.draw(|f| ui(f, app))?;
 

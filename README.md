@@ -28,6 +28,7 @@ Key variables:
 - `UPCOMING_POLL_SECS`: Minimum seconds between manual upcoming fetches.
 - `UPCOMING_DATE`: Optional matchday override (YYYYMMDD) for upcoming list.
 - `UPCOMING_WINDOW_DAYS`: Number of days to fetch (1-14). Use 7 for a full weekend slate.
+- `DETAILS_POLL_SECS`: Auto-refresh interval for match details (lineups/events/stats) when live.
 
 Notes:
 
