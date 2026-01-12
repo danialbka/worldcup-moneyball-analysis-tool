@@ -154,15 +154,6 @@ impl App {
     }
 
     fn maybe_refresh_match_details(&mut self) {
-        match self.state.screen {
-            Screen::Pulse => {
-                if self.state.pulse_view != PulseView::Live {
-                    return;
-                }
-            }
-            Screen::Terminal { .. } => {}
-        }
-
         let live_matches: Vec<String> = self
             .state
             .filtered_matches()
