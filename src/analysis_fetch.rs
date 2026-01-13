@@ -490,19 +490,33 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
             .collect(),
     });
 
+    let season_top_items = parsed
+        .first_season_stats
+        .as_ref()
+        .and_then(|season| {
+            season
+                .top_stat_card
+                .as_ref()
+                .and_then(|card| card.items.as_ref())
+        })
+        .cloned()
+        .unwrap_or_default();
+
+    let all_competitions = if !season_top_items.is_empty() {
+        season_top_items
+            .iter()
+            .map(|stat| PlayerStatItem {
+                title: stat.title.clone(),
+                value: value_to_string(&stat.stat_value),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     let top_items = match parsed.top_stat_card.and_then(|card| card.items) {
         Some(items) if !items.is_empty() => items,
-        _ => parsed
-            .first_season_stats
-            .as_ref()
-            .and_then(|season| {
-                season
-                    .top_stat_card
-                    .as_ref()
-                    .and_then(|card| card.items.as_ref())
-            })
-            .cloned()
-            .unwrap_or_default(),
+        _ => season_top_items,
     };
 
     let top_stats = top_items
@@ -595,6 +609,8 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         shirt: info_map.get("Shirt").cloned(),
         market_value: info_map.get("Market value").cloned(),
         contract_end: info_map.get("Contract end").cloned(),
+        all_competitions,
+        all_competitions_season: main_league.as_ref().map(|league| league.season.clone()),
         main_league,
         top_stats,
         season_groups,

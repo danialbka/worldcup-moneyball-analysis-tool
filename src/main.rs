@@ -1063,7 +1063,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     render_detail_section(
         frame,
         sections[1],
-        "League Stats",
+        "All Competitions",
         &league_text,
         state.player_detail_section_scrolls[1],
         state.player_detail_section == 1,
@@ -1072,7 +1072,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     render_detail_section(
         frame,
         sections[2],
-        "Top Stats",
+        "Top Stats (All Competitions)",
         &top_text,
         state.player_detail_section_scrolls[2],
         state.player_detail_section == 2,
@@ -1108,7 +1108,8 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn player_detail_has_stats(detail: &PlayerDetail) -> bool {
-    detail.main_league.is_some()
+    !detail.all_competitions.is_empty()
+        || detail.main_league.is_some()
         || !detail.top_stats.is_empty()
         || !detail.season_groups.is_empty()
         || detail
@@ -1170,12 +1171,16 @@ fn player_info_text(detail: &PlayerDetail) -> String {
 }
 
 fn player_league_stats_text(detail: &PlayerDetail) -> String {
-    let Some(league) = &detail.main_league else {
-        return "No league stats".to_string();
-    };
+    if detail.all_competitions.is_empty() {
+        return "No all-competitions stats".to_string();
+    }
     let mut lines = Vec::new();
-    lines.push(format!("{} ({})", league.league_name, league.season));
-    for stat in league.stats.iter().take(8) {
+    let season_label = detail
+        .all_competitions_season
+        .as_deref()
+        .unwrap_or("-");
+    lines.push(format!("All competitions ({season_label})"));
+    for stat in detail.all_competitions.iter().take(8) {
         lines.push(format!("{}: {}", stat.title, stat.value));
     }
     lines.join("\n")
@@ -1183,7 +1188,7 @@ fn player_league_stats_text(detail: &PlayerDetail) -> String {
 
 fn player_top_stats_text(detail: &PlayerDetail) -> String {
     if detail.top_stats.is_empty() {
-        return "No top stats".to_string();
+        return "No all-competitions top stats".to_string();
     }
     let mut lines = Vec::new();
     for stat in detail.top_stats.iter().take(8) {

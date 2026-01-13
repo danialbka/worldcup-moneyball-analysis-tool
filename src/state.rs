@@ -537,6 +537,8 @@ pub struct PlayerDetail {
     pub shirt: Option<String>,
     pub market_value: Option<String>,
     pub contract_end: Option<String>,
+    pub all_competitions: Vec<PlayerStatItem>,
+    pub all_competitions_season: Option<String>,
     pub main_league: Option<PlayerLeagueStats>,
     pub top_stats: Vec<PlayerStatItem>,
     pub season_groups: Vec<PlayerStatGroup>,
