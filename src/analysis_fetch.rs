@@ -281,10 +281,7 @@ const WORLD_CUP_TEAMS: &[NationInfo] = &[
 
 pub fn fetch_worldcup_team_analysis() -> AnalysisFetch {
     let mut errors = Vec::new();
-    let client = match Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
+    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
         Ok(client) => client,
         Err(err) => {
             errors.push(format!("analysis client build failed: {err}"));
@@ -544,7 +541,11 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         })
         .collect::<Vec<_>>();
 
-    let season_items = match parsed.stats_section.and_then(|section| section.items) {
+    let season_items = match parsed
+        .stats_section
+        .as_ref()
+        .and_then(|section| section.items.clone())
+    {
         Some(items) if !items.is_empty() => items,
         _ => parsed
             .first_season_stats
@@ -553,16 +554,30 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
                 season
                     .stats_section
                     .as_ref()
-                    .and_then(|section| section.items.as_ref())
+                    .and_then(|section| section.items.clone())
             })
-            .cloned()
             .unwrap_or_default(),
     };
 
+    let season_items = season_items
+        .into_iter()
+        .filter(|group| {
+            group
+                .items
+                .as_ref()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
     let season_groups = season_items
         .into_iter()
-        .filter_map(|group| {
-            let title = group.title?;
+        .enumerate()
+        .filter_map(|(idx, group)| {
+            let title = group
+                .title
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| format!("Stats Group {}", idx + 1));
             let items = group
                 .items
                 .unwrap_or_default()
@@ -666,12 +681,13 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
                         .and_then(|r| r.rating.as_ref())
                         .map(value_to_string)
                         .unwrap_or_else(|| "-".to_string());
+                    let rating = normalize_stat_cell(rating);
                     crate::state::PlayerSeasonTournamentStat {
                         league: stat.league_name.clone(),
                         season: stat.season_name.clone(),
-                        appearances: empty_to_dash(stat.appearances.clone()),
-                        goals: empty_to_dash(stat.goals.clone()),
-                        assists: empty_to_dash(stat.assists.clone()),
+                        appearances: normalize_stat_cell(stat.appearances.clone()),
+                        goals: normalize_stat_cell(stat.goals.clone()),
+                        assists: normalize_stat_cell(stat.assists.clone()),
                         rating,
                     }
                 })
@@ -801,6 +817,15 @@ fn empty_to_dash(value: String) -> String {
     }
 }
 
+fn normalize_stat_cell(value: String) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        "-".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TeamSquadResponse {
     details: TeamSquadDetails,
@@ -892,9 +917,9 @@ struct PlayerCareerHistory {
 
 #[derive(Debug, Deserialize)]
 struct PlayerCareerCategory {
-    #[serde(rename = "teamEntries", default)]
+    #[serde(rename = "teamEntries", default, deserialize_with = "vec_or_default")]
     team_entries: Vec<PlayerCareerTeamEntry>,
-    #[serde(rename = "seasonEntries", default)]
+    #[serde(rename = "seasonEntries", default, deserialize_with = "vec_or_default")]
     season_entries: Vec<PlayerCareerSeasonEntry>,
 }
 
