@@ -477,6 +477,23 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         }
     }
 
+    let positions = parsed
+        .position_description
+        .as_ref()
+        .map(|desc| {
+            desc.positions
+                .iter()
+                .map(|pos| {
+                    if pos.is_main_position {
+                        format!("{} (primary)", pos.str_pos.label)
+                    } else {
+                        pos.str_pos.label.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     let main_league = parsed.main_league.map(|league| PlayerLeagueStats {
         league_name: league.league_name,
         season: league.season,
@@ -595,6 +612,98 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         })
         .collect::<Vec<_>>();
 
+    let career_sections = parsed
+        .career_history
+        .as_ref()
+        .and_then(|history| history.career_items.as_ref())
+        .map(|items| {
+            let mut ordered = Vec::new();
+            for key in ["senior", "national team", "youth"] {
+                if let Some(section) = items.get(key) {
+                    ordered.push((key.to_string(), section));
+                }
+            }
+            for (key, section) in items.iter() {
+                if !ordered.iter().any(|(title, _)| title == key) {
+                    ordered.push((key.clone(), section));
+                }
+            }
+            ordered
+                .into_iter()
+                .map(|(title, section)| crate::state::PlayerCareerSection {
+                    title,
+                    entries: section
+                        .team_entries
+                        .iter()
+                        .map(|entry| crate::state::PlayerCareerEntry {
+                            team: entry.team.clone(),
+                            start_date: entry.start_date.clone(),
+                            end_date: entry.end_date.clone(),
+                            appearances: entry.appearances.clone(),
+                            goals: entry.goals.clone(),
+                            assists: entry.assists.clone(),
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let season_breakdown = parsed
+        .career_history
+        .as_ref()
+        .and_then(|history| history.career_items.as_ref())
+        .and_then(|items| items.get("senior"))
+        .and_then(|section| section.season_entries.first())
+        .map(|season| {
+            season
+                .tournament_stats
+                .iter()
+                .map(|stat| {
+                    let rating = stat
+                        .rating
+                        .as_ref()
+                        .and_then(|r| r.rating.as_ref())
+                        .map(value_to_string)
+                        .unwrap_or_else(|| "-".to_string());
+                    crate::state::PlayerSeasonTournamentStat {
+                        league: stat.league_name.clone(),
+                        season: stat.season_name.clone(),
+                        appearances: empty_to_dash(stat.appearances.clone()),
+                        goals: empty_to_dash(stat.goals.clone()),
+                        assists: empty_to_dash(stat.assists.clone()),
+                        rating,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let trophies = parsed
+        .trophies
+        .map(|trophies| {
+            trophies
+                .player_trophies
+                .into_iter()
+                .flat_map(|team| {
+                    team.tournaments.into_iter().map(move |tournament| {
+                        crate::state::PlayerTrophyEntry {
+                            team: team.team_name.clone(),
+                            league: tournament.league_name,
+                            seasons_won: tournament.seasons_won,
+                            seasons_runner_up: tournament.seasons_runner_up,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let contract_end = info_map
+        .get("Contract end")
+        .cloned()
+        .or_else(|| parsed.contract_end.map(|d| d.utc_time));
+
     Ok(PlayerDetail {
         id: parsed.id,
         name: parsed.name,
@@ -608,7 +717,12 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         preferred_foot: info_map.get("Preferred foot").cloned(),
         shirt: info_map.get("Shirt").cloned(),
         market_value: info_map.get("Market value").cloned(),
-        contract_end: info_map.get("Contract end").cloned(),
+        contract_end,
+        birth_date: parsed.birth_date.map(|d| d.utc_time),
+        status: parsed.status,
+        injury_info: optional_info_string(parsed.injury_information.as_ref()),
+        international_duty: optional_info_string(parsed.international_duty.as_ref()),
+        positions,
         all_competitions,
         all_competitions_season: main_league.as_ref().map(|league| league.season.clone()),
         main_league,
@@ -616,6 +730,9 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         season_groups,
         traits,
         recent_matches,
+        season_breakdown,
+        career_sections,
+        trophies,
     })
 }
 
@@ -638,6 +755,16 @@ fn info_value_to_string(value: &serde_json::Value) -> String {
         }
         serde_json::Value::Null => "-".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn optional_info_string(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    let rendered = info_value_to_string(value);
+    if rendered == "-" || rendered == "null" {
+        None
+    } else {
+        Some(rendered)
     }
 }
 
@@ -720,12 +847,19 @@ struct SquadRole {
 struct PlayerDataResponse {
     id: u32,
     name: String,
+    #[serde(rename = "birthDate")]
+    birth_date: Option<PlayerDate>,
+    #[serde(rename = "contractEnd")]
+    contract_end: Option<PlayerDate>,
     #[serde(rename = "primaryTeam")]
     primary_team: Option<PlayerTeam>,
     #[serde(rename = "positionDescription")]
     position_description: Option<PlayerPositionDescription>,
     #[serde(rename = "playerInformation")]
     player_information: Option<Vec<PlayerInfoRow>>,
+    #[serde(rename = "careerHistory")]
+    career_history: Option<PlayerCareerHistory>,
+    trophies: Option<PlayerTrophies>,
     #[serde(rename = "mainLeague")]
     main_league: Option<PlayerLeague>,
     #[serde(rename = "topStatCard")]
@@ -737,6 +871,95 @@ struct PlayerDataResponse {
     traits: Option<PlayerTraits>,
     #[serde(rename = "recentMatches")]
     recent_matches: Option<Vec<PlayerRecentMatch>>,
+    status: Option<String>,
+    #[serde(rename = "injuryInformation")]
+    injury_information: Option<serde_json::Value>,
+    #[serde(rename = "internationalDuty")]
+    international_duty: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerDate {
+    #[serde(rename = "utcTime")]
+    utc_time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerCareerHistory {
+    #[serde(rename = "careerItems")]
+    career_items: Option<std::collections::HashMap<String, PlayerCareerCategory>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerCareerCategory {
+    #[serde(rename = "teamEntries", default)]
+    team_entries: Vec<PlayerCareerTeamEntry>,
+    #[serde(rename = "seasonEntries", default)]
+    season_entries: Vec<PlayerCareerSeasonEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerCareerTeamEntry {
+    team: String,
+    #[serde(rename = "startDate")]
+    start_date: Option<String>,
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
+    appearances: Option<String>,
+    goals: Option<String>,
+    assists: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerCareerSeasonEntry {
+    #[serde(rename = "seasonName")]
+    season_name: String,
+    #[serde(rename = "tournamentStats", default)]
+    tournament_stats: Vec<PlayerTournamentStat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerTournamentStat {
+    #[serde(rename = "leagueName")]
+    league_name: String,
+    #[serde(rename = "seasonName")]
+    season_name: String,
+    #[serde(default)]
+    goals: String,
+    #[serde(default)]
+    assists: String,
+    #[serde(default)]
+    appearances: String,
+    rating: Option<PlayerRating>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerRating {
+    rating: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerTrophies {
+    #[serde(rename = "playerTrophies", default)]
+    player_trophies: Vec<PlayerTrophyTeam>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerTrophyTeam {
+    #[serde(rename = "teamName")]
+    team_name: String,
+    #[serde(default)]
+    tournaments: Vec<PlayerTrophyTournament>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerTrophyTournament {
+    #[serde(rename = "leagueName")]
+    league_name: String,
+    #[serde(rename = "seasonsWon", default)]
+    seasons_won: Vec<String>,
+    #[serde(rename = "seasonsRunnerUp", default)]
+    seasons_runner_up: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -757,11 +980,21 @@ struct PlayerTeam {
 struct PlayerPositionDescription {
     #[serde(rename = "primaryPosition")]
     primary_position: Option<PlayerPosition>,
+    #[serde(default)]
+    positions: Vec<PlayerPositionSummary>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PlayerPosition {
     label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerPositionSummary {
+    #[serde(rename = "strPos")]
+    str_pos: PlayerPosition,
+    #[serde(rename = "isMainPosition")]
+    is_main_position: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1024,6 +1024,9 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let top_text = player_top_stats_text(detail);
     let traits_text = player_traits_text(detail);
     let other_text = player_other_stats_text(detail);
+    let season_text = player_season_breakdown_text(detail);
+    let career_text = player_career_text(detail);
+    let trophies_text = player_trophies_text(detail);
     let recent_text = player_recent_matches_text(detail);
 
     let info_lines = text_line_count(&info_text);
@@ -1031,29 +1034,40 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let top_lines = text_line_count(&top_text);
     let traits_lines = text_line_count(&traits_text);
     let other_lines = text_line_count(&other_text);
+    let season_lines = text_line_count(&season_text);
+    let career_lines = text_line_count(&career_text);
+    let trophies_lines = text_line_count(&trophies_text);
     let recent_lines = text_line_count(&recent_text);
 
-    let info_height = text_block_height_from_lines(info_lines, 8);
-    let league_height = text_block_height_from_lines(league_lines, 7);
-    let top_height = text_block_height_from_lines(top_lines, 7);
-    let traits_height = text_block_height_from_lines(traits_lines, 7);
-    let other_height = text_block_height_from_lines(other_lines, 9);
+    let left = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
 
-    let sections = Layout::default()
+    let left_sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(info_height),
-            Constraint::Length(league_height),
-            Constraint::Length(top_height),
-            Constraint::Length(traits_height),
-            Constraint::Length(other_height),
+            Constraint::Length(text_block_height_from_lines(info_lines, 8)),
+            Constraint::Length(text_block_height_from_lines(league_lines, 7)),
+            Constraint::Length(text_block_height_from_lines(top_lines, 7)),
+            Constraint::Length(text_block_height_from_lines(traits_lines, 7)),
             Constraint::Min(3),
         ])
-        .split(inner);
+        .split(left[0]);
+
+    let right_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(text_block_height_from_lines(season_lines, 9)),
+            Constraint::Length(text_block_height_from_lines(career_lines, 9)),
+            Constraint::Length(text_block_height_from_lines(trophies_lines, 7)),
+            Constraint::Min(3),
+        ])
+        .split(left[1]);
 
     render_detail_section(
         frame,
-        sections[0],
+        left_sections[0],
         "Player Info",
         &info_text,
         state.player_detail_section_scrolls[0],
@@ -1062,7 +1076,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     render_detail_section(
         frame,
-        sections[1],
+        left_sections[1],
         "All Competitions",
         &league_text,
         state.player_detail_section_scrolls[1],
@@ -1071,7 +1085,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     render_detail_section(
         frame,
-        sections[2],
+        left_sections[2],
         "Top Stats (All Competitions)",
         &top_text,
         state.player_detail_section_scrolls[2],
@@ -1080,7 +1094,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     render_detail_section(
         frame,
-        sections[3],
+        left_sections[3],
         "Player Traits",
         &traits_text,
         state.player_detail_section_scrolls[3],
@@ -1089,20 +1103,48 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     render_detail_section(
         frame,
-        sections[4],
+        left_sections[4],
         "Other Stats",
         &other_text,
         state.player_detail_section_scrolls[4],
         state.player_detail_section == 4,
         other_lines,
     );
+
     render_detail_section(
         frame,
-        sections[5],
-        "Match Stats (Recent)",
-        &recent_text,
+        right_sections[0],
+        "Season Breakdown",
+        &season_text,
         state.player_detail_section_scrolls[5],
         state.player_detail_section == 5,
+        season_lines,
+    );
+    render_detail_section(
+        frame,
+        right_sections[1],
+        "Career Summary",
+        &career_text,
+        state.player_detail_section_scrolls[6],
+        state.player_detail_section == 6,
+        career_lines,
+    );
+    render_detail_section(
+        frame,
+        right_sections[2],
+        "Trophies",
+        &trophies_text,
+        state.player_detail_section_scrolls[7],
+        state.player_detail_section == 7,
+        trophies_lines,
+    );
+    render_detail_section(
+        frame,
+        right_sections[3],
+        "Match Stats (Recent)",
+        &recent_text,
+        state.player_detail_section_scrolls[8],
+        state.player_detail_section == 8,
         recent_lines,
     );
 }
@@ -1118,6 +1160,9 @@ fn player_detail_has_stats(detail: &PlayerDetail) -> bool {
             .map(|traits| !traits.items.is_empty())
             .unwrap_or(false)
         || !detail.recent_matches.is_empty()
+        || !detail.season_breakdown.is_empty()
+        || !detail.career_sections.is_empty()
+        || !detail.trophies.is_empty()
 }
 
 fn player_detail_text(detail: &PlayerDetail) -> String {
@@ -1131,6 +1176,12 @@ fn player_detail_text(detail: &PlayerDetail) -> String {
     lines.push(player_traits_text(detail));
     lines.push(String::new());
     lines.push(player_other_stats_text(detail));
+    lines.push(String::new());
+    lines.push(player_season_breakdown_text(detail));
+    lines.push(String::new());
+    lines.push(player_career_text(detail));
+    lines.push(String::new());
+    lines.push(player_trophies_text(detail));
     lines.push(String::new());
     lines.push(player_recent_matches_text(detail));
     lines.join("\n")
@@ -1165,7 +1216,22 @@ fn player_info_text(detail: &PlayerDetail) -> String {
         lines.push(format!("Market value: {value}"));
     }
     if let Some(contract_end) = &detail.contract_end {
-        lines.push(format!("Contract end: {contract_end}"));
+        lines.push(format!("Contract end: {}", shorten_date(contract_end)));
+    }
+    if let Some(birth_date) = &detail.birth_date {
+        lines.push(format!("Birth date: {}", shorten_date(birth_date)));
+    }
+    if let Some(status) = &detail.status {
+        lines.push(format!("Status: {status}"));
+    }
+    if let Some(injury) = &detail.injury_info {
+        lines.push(format!("Injury: {injury}"));
+    }
+    if let Some(duty) = &detail.international_duty {
+        lines.push(format!("International duty: {duty}"));
+    }
+    if !detail.positions.is_empty() {
+        lines.push(format!("Positions: {}", detail.positions.join(", ")));
     }
     lines.join("\n")
 }
@@ -1218,6 +1284,76 @@ fn player_other_stats_text(detail: &PlayerDetail) -> String {
         lines.push(format!("{}:", group.title));
         for item in group.items.iter().take(5) {
             lines.push(format!("  {}: {}", item.title, item.value));
+        }
+    }
+    lines.join("\n")
+}
+
+fn player_season_breakdown_text(detail: &PlayerDetail) -> String {
+    if detail.season_breakdown.is_empty() {
+        return "No season breakdown".to_string();
+    }
+    let mut lines = Vec::new();
+    for row in detail.season_breakdown.iter().take(10) {
+        lines.push(format!(
+            "{} {} | Apps {} G {} A {} | R {}",
+            row.season, row.league, row.appearances, row.goals, row.assists, row.rating
+        ));
+    }
+    lines.join("\n")
+}
+
+fn player_career_text(detail: &PlayerDetail) -> String {
+    if detail.career_sections.is_empty() {
+        return "No career history".to_string();
+    }
+    let mut lines = Vec::new();
+    for section in detail.career_sections.iter().take(3) {
+        lines.push(format!("{}:", title_case(&section.title)));
+        for entry in section.entries.iter().take(6) {
+            let start = entry
+                .start_date
+                .as_deref()
+                .map(shorten_date)
+                .unwrap_or_else(|| "-".to_string());
+            let end = entry
+                .end_date
+                .as_deref()
+                .map(shorten_date)
+                .unwrap_or_else(|| "-".to_string());
+            let apps = entry.appearances.as_deref().unwrap_or("-");
+            let goals = entry.goals.as_deref().unwrap_or("-");
+            let assists = entry.assists.as_deref().unwrap_or("-");
+            lines.push(format!(
+                "  {} {start}→{end} | Apps {apps} G {goals} A {assists}",
+                entry.team
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn player_trophies_text(detail: &PlayerDetail) -> String {
+    if detail.trophies.is_empty() {
+        return "No trophies listed".to_string();
+    }
+    let mut lines = Vec::new();
+    for trophy in detail.trophies.iter().take(10) {
+        if !trophy.seasons_won.is_empty() {
+            lines.push(format!(
+                "{} - {}: {}",
+                trophy.team,
+                trophy.league,
+                trophy.seasons_won.join(", ")
+            ));
+        }
+        if !trophy.seasons_runner_up.is_empty() {
+            lines.push(format!(
+                "{} - {} (Runner-up): {}",
+                trophy.team,
+                trophy.league,
+                trophy.seasons_runner_up.join(", ")
+            ));
         }
     }
     lines.join("\n")
@@ -1289,6 +1425,20 @@ fn shorten_date(raw: &str) -> String {
     }
 }
 
+fn title_case(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let rest = chars.as_str().to_lowercase();
+            format!("{}{}", first.to_uppercase(), rest)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn player_detail_section_max_scroll(detail: &PlayerDetail, section: usize) -> u16 {
     let lines = match section {
         0 => player_info_text(detail),
@@ -1296,6 +1446,9 @@ fn player_detail_section_max_scroll(detail: &PlayerDetail, section: usize) -> u1
         2 => player_top_stats_text(detail),
         3 => player_traits_text(detail),
         4 => player_other_stats_text(detail),
+        5 => player_season_breakdown_text(detail),
+        6 => player_career_text(detail),
+        7 => player_trophies_text(detail),
         _ => player_recent_matches_text(detail),
     };
     text_line_count(&lines).saturating_sub(1)

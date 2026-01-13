@@ -251,6 +251,11 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                     shirt: None,
                                     market_value: None,
                                     contract_end: None,
+                                    birth_date: None,
+                                    status: None,
+                                    injury_info: None,
+                                    international_duty: None,
+                                    positions: Vec::new(),
                                     all_competitions: Vec::new(),
                                     all_competitions_season: None,
                                     main_league: None,
@@ -258,6 +263,9 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                     season_groups: Vec::new(),
                                     traits: None,
                                     recent_matches: Vec::new(),
+                                    season_breakdown: Vec::new(),
+                                    career_sections: Vec::new(),
+                                    trophies: Vec::new(),
                                 }));
                             }
                         }

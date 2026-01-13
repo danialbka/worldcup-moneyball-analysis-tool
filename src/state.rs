@@ -420,7 +420,7 @@ impl AppState {
     }
 }
 
-pub const PLAYER_DETAIL_SECTIONS: usize = 6;
+pub const PLAYER_DETAIL_SECTIONS: usize = 9;
 
 #[derive(Debug, Clone)]
 pub struct MatchSummary {
@@ -537,6 +537,11 @@ pub struct PlayerDetail {
     pub shirt: Option<String>,
     pub market_value: Option<String>,
     pub contract_end: Option<String>,
+    pub birth_date: Option<String>,
+    pub status: Option<String>,
+    pub injury_info: Option<String>,
+    pub international_duty: Option<String>,
+    pub positions: Vec<String>,
     pub all_competitions: Vec<PlayerStatItem>,
     pub all_competitions_season: Option<String>,
     pub main_league: Option<PlayerLeagueStats>,
@@ -544,6 +549,9 @@ pub struct PlayerDetail {
     pub season_groups: Vec<PlayerStatGroup>,
     pub traits: Option<PlayerTraitGroup>,
     pub recent_matches: Vec<PlayerMatchStat>,
+    pub season_breakdown: Vec<PlayerSeasonTournamentStat>,
+    pub career_sections: Vec<PlayerCareerSection>,
+    pub trophies: Vec<PlayerTrophyEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -585,6 +593,40 @@ pub struct PlayerMatchStat {
     pub goals: u8,
     pub assists: u8,
     pub rating: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerSeasonTournamentStat {
+    pub league: String,
+    pub season: String,
+    pub appearances: String,
+    pub goals: String,
+    pub assists: String,
+    pub rating: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerCareerSection {
+    pub title: String,
+    pub entries: Vec<PlayerCareerEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerCareerEntry {
+    pub team: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub appearances: Option<String>,
+    pub goals: Option<String>,
+    pub assists: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerTrophyEntry {
+    pub team: String,
+    pub league: String,
+    pub seasons_won: Vec<String>,
+    pub seasons_runner_up: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
