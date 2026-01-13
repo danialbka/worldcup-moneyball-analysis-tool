@@ -70,3 +70,4 @@ Detailed (manual wiring if needed later):
 - If Pulse shows nothing, confirm `APP_LEAGUE_*` IDs match the FotMob league IDs and that `PULSE_DATE` is set to a matchday with fixtures.
 # football
 # football
+# worldcup
