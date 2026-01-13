@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use rand::Rng;
 
+use crate::analysis_fetch;
 use crate::state::{
     Delta, Event, EventKind, LineupSide, MatchDetail, MatchLineups, MatchSummary, ModelQuality,
     PlayerSlot, ProviderCommand, UpcomingMatch, WinProbRow,
@@ -195,6 +196,69 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let _ = tx.send(Delta::SetUpcoming(seed_upcoming()));
                         }
                         last_upcoming = Instant::now();
+                    }
+                    ProviderCommand::FetchAnalysis => {
+                        let result = analysis_fetch::fetch_worldcup_team_analysis();
+                        for err in result.errors {
+                            let _ = tx.send(Delta::Log(format!(
+                                "[WARN] Analysis fetch: {err}"
+                            )));
+                        }
+                        let _ = tx.send(Delta::SetAnalysis(result.teams));
+                    }
+                    ProviderCommand::FetchSquad { team_id, team_name } => {
+                        match analysis_fetch::fetch_team_squad(team_id) {
+                            Ok(squad) => {
+                                let _ = tx.send(Delta::SetSquad {
+                                    team_name: squad.team_name,
+                                    team_id,
+                                    players: squad.players,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Delta::Log(format!(
+                                    "[WARN] Squad fetch failed: {err}"
+                                )));
+                                let _ = tx.send(Delta::SetSquad {
+                                    team_name,
+                                    team_id,
+                                    players: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    ProviderCommand::FetchPlayer {
+                        player_id,
+                        player_name,
+                    } => {
+                        match analysis_fetch::fetch_player_detail(player_id) {
+                            Ok(detail) => {
+                                let _ = tx.send(Delta::SetPlayerDetail(detail));
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Delta::Log(format!(
+                                    "[WARN] Player fetch failed: {err}"
+                                )));
+                                let _ = tx.send(Delta::SetPlayerDetail(crate::state::PlayerDetail {
+                                    id: player_id,
+                                    name: player_name,
+                                    team: None,
+                                    position: None,
+                                    age: None,
+                                    country: None,
+                                    height: None,
+                                    preferred_foot: None,
+                                    shirt: None,
+                                    market_value: None,
+                                    contract_end: None,
+                                    main_league: None,
+                                    top_stats: Vec::new(),
+                                    season_groups: Vec::new(),
+                                    traits: None,
+                                    recent_matches: Vec::new(),
+                                }));
+                            }
+                        }
                     }
                 }
             }

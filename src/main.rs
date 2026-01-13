@@ -15,10 +15,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Clear, Paragraph};
 
 mod fake_feed;
+mod analysis_fetch;
 mod state;
 mod upcoming_fetch;
 
-use crate::state::{apply_delta, league_label, AppState, PulseView, Screen};
+use crate::state::{
+    apply_delta, confed_label, league_label, AppState, PlayerDetail, PulseView, Screen,
+    PLAYER_DETAIL_SECTIONS,
+};
 
 struct App {
     state: AppState,
@@ -57,16 +61,91 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('1') => self.state.screen = Screen::Pulse,
-            KeyCode::Char('d') | KeyCode::Enter => {
-                let match_id = self.state.selected_match_id();
-                if self.state.pulse_view == PulseView::Live {
-                    self.state.screen = Screen::Terminal { match_id };
-                    self.request_match_details(true);
+            KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.state.screen = Screen::Analysis;
+                if self.state.analysis.is_empty() && !self.state.analysis_loading {
+                    self.request_analysis(true);
                 }
             }
-            KeyCode::Char('b') | KeyCode::Esc => self.state.screen = Screen::Pulse,
-            KeyCode::Char('j') | KeyCode::Down => self.state.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.state.select_prev(),
+            KeyCode::Char('d') | KeyCode::Enter => {
+                match self.state.screen {
+                    Screen::Pulse => {
+                        let match_id = self.state.selected_match_id();
+                        if self.state.pulse_view == PulseView::Live {
+                            self.state.screen = Screen::Terminal { match_id };
+                            self.request_match_details(true);
+                        }
+                    }
+                    Screen::Analysis => {
+                        let team = self.state.selected_analysis().cloned();
+                        if let Some(team) = team {
+                            self.state.screen = Screen::Squad;
+                            let needs_fetch = self.state.squad_team_id != Some(team.id)
+                                || self.state.squad.is_empty();
+                            if needs_fetch && !self.state.squad_loading {
+                                self.request_squad(team.id, team.name.clone(), true);
+                            }
+                        }
+                    }
+                    Screen::Squad => {
+                        let player = self.state.selected_squad_player().cloned();
+                        if let Some(player) = player {
+                            self.state.screen = Screen::PlayerDetail;
+                            self.state.player_detail_scroll = 0;
+                            self.state.player_detail_section = 0;
+                            self.state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+                            let cached_detail = self.state.player_detail.as_ref();
+                            let cached = cached_detail
+                                .map(|detail| detail.id == player.id)
+                                .unwrap_or(false);
+                            let needs_stats_refresh = cached_detail
+                                .map(|detail| !player_detail_has_stats(detail))
+                                .unwrap_or(false);
+                            if (!cached || needs_stats_refresh) && !self.state.player_loading {
+                                self.request_player_detail(player.id, player.name.clone(), true);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Char('b') | KeyCode::Esc => {
+                self.state.screen = match self.state.screen {
+                    Screen::Terminal { .. } => Screen::Pulse,
+                    Screen::Analysis => Screen::Pulse,
+                    Screen::Squad => Screen::Analysis,
+                    Screen::PlayerDetail => Screen::Squad,
+                    Screen::Pulse => Screen::Pulse,
+                };
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if matches!(self.state.screen, Screen::Analysis) {
+                    self.state.select_analysis_next();
+                } else if matches!(self.state.screen, Screen::Squad) {
+                    self.state.select_squad_next();
+                } else if matches!(self.state.screen, Screen::PlayerDetail) {
+                    let max_scroll = self
+                        .state
+                        .player_detail
+                        .as_ref()
+                        .map(|detail| player_detail_section_max_scroll(detail, self.state.player_detail_section))
+                        .unwrap_or(0);
+                    self.state.scroll_player_detail_down(max_scroll);
+                } else {
+                    self.state.select_next();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if matches!(self.state.screen, Screen::Analysis) {
+                    self.state.select_analysis_prev();
+                } else if matches!(self.state.screen, Screen::Squad) {
+                    self.state.select_squad_prev();
+                } else if matches!(self.state.screen, Screen::PlayerDetail) {
+                    self.state.scroll_player_detail_up();
+                } else {
+                    self.state.select_prev();
+                }
+            }
             KeyCode::Char('s') => self.state.cycle_sort(),
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 self.state.cycle_league_mode();
@@ -79,6 +158,37 @@ impl App {
                 self.state.toggle_pulse_view();
                 if to_upcoming {
                     self.request_upcoming(true);
+                }
+            }
+            KeyCode::Tab => {
+                if matches!(self.state.screen, Screen::PlayerDetail) {
+                    self.state.cycle_player_detail_section_next();
+                }
+            }
+            KeyCode::BackTab => {
+                if matches!(self.state.screen, Screen::PlayerDetail) {
+                    self.state.cycle_player_detail_section_prev();
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if matches!(self.state.screen, Screen::Analysis) {
+                    self.request_analysis(true);
+                } else if matches!(self.state.screen, Screen::Squad) {
+                    if let Some(team_id) = self.state.squad_team_id {
+                        let team_name = self
+                            .state
+                            .squad_team
+                            .clone()
+                            .unwrap_or_else(|| "Team".to_string());
+                        self.request_squad(team_id, team_name, true);
+                    }
+                } else if matches!(self.state.screen, Screen::PlayerDetail) {
+                    if let (Some(player_id), Some(player_name)) = (
+                        self.state.player_last_id,
+                        self.state.player_last_name.clone(),
+                    ) {
+                        self.request_player_detail(player_id, player_name, true);
+                    }
                 }
             }
             KeyCode::Char('i') | KeyCode::Char('I') => self.request_match_details(true),
@@ -138,6 +248,77 @@ impl App {
                 self.state.push_log("[INFO] Upcoming request sent");
             }
             self.last_upcoming_refresh = Instant::now();
+        }
+    }
+
+    fn request_analysis(&mut self, announce: bool) {
+        let Some(tx) = &self.cmd_tx else {
+            if announce {
+                self.state.push_log("[INFO] Analysis fetch unavailable");
+            }
+            return;
+        };
+        if tx.send(state::ProviderCommand::FetchAnalysis).is_err() {
+            if announce {
+                self.state.push_log("[WARN] Analysis request failed");
+            }
+        } else {
+            if announce {
+                self.state.push_log("[INFO] Analysis request sent");
+            }
+            self.state.analysis_loading = true;
+        }
+    }
+
+    fn request_squad(&mut self, team_id: u32, team_name: String, announce: bool) {
+        let Some(tx) = &self.cmd_tx else {
+            if announce {
+                self.state.push_log("[INFO] Squad fetch unavailable");
+            }
+            return;
+        };
+        if tx
+            .send(state::ProviderCommand::FetchSquad { team_id, team_name })
+            .is_err()
+        {
+            if announce {
+                self.state.push_log("[WARN] Squad request failed");
+            }
+        } else {
+            if announce {
+                self.state.push_log("[INFO] Squad request sent");
+            }
+            self.state.squad_loading = true;
+            self.state.squad = Vec::new();
+            self.state.squad_selected = 0;
+        }
+    }
+
+    fn request_player_detail(&mut self, player_id: u32, player_name: String, announce: bool) {
+        let Some(tx) = &self.cmd_tx else {
+            if announce {
+                self.state.push_log("[INFO] Player fetch unavailable");
+            }
+            return;
+        };
+        self.state.player_last_id = Some(player_id);
+        self.state.player_last_name = Some(player_name.clone());
+        if tx
+            .send(state::ProviderCommand::FetchPlayer {
+                player_id,
+                player_name,
+            })
+            .is_err()
+        {
+            if announce {
+                self.state.push_log("[WARN] Player request failed");
+            }
+        } else {
+            if announce {
+                self.state.push_log("[INFO] Player request sent");
+            }
+            self.state.player_loading = true;
+            self.state.player_detail = None;
         }
     }
 
@@ -261,6 +442,9 @@ fn ui(frame: &mut Frame, app: &App) {
     match app.state.screen {
         Screen::Pulse => render_pulse(frame, chunks[1], &app.state),
         Screen::Terminal { .. } => render_terminal(frame, chunks[1], &app.state),
+        Screen::Analysis => render_analysis(frame, chunks[1], &app.state),
+        Screen::Squad => render_squad(frame, chunks[1], &app.state),
+        Screen::PlayerDetail => render_player_detail(frame, chunks[1], &app.state),
     }
 
     let footer = Paragraph::new(footer_text(&app.state))
@@ -281,6 +465,34 @@ fn header_text(state: &AppState) -> String {
             sort_label(state.sort)
         ),
         Screen::Terminal { .. } => "WC26 TERMINAL".to_string(),
+        Screen::Analysis => {
+            let updated = state
+                .analysis_updated
+                .as_deref()
+                .unwrap_or("-");
+            let status = if state.analysis_loading {
+                "LOADING"
+            } else {
+                "READY"
+            };
+            format!(
+                "WC26 ANALYSIS | Teams: {} | FIFA: {} | {}",
+                state.analysis.len(),
+                updated,
+                status
+            )
+        }
+        Screen::Squad => {
+            let team = state.squad_team.as_deref().unwrap_or("-");
+            let status = if state.squad_loading { "LOADING" } else { "READY" };
+            format!(
+                "WC26 SQUAD | Team: {} | Players: {} | {}",
+                team,
+                state.squad.len(),
+                status
+            )
+        }
+        Screen::PlayerDetail => "WC26 PLAYER".to_string(),
     };
     let line1 = format!("  .-.  {}", title);
     let line2 = " /___\\".to_string();
@@ -292,14 +504,27 @@ fn footer_text(state: &AppState) -> String {
     match state.screen {
         Screen::Pulse => match state.pulse_view {
             PulseView::Live => {
-                "1 Pulse | Enter/d Terminal | j/k/↑/↓ Move | s Sort | l League | u Upcoming | i Details | ? Help | q Quit".to_string()
+                "1 Pulse | 2 Analysis | Enter/d Terminal | j/k/↑/↓ Move | s Sort | l League | u Upcoming | i Details | ? Help | q Quit".to_string()
             }
             PulseView::Upcoming => {
-                "1 Pulse | u Live | j/k/↑/↓ Scroll | l League | ? Help | q Quit".to_string()
+                "1 Pulse | 2 Analysis | u Live | j/k/↑/↓ Scroll | l League | ? Help | q Quit"
+                    .to_string()
             }
         },
         Screen::Terminal { .. } => {
-            "1 Pulse | b/Esc Back | i Details | l League | ? Help | q Quit".to_string()
+            "1 Pulse | 2 Analysis | b/Esc Back | i Details | l League | ? Help | q Quit"
+                .to_string()
+        }
+        Screen::Analysis => {
+            "1 Pulse | b/Esc Back | j/k/↑/↓ Move | Enter Squad | r Refresh | ? Help | q Quit"
+                .to_string()
+        }
+        Screen::Squad => {
+            "1 Pulse | b/Esc Back | j/k/↑/↓ Move | Enter Player | r Refresh | ? Help | q Quit"
+                .to_string()
+        }
+        Screen::PlayerDetail => {
+            "1 Pulse | b/Esc Back | j/k/↑/↓ Scroll | r Refresh | ? Help | q Quit".to_string()
         }
     }
 }
@@ -482,6 +707,40 @@ fn upcoming_columns() -> [Constraint; 7] {
     ]
 }
 
+fn analysis_columns() -> [Constraint; 11] {
+    [
+        Constraint::Length(10),
+        Constraint::Length(1),
+        Constraint::Min(20),
+        Constraint::Length(1),
+        Constraint::Length(6),
+        Constraint::Length(1),
+        Constraint::Length(7),
+        Constraint::Length(1),
+        Constraint::Length(12),
+        Constraint::Length(1),
+        Constraint::Length(5),
+    ]
+}
+
+fn squad_columns() -> [Constraint; 13] {
+    [
+        Constraint::Min(18),
+        Constraint::Length(1),
+        Constraint::Length(4),
+        Constraint::Length(1),
+        Constraint::Length(12),
+        Constraint::Length(1),
+        Constraint::Length(16),
+        Constraint::Length(1),
+        Constraint::Length(4),
+        Constraint::Length(1),
+        Constraint::Length(6),
+        Constraint::Length(1),
+        Constraint::Length(10),
+    ]
+}
+
 fn render_pulse_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -514,6 +773,527 @@ fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
     render_cell_text(frame, cols[4], "League", style);
     render_vseparator(frame, cols[5], sep_style);
     render_cell_text(frame, cols[6], "Round", style);
+}
+
+fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+
+    let widths = analysis_columns();
+    render_analysis_header(frame, sections[0], &widths);
+
+    let list_area = sections[1];
+    if state.analysis.is_empty() {
+        let message = if state.analysis_loading {
+            "Loading analysis..."
+        } else {
+            "No analysis data yet"
+        };
+        let empty = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, list_area);
+        return;
+    }
+
+    if list_area.height == 0 {
+        return;
+    }
+
+    let visible = list_area.height as usize;
+    let total = state.analysis.len();
+    let (start, end) = visible_range(state.analysis_selected, total, visible);
+
+    for (i, idx) in (start..end).enumerate() {
+        let row_area = Rect {
+            x: list_area.x,
+            y: list_area.y + i as u16,
+            width: list_area.width,
+            height: 1,
+        };
+
+        let selected = idx == state.analysis_selected;
+        let row_style = if selected {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        if selected {
+            frame.render_widget(Block::default().style(row_style), row_area);
+        }
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(widths)
+            .split(row_area);
+
+        let row = &state.analysis[idx];
+        let confed = confed_label(row.confed);
+        let rank = row
+            .fifa_rank
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let points = row
+            .fifa_points
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let updated = row
+            .fifa_updated
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let host = if row.host { "yes" } else { "-" };
+
+        let sep_style = Style::default().fg(Color::DarkGray);
+        render_cell_text(frame, cols[0], confed, row_style);
+        render_vseparator(frame, cols[1], sep_style);
+        render_cell_text(frame, cols[2], &row.name, row_style);
+        render_vseparator(frame, cols[3], sep_style);
+        render_cell_text(frame, cols[4], &rank, row_style);
+        render_vseparator(frame, cols[5], sep_style);
+        render_cell_text(frame, cols[6], &points, row_style);
+        render_vseparator(frame, cols[7], sep_style);
+        render_cell_text(frame, cols[8], &updated, row_style);
+        render_vseparator(frame, cols[9], sep_style);
+        render_cell_text(frame, cols[10], host, row_style);
+    }
+}
+
+fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(widths)
+        .split(area);
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(Color::DarkGray);
+
+    render_cell_text(frame, cols[0], "Confed", style);
+    render_vseparator(frame, cols[1], sep_style);
+    render_cell_text(frame, cols[2], "Team", style);
+    render_vseparator(frame, cols[3], sep_style);
+    render_cell_text(frame, cols[4], "Rank", style);
+    render_vseparator(frame, cols[5], sep_style);
+    render_cell_text(frame, cols[6], "Points", style);
+    render_vseparator(frame, cols[7], sep_style);
+    render_cell_text(frame, cols[8], "Updated", style);
+    render_vseparator(frame, cols[9], sep_style);
+    render_cell_text(frame, cols[10], "Host", style);
+}
+
+fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+
+    let widths = squad_columns();
+    render_squad_header(frame, sections[0], &widths);
+
+    let list_area = sections[1];
+    if state.squad.is_empty() {
+        let message = if state.squad_loading {
+            "Loading squad..."
+        } else {
+            "No squad data yet"
+        };
+        let empty = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, list_area);
+        return;
+    }
+
+    if list_area.height == 0 {
+        return;
+    }
+
+    let visible = list_area.height as usize;
+    let total = state.squad.len();
+    let (start, end) = visible_range(state.squad_selected, total, visible);
+
+    for (i, idx) in (start..end).enumerate() {
+        let row_area = Rect {
+            x: list_area.x,
+            y: list_area.y + i as u16,
+            width: list_area.width,
+            height: 1,
+        };
+
+        let selected = idx == state.squad_selected;
+        let row_style = if selected {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        if selected {
+            frame.render_widget(Block::default().style(row_style), row_area);
+        }
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(widths)
+            .split(row_area);
+
+        let player = &state.squad[idx];
+        let age = player
+            .age
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let height = player
+            .height
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let number = player
+            .shirt_number
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let value = player
+            .market_value
+            .map(|v| format!("€{:.1}M", v as f64 / 1_000_000.0))
+            .unwrap_or_else(|| "-".to_string());
+
+        let sep_style = Style::default().fg(Color::DarkGray);
+        render_cell_text(frame, cols[0], &player.name, row_style);
+        render_vseparator(frame, cols[1], sep_style);
+        render_cell_text(frame, cols[2], &number, row_style);
+        render_vseparator(frame, cols[3], sep_style);
+        render_cell_text(frame, cols[4], &player.role, row_style);
+        render_vseparator(frame, cols[5], sep_style);
+        render_cell_text(frame, cols[6], &player.club, row_style);
+        render_vseparator(frame, cols[7], sep_style);
+        render_cell_text(frame, cols[8], &age, row_style);
+        render_vseparator(frame, cols[9], sep_style);
+        render_cell_text(frame, cols[10], &height, row_style);
+        render_vseparator(frame, cols[11], sep_style);
+        render_cell_text(frame, cols[12], &value, row_style);
+    }
+}
+
+fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(widths)
+        .split(area);
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(Color::DarkGray);
+
+    render_cell_text(frame, cols[0], "Player", style);
+    render_vseparator(frame, cols[1], sep_style);
+    render_cell_text(frame, cols[2], "No", style);
+    render_vseparator(frame, cols[3], sep_style);
+    render_cell_text(frame, cols[4], "Role", style);
+    render_vseparator(frame, cols[5], sep_style);
+    render_cell_text(frame, cols[6], "Club", style);
+    render_vseparator(frame, cols[7], sep_style);
+    render_cell_text(frame, cols[8], "Age", style);
+    render_vseparator(frame, cols[9], sep_style);
+    render_cell_text(frame, cols[10], "Ht", style);
+    render_vseparator(frame, cols[11], sep_style);
+    render_cell_text(frame, cols[12], "Value", style);
+}
+
+fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default().title("Player Detail").borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if state.player_loading {
+        let text = Paragraph::new("Loading player details...")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(text, inner);
+        return;
+    }
+
+    let Some(detail) = state.player_detail.as_ref() else {
+        let text = Paragraph::new("No player data yet")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(text, inner);
+        return;
+    };
+
+    if inner.height < 8 {
+        let text = player_detail_text(detail);
+        let paragraph = Paragraph::new(text).scroll((state.player_detail_scroll, 0));
+        frame.render_widget(paragraph, inner);
+        return;
+    }
+
+    let info_text = player_info_text(detail);
+    let league_text = player_league_stats_text(detail);
+    let top_text = player_top_stats_text(detail);
+    let traits_text = player_traits_text(detail);
+    let other_text = player_other_stats_text(detail);
+    let recent_text = player_recent_matches_text(detail);
+
+    let info_lines = text_line_count(&info_text);
+    let league_lines = text_line_count(&league_text);
+    let top_lines = text_line_count(&top_text);
+    let traits_lines = text_line_count(&traits_text);
+    let other_lines = text_line_count(&other_text);
+    let recent_lines = text_line_count(&recent_text);
+
+    let info_height = text_block_height_from_lines(info_lines, 8);
+    let league_height = text_block_height_from_lines(league_lines, 7);
+    let top_height = text_block_height_from_lines(top_lines, 7);
+    let traits_height = text_block_height_from_lines(traits_lines, 7);
+    let other_height = text_block_height_from_lines(other_lines, 9);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(info_height),
+            Constraint::Length(league_height),
+            Constraint::Length(top_height),
+            Constraint::Length(traits_height),
+            Constraint::Length(other_height),
+            Constraint::Min(3),
+        ])
+        .split(inner);
+
+    render_detail_section(
+        frame,
+        sections[0],
+        "Player Info",
+        &info_text,
+        state.player_detail_section_scrolls[0],
+        state.player_detail_section == 0,
+        info_lines,
+    );
+    render_detail_section(
+        frame,
+        sections[1],
+        "League Stats",
+        &league_text,
+        state.player_detail_section_scrolls[1],
+        state.player_detail_section == 1,
+        league_lines,
+    );
+    render_detail_section(
+        frame,
+        sections[2],
+        "Top Stats",
+        &top_text,
+        state.player_detail_section_scrolls[2],
+        state.player_detail_section == 2,
+        top_lines,
+    );
+    render_detail_section(
+        frame,
+        sections[3],
+        "Player Traits",
+        &traits_text,
+        state.player_detail_section_scrolls[3],
+        state.player_detail_section == 3,
+        traits_lines,
+    );
+    render_detail_section(
+        frame,
+        sections[4],
+        "Other Stats",
+        &other_text,
+        state.player_detail_section_scrolls[4],
+        state.player_detail_section == 4,
+        other_lines,
+    );
+    render_detail_section(
+        frame,
+        sections[5],
+        "Match Stats (Recent)",
+        &recent_text,
+        state.player_detail_section_scrolls[5],
+        state.player_detail_section == 5,
+        recent_lines,
+    );
+}
+
+fn player_detail_has_stats(detail: &PlayerDetail) -> bool {
+    detail.main_league.is_some()
+        || !detail.top_stats.is_empty()
+        || !detail.season_groups.is_empty()
+        || detail
+            .traits
+            .as_ref()
+            .map(|traits| !traits.items.is_empty())
+            .unwrap_or(false)
+        || !detail.recent_matches.is_empty()
+}
+
+fn player_detail_text(detail: &PlayerDetail) -> String {
+    let mut lines = Vec::new();
+    lines.push(player_info_text(detail));
+    lines.push(String::new());
+    lines.push(player_league_stats_text(detail));
+    lines.push(String::new());
+    lines.push(player_top_stats_text(detail));
+    lines.push(String::new());
+    lines.push(player_traits_text(detail));
+    lines.push(String::new());
+    lines.push(player_other_stats_text(detail));
+    lines.push(String::new());
+    lines.push(player_recent_matches_text(detail));
+    lines.join("\n")
+}
+
+fn player_info_text(detail: &PlayerDetail) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("Name: {}", detail.name));
+    lines.push(format!("ID: {}", detail.id));
+    if let Some(team) = &detail.team {
+        lines.push(format!("Team: {team}"));
+    }
+    if let Some(position) = &detail.position {
+        lines.push(format!("Position: {position}"));
+    }
+    if let Some(age) = &detail.age {
+        lines.push(format!("Age: {age}"));
+    }
+    if let Some(country) = &detail.country {
+        lines.push(format!("Country: {country}"));
+    }
+    if let Some(height) = &detail.height {
+        lines.push(format!("Height: {height}"));
+    }
+    if let Some(foot) = &detail.preferred_foot {
+        lines.push(format!("Preferred foot: {foot}"));
+    }
+    if let Some(shirt) = &detail.shirt {
+        lines.push(format!("Shirt: {shirt}"));
+    }
+    if let Some(value) = &detail.market_value {
+        lines.push(format!("Market value: {value}"));
+    }
+    if let Some(contract_end) = &detail.contract_end {
+        lines.push(format!("Contract end: {contract_end}"));
+    }
+    lines.join("\n")
+}
+
+fn player_league_stats_text(detail: &PlayerDetail) -> String {
+    let Some(league) = &detail.main_league else {
+        return "No league stats".to_string();
+    };
+    let mut lines = Vec::new();
+    lines.push(format!("{} ({})", league.league_name, league.season));
+    for stat in league.stats.iter().take(8) {
+        lines.push(format!("{}: {}", stat.title, stat.value));
+    }
+    lines.join("\n")
+}
+
+fn player_top_stats_text(detail: &PlayerDetail) -> String {
+    if detail.top_stats.is_empty() {
+        return "No top stats".to_string();
+    }
+    let mut lines = Vec::new();
+    for stat in detail.top_stats.iter().take(8) {
+        lines.push(format!("{}: {}", stat.title, stat.value));
+    }
+    lines.join("\n")
+}
+
+fn player_traits_text(detail: &PlayerDetail) -> String {
+    let Some(traits) = &detail.traits else {
+        return "No traits".to_string();
+    };
+    let mut lines = Vec::new();
+    lines.push(traits.title.clone());
+    for item in traits.items.iter().take(8) {
+        lines.push(format!("{}: {:.0}%", item.title, item.value * 100.0));
+    }
+    lines.join("\n")
+}
+
+fn player_other_stats_text(detail: &PlayerDetail) -> String {
+    if detail.season_groups.is_empty() {
+        return "No additional stats".to_string();
+    }
+    let mut lines = Vec::new();
+    for group in detail.season_groups.iter().take(3) {
+        lines.push(format!("{}:", group.title));
+        for item in group.items.iter().take(5) {
+            lines.push(format!("  {}: {}", item.title, item.value));
+        }
+    }
+    lines.join("\n")
+}
+
+fn player_recent_matches_text(detail: &PlayerDetail) -> String {
+    if detail.recent_matches.is_empty() {
+        return "No recent matches".to_string();
+    }
+    let mut lines = Vec::new();
+    for m in detail.recent_matches.iter().take(10) {
+        let date = shorten_date(&m.date);
+        let rating = m.rating.as_deref().unwrap_or("-");
+        lines.push(format!(
+            "{date} vs {} | {} | G {} A {} | R {}",
+            m.opponent, m.league, m.goals, m.assists, rating
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_detail_section(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: &str,
+    scroll: u16,
+    active: bool,
+    total_lines: u16,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let border_style = if active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let max_scroll = total_lines.saturating_sub(1);
+    let current = scroll.min(max_scroll) + 1;
+    let total = max_scroll + 1;
+    let title = format!("{title}  {current}/{total}");
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let paragraph = Paragraph::new(body).scroll((scroll, 0));
+    frame.render_widget(paragraph, inner);
+}
+
+fn text_line_count(text: &str) -> u16 {
+    text.lines().count().max(1) as u16
+}
+
+fn text_block_height_from_lines(lines: u16, max_height: u16) -> u16 {
+    (lines + 2).min(max_height).max(3)
+}
+
+fn shorten_date(raw: &str) -> String {
+    if raw.len() >= 10 {
+        raw[..10].to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn player_detail_section_max_scroll(detail: &PlayerDetail, section: usize) -> u16 {
+    let lines = match section {
+        0 => player_info_text(detail),
+        1 => player_league_stats_text(detail),
+        2 => player_top_stats_text(detail),
+        3 => player_traits_text(detail),
+        4 => player_other_stats_text(detail),
+        _ => player_recent_matches_text(detail),
+    };
+    text_line_count(&lines).saturating_sub(1)
 }
 fn render_cell_text(frame: &mut Frame, area: Rect, text: &str, style: Style) {
     let text_area = Rect {
@@ -917,17 +1697,25 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "",
         "Global:",
         "  1            Pulse",
+        "  2 / a        Analysis",
         "  Enter / d    Terminal",
         "  b / Esc      Back",
         "  l            League toggle",
         "  u            Upcoming view",
         "  i            Fetch match details",
+        "  r            Refresh analysis/squad/player",
         "  ?            Toggle help",
         "  q            Quit",
         "",
         "Pulse:",
         "  j/k or ↑/↓   Move/scroll",
         "  s            Cycle sort mode",
+        "",
+        "Analysis/Squad:",
+        "  Enter        Open squad / player detail",
+        "",
+        "Player detail:",
+        "  j/k or ↑/↓   Scroll",
     ]
     .join("\n");
 

@@ -5,6 +5,9 @@ use std::env;
 pub enum Screen {
     Pulse,
     Terminal { match_id: Option<String> },
+    Analysis,
+    Squad,
+    PlayerDetail,
 }
 
 #[allow(dead_code)]
@@ -35,6 +38,16 @@ pub enum LeagueMode {
     WorldCup,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confederation {
+    AFC,
+    CAF,
+    CONCACAF,
+    CONMEBOL,
+    UEFA,
+    OFC,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub screen: Screen,
@@ -50,6 +63,22 @@ pub struct AppState {
     pub match_detail: HashMap<String, MatchDetail>,
     pub logs: VecDeque<String>,
     pub help_overlay: bool,
+    pub analysis: Vec<TeamAnalysis>,
+    pub analysis_selected: usize,
+    pub analysis_loading: bool,
+    pub analysis_updated: Option<String>,
+    pub squad: Vec<SquadPlayer>,
+    pub squad_selected: usize,
+    pub squad_loading: bool,
+    pub squad_team: Option<String>,
+    pub squad_team_id: Option<u32>,
+    pub player_detail: Option<PlayerDetail>,
+    pub player_loading: bool,
+    pub player_last_id: Option<u32>,
+    pub player_last_name: Option<String>,
+    pub player_detail_scroll: u16,
+    pub player_detail_section: usize,
+    pub player_detail_section_scrolls: [u16; PLAYER_DETAIL_SECTIONS],
 }
 
 impl AppState {
@@ -70,6 +99,22 @@ impl AppState {
             match_detail: HashMap::new(),
             logs: VecDeque::new(),
             help_overlay: false,
+            analysis: Vec::new(),
+            analysis_selected: 0,
+            analysis_loading: false,
+            analysis_updated: None,
+            squad: Vec::new(),
+            squad_selected: 0,
+            squad_loading: false,
+            squad_team: None,
+            squad_team_id: None,
+            player_detail: None,
+            player_loading: false,
+            player_last_id: None,
+            player_last_name: None,
+            player_detail_scroll: 0,
+            player_detail_section: 0,
+            player_detail_section_scrolls: [0; PLAYER_DETAIL_SECTIONS],
         }
     }
 
@@ -280,7 +325,102 @@ impl AppState {
     fn scroll_upcoming_up(&mut self) {
         self.upcoming_scroll = self.upcoming_scroll.saturating_sub(1);
     }
+
+    pub fn selected_analysis(&self) -> Option<&TeamAnalysis> {
+        self.analysis.get(self.analysis_selected)
+    }
+
+    pub fn selected_squad_player(&self) -> Option<&SquadPlayer> {
+        self.squad.get(self.squad_selected)
+    }
+
+    pub fn select_analysis_next(&mut self) {
+        let total = self.analysis.len();
+        if total == 0 {
+            self.analysis_selected = 0;
+            return;
+        }
+        self.analysis_selected = (self.analysis_selected + 1) % total;
+    }
+
+    pub fn select_analysis_prev(&mut self) {
+        let total = self.analysis.len();
+        if total == 0 {
+            self.analysis_selected = 0;
+            return;
+        }
+        if self.analysis_selected == 0 {
+            self.analysis_selected = total - 1;
+        } else {
+            self.analysis_selected -= 1;
+        }
+    }
+
+    pub fn select_squad_next(&mut self) {
+        let total = self.squad.len();
+        if total == 0 {
+            self.squad_selected = 0;
+            return;
+        }
+        self.squad_selected = (self.squad_selected + 1) % total;
+    }
+
+    pub fn select_squad_prev(&mut self) {
+        let total = self.squad.len();
+        if total == 0 {
+            self.squad_selected = 0;
+            return;
+        }
+        if self.squad_selected == 0 {
+            self.squad_selected = total - 1;
+        } else {
+            self.squad_selected -= 1;
+        }
+    }
+
+    pub fn scroll_player_detail_down(&mut self, max_scroll: u16) {
+        if self.player_detail_scroll < max_scroll {
+            self.player_detail_scroll = (self.player_detail_scroll + 1).min(max_scroll);
+        }
+        if let Some(scroll) = self
+            .player_detail_section_scrolls
+            .get_mut(self.player_detail_section)
+        {
+            if *scroll < max_scroll {
+                *scroll = (*scroll + 1).min(max_scroll);
+            }
+        }
+    }
+
+    pub fn scroll_player_detail_up(&mut self) {
+        if self.player_detail_scroll > 0 {
+            self.player_detail_scroll = self.player_detail_scroll.saturating_sub(1);
+        }
+        if let Some(scroll) = self
+            .player_detail_section_scrolls
+            .get_mut(self.player_detail_section)
+        {
+            if *scroll > 0 {
+                *scroll = scroll.saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn cycle_player_detail_section_next(&mut self) {
+        self.player_detail_section =
+            (self.player_detail_section + 1) % PLAYER_DETAIL_SECTIONS;
+    }
+
+    pub fn cycle_player_detail_section_prev(&mut self) {
+        if self.player_detail_section == 0 {
+            self.player_detail_section = PLAYER_DETAIL_SECTIONS - 1;
+        } else {
+            self.player_detail_section -= 1;
+        }
+    }
 }
+
+pub const PLAYER_DETAIL_SECTIONS: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct MatchSummary {
@@ -361,6 +501,90 @@ pub struct StatRow {
     pub away: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct TeamAnalysis {
+    pub id: u32,
+    pub name: String,
+    pub confed: Confederation,
+    pub host: bool,
+    pub fifa_rank: Option<u32>,
+    pub fifa_points: Option<u32>,
+    pub fifa_updated: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SquadPlayer {
+    pub id: u32,
+    pub name: String,
+    pub role: String,
+    pub club: String,
+    pub age: Option<u32>,
+    pub height: Option<u32>,
+    pub shirt_number: Option<u32>,
+    pub market_value: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerDetail {
+    pub id: u32,
+    pub name: String,
+    pub team: Option<String>,
+    pub position: Option<String>,
+    pub age: Option<String>,
+    pub country: Option<String>,
+    pub height: Option<String>,
+    pub preferred_foot: Option<String>,
+    pub shirt: Option<String>,
+    pub market_value: Option<String>,
+    pub contract_end: Option<String>,
+    pub main_league: Option<PlayerLeagueStats>,
+    pub top_stats: Vec<PlayerStatItem>,
+    pub season_groups: Vec<PlayerStatGroup>,
+    pub traits: Option<PlayerTraitGroup>,
+    pub recent_matches: Vec<PlayerMatchStat>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerStatItem {
+    pub title: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerStatGroup {
+    pub title: String,
+    pub items: Vec<PlayerStatItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerLeagueStats {
+    pub league_name: String,
+    pub season: String,
+    pub stats: Vec<PlayerStatItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerTraitGroup {
+    pub title: String,
+    pub items: Vec<PlayerTraitItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerTraitItem {
+    pub title: String,
+    pub value: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerMatchStat {
+    pub opponent: String,
+    pub league: String,
+    pub date: String,
+    pub goals: u8,
+    pub assists: u8,
+    pub rating: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     Shot,
@@ -376,6 +600,9 @@ pub enum Delta {
     UpsertMatch(MatchSummary),
     SetUpcoming(Vec<UpcomingMatch>),
     AddEvent { id: String, event: Event },
+    SetAnalysis(Vec<TeamAnalysis>),
+    SetSquad { team_name: String, team_id: u32, players: Vec<SquadPlayer> },
+    SetPlayerDetail(PlayerDetail),
     Log(String),
 }
 
@@ -383,6 +610,9 @@ pub enum Delta {
 pub enum ProviderCommand {
     FetchMatchDetails { fixture_id: String },
     FetchUpcoming,
+    FetchAnalysis,
+    FetchSquad { team_id: u32, team_name: String },
+    FetchPlayer { player_id: u32, player_name: String },
 }
 
 pub fn apply_delta(state: &mut AppState, delta: Delta) {
@@ -428,6 +658,30 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     stats: Vec::new(),
                 });
             entry.events.push(event);
+        }
+        Delta::SetAnalysis(items) => {
+            state.analysis_updated = items.iter().find_map(|t| t.fifa_updated.clone());
+            state.analysis = items;
+            state.analysis_loading = false;
+            state.analysis_selected = 0;
+        }
+        Delta::SetSquad {
+            team_name,
+            team_id,
+            players,
+        } => {
+            state.squad = players;
+            state.squad_selected = 0;
+            state.squad_loading = false;
+            state.squad_team = Some(team_name);
+            state.squad_team_id = Some(team_id);
+        }
+        Delta::SetPlayerDetail(detail) => {
+            state.player_detail = Some(detail);
+            state.player_loading = false;
+            state.player_detail_scroll = 0;
+            state.player_detail_section = 0;
+            state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
         }
         Delta::Log(msg) => state.push_log(msg),
     }
@@ -476,5 +730,16 @@ pub fn league_label(mode: LeagueMode) -> &'static str {
     match mode {
         LeagueMode::PremierLeague => "Premier League",
         LeagueMode::WorldCup => "World Cup",
+    }
+}
+
+pub fn confed_label(confed: Confederation) -> &'static str {
+    match confed {
+        Confederation::AFC => "AFC",
+        Confederation::CAF => "CAF",
+        Confederation::CONCACAF => "CONCACAF",
+        Confederation::CONMEBOL => "CONMEBOL",
+        Confederation::UEFA => "UEFA",
+        Confederation::OFC => "OFC",
     }
 }
