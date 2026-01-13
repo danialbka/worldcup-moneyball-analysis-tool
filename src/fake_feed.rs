@@ -53,28 +53,16 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
         let minute_interval = Duration::from_secs(60);
         let mut matches: Vec<MatchSummary> = Vec::new();
 
-        if let Err(err) = refresh_live_matches(
-            &mut matches,
-            pulse_date.as_deref(),
-            &tx,
-        ) {
-            let _ = tx.send(Delta::Log(format!(
-                "[WARN] Live fetch error: {err}"
-            )));
+        if let Err(err) = refresh_live_matches(&mut matches, pulse_date.as_deref(), &tx) {
+            let _ = tx.send(Delta::Log(format!("[WARN] Live fetch error: {err}")));
         }
 
         loop {
             thread::sleep(Duration::from_millis(900));
 
             if last_live_fetch.elapsed() >= live_interval {
-                if let Err(err) = refresh_live_matches(
-                    &mut matches,
-                    pulse_date.as_deref(),
-                    &tx,
-                ) {
-                    let _ = tx.send(Delta::Log(format!(
-                        "[WARN] Live fetch error: {err}"
-                    )));
+                if let Err(err) = refresh_live_matches(&mut matches, pulse_date.as_deref(), &tx) {
+                    let _ = tx.send(Delta::Log(format!("[WARN] Live fetch error: {err}")));
                 }
                 last_live_fetch = Instant::now();
             }
@@ -143,9 +131,8 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 });
                             }
                             Err(err) => {
-                                let _ = tx.send(Delta::Log(format!(
-                                    "[WARN] Match details error: {err}"
-                                )));
+                                let _ = tx
+                                    .send(Delta::Log(format!("[WARN] Match details error: {err}")));
                                 if let Some(lineups) = lineups.get(&fixture_id) {
                                     let detail = MatchDetail {
                                         events: Vec::new(),
@@ -200,9 +187,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                     ProviderCommand::FetchAnalysis => {
                         let result = analysis_fetch::fetch_worldcup_team_analysis();
                         for err in result.errors {
-                            let _ = tx.send(Delta::Log(format!(
-                                "[WARN] Analysis fetch: {err}"
-                            )));
+                            let _ = tx.send(Delta::Log(format!("[WARN] Analysis fetch: {err}")));
                         }
                         let _ = tx.send(Delta::SetAnalysis(result.teams));
                     }
@@ -216,9 +201,8 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 });
                             }
                             Err(err) => {
-                                let _ = tx.send(Delta::Log(format!(
-                                    "[WARN] Squad fetch failed: {err}"
-                                )));
+                                let _ = tx
+                                    .send(Delta::Log(format!("[WARN] Squad fetch failed: {err}")));
                                 let _ = tx.send(Delta::SetSquad {
                                     team_name,
                                     team_id,
@@ -230,45 +214,107 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                     ProviderCommand::FetchPlayer {
                         player_id,
                         player_name,
-                    } => {
-                        match analysis_fetch::fetch_player_detail(player_id) {
-                            Ok(detail) => {
-                                let _ = tx.send(Delta::SetPlayerDetail(detail));
-                            }
-                            Err(err) => {
-                                let _ = tx.send(Delta::Log(format!(
-                                    "[WARN] Player fetch failed: {err}"
-                                )));
-                                let _ = tx.send(Delta::SetPlayerDetail(crate::state::PlayerDetail {
-                                    id: player_id,
-                                    name: player_name,
-                                    team: None,
-                                    position: None,
-                                    age: None,
-                                    country: None,
-                                    height: None,
-                                    preferred_foot: None,
-                                    shirt: None,
-                                    market_value: None,
-                                    contract_end: None,
-                                    birth_date: None,
-                                    status: None,
-                                    injury_info: None,
-                                    international_duty: None,
-                                    positions: Vec::new(),
-                                    all_competitions: Vec::new(),
-                                    all_competitions_season: None,
-                                    main_league: None,
-                                    top_stats: Vec::new(),
-                                    season_groups: Vec::new(),
-                                    traits: None,
-                                    recent_matches: Vec::new(),
-                                    season_breakdown: Vec::new(),
-                                    career_sections: Vec::new(),
-                                    trophies: Vec::new(),
-                                }));
-                            }
+                    } => match analysis_fetch::fetch_player_detail(player_id) {
+                        Ok(detail) => {
+                            let _ = tx.send(Delta::SetPlayerDetail(detail));
                         }
+                        Err(err) => {
+                            let _ =
+                                tx.send(Delta::Log(format!("[WARN] Player fetch failed: {err}")));
+                            let _ = tx.send(Delta::SetPlayerDetail(crate::state::PlayerDetail {
+                                id: player_id,
+                                name: player_name,
+                                team: None,
+                                position: None,
+                                age: None,
+                                country: None,
+                                height: None,
+                                preferred_foot: None,
+                                shirt: None,
+                                market_value: None,
+                                contract_end: None,
+                                birth_date: None,
+                                status: None,
+                                injury_info: None,
+                                international_duty: None,
+                                positions: Vec::new(),
+                                all_competitions: Vec::new(),
+                                all_competitions_season: None,
+                                main_league: None,
+                                top_stats: Vec::new(),
+                                season_groups: Vec::new(),
+                                traits: None,
+                                recent_matches: Vec::new(),
+                                season_breakdown: Vec::new(),
+                                career_sections: Vec::new(),
+                                trophies: Vec::new(),
+                            }));
+                        }
+                    },
+                    ProviderCommand::ExportWorldcupAnalysis { path } => {
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Delta::ExportStarted {
+                                path: path.clone(),
+                                total: 0,
+                            });
+
+                            let progress_tx = tx.clone();
+                            let progress_path = path.clone();
+                            let mut last_current = 0usize;
+                            let mut last_total = 0usize;
+
+                            let report =
+                                crate::analysis_export::export_worldcup_analysis_with_progress(
+                                    path.as_ref(),
+                                    |progress| {
+                                        last_current = progress.current;
+                                        last_total = progress.total;
+                                        let _ = progress_tx.send(Delta::ExportProgress {
+                                            current: progress.current,
+                                            total: progress.total,
+                                            message: progress.message,
+                                        });
+                                    },
+                                );
+
+                            match report {
+                                Ok(report) => {
+                                    let _ = tx.send(Delta::ExportFinished {
+                                        path: progress_path,
+                                        current: last_current.max(last_total),
+                                        total: last_total,
+                                        teams: report.teams,
+                                        players: report.players,
+                                        stats: report.stats,
+                                        info_rows: report.info_rows,
+                                        season_breakdown: report.season_breakdown,
+                                        career_rows: report.career_rows,
+                                        trophies: report.trophies,
+                                        recent_matches: report.recent_matches,
+                                        errors: report.errors.len(),
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ =
+                                        tx.send(Delta::Log(format!("[WARN] Export failed: {err}")));
+                                    let _ = tx.send(Delta::ExportFinished {
+                                        path: progress_path,
+                                        current: last_current,
+                                        total: last_total,
+                                        teams: 0,
+                                        players: 0,
+                                        stats: 0,
+                                        info_rows: 0,
+                                        season_breakdown: 0,
+                                        career_rows: 0,
+                                        trophies: 0,
+                                        recent_matches: 0,
+                                        errors: 1,
+                                    });
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -366,9 +412,13 @@ fn merge_fotmob_matches(
 }
 
 fn opt_env(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .and_then(|val| if val.trim().is_empty() { None } else { Some(val) })
+    env::var(key).ok().and_then(|val| {
+        if val.trim().is_empty() {
+            None
+        } else {
+            Some(val)
+        }
+    })
 }
 
 fn opt_date_env(key: &str) -> Option<String> {
@@ -503,10 +553,7 @@ fn seed_lineups() -> Vec<(String, MatchLineups)> {
             player("Paqueta", 7, "MF"),
             player("Vini Jr", 10, "FW"),
         ],
-        subs: vec![
-            player("Rodrygo", 11, "FW"),
-            player("Bruno G", 8, "MF"),
-        ],
+        subs: vec![player("Rodrygo", 11, "FW"), player("Bruno G", 8, "MF")],
     };
 
     let ger = LineupSide {

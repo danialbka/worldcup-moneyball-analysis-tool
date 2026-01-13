@@ -79,9 +79,14 @@ pub struct AppState {
     pub player_detail_scroll: u16,
     pub player_detail_section: usize,
     pub player_detail_section_scrolls: [u16; PLAYER_DETAIL_SECTIONS],
+    pub export: ExportState,
 }
 
 impl AppState {
+    pub fn maybe_clear_export(&mut self, now: std::time::Instant) {
+        self.export.clear_if_done_for(now, 8);
+    }
+
     pub fn new() -> Self {
         let league_pl_ids = parse_ids_env("APP_LEAGUE_PREMIER_IDS");
         let league_wc_ids = parse_ids_env("APP_LEAGUE_WORLDCUP_IDS");
@@ -115,6 +120,7 @@ impl AppState {
             player_detail_scroll: 0,
             player_detail_section: 0,
             player_detail_section_scrolls: [0; PLAYER_DETAIL_SECTIONS],
+            export: ExportState::new(),
         }
     }
 
@@ -178,12 +184,10 @@ impl AppState {
                     .partial_cmp(&a.win.delta_home.abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             }),
-            SortMode::Time => self.matches.sort_by(|a, b| {
-                match (a.is_live, b.is_live) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.minute.cmp(&b.minute),
-                }
+            SortMode::Time => self.matches.sort_by(|a, b| match (a.is_live, b.is_live) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.minute.cmp(&b.minute),
             }),
             SortMode::Close => self.matches.sort_by(|a, b| {
                 b.win
@@ -202,10 +206,7 @@ impl AppState {
 
         if let Some(id) = selected_id {
             let filtered = self.filtered_indices();
-            if let Some(pos) = filtered
-                .iter()
-                .position(|idx| self.matches[*idx].id == id)
-            {
+            if let Some(pos) = filtered.iter().position(|idx| self.matches[*idx].id == id) {
                 self.selected = pos;
                 return;
             }
@@ -286,9 +287,11 @@ impl AppState {
 
     fn matches_mode(&self, m: &MatchSummary) -> bool {
         match self.league_mode {
-            LeagueMode::PremierLeague => {
-                matches_league(m, &self.league_pl_ids, &["premier league", "premier", "epl"])
-            }
+            LeagueMode::PremierLeague => matches_league(
+                m,
+                &self.league_pl_ids,
+                &["premier league", "premier", "epl"],
+            ),
             LeagueMode::WorldCup => {
                 matches_league(m, &self.league_wc_ids, &["world cup", "worldcup"])
             }
@@ -297,9 +300,11 @@ impl AppState {
 
     fn upcoming_matches_mode(&self, m: &UpcomingMatch) -> bool {
         match self.league_mode {
-            LeagueMode::PremierLeague => {
-                matches_league_upcoming(m, &self.league_pl_ids, &["premier league", "premier", "epl"])
-            }
+            LeagueMode::PremierLeague => matches_league_upcoming(
+                m,
+                &self.league_pl_ids,
+                &["premier league", "premier", "epl"],
+            ),
             LeagueMode::WorldCup => {
                 matches_league_upcoming(m, &self.league_wc_ids, &["world cup", "worldcup"])
             }
@@ -407,8 +412,7 @@ impl AppState {
     }
 
     pub fn cycle_player_detail_section_next(&mut self) {
-        self.player_detail_section =
-            (self.player_detail_section + 1) % PLAYER_DETAIL_SECTIONS;
+        self.player_detail_section = (self.player_detail_section + 1) % PLAYER_DETAIL_SECTIONS;
     }
 
     pub fn cycle_player_detail_section_prev(&mut self) {
@@ -421,6 +425,45 @@ impl AppState {
 }
 
 pub const PLAYER_DETAIL_SECTIONS: usize = 9;
+
+#[derive(Debug, Clone)]
+pub struct ExportState {
+    pub active: bool,
+    pub done: bool,
+    pub path: Option<String>,
+    pub current: usize,
+    pub total: usize,
+    pub message: String,
+    pub error_count: usize,
+    pub last_updated: Option<std::time::Instant>,
+}
+
+impl ExportState {
+    pub fn new() -> Self {
+        Self {
+            active: false,
+            done: false,
+            path: None,
+            current: 0,
+            total: 0,
+            message: String::new(),
+            error_count: 0,
+            last_updated: None,
+        }
+    }
+
+    pub fn clear_if_done_for(&mut self, now: std::time::Instant, keep_secs: u64) {
+        if !self.active || !self.done {
+            return;
+        }
+        let Some(last) = self.last_updated else {
+            return;
+        };
+        if now.duration_since(last).as_secs() >= keep_secs {
+            *self = Self::new();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MatchSummary {
@@ -640,13 +683,46 @@ pub enum EventKind {
 #[derive(Debug, Clone)]
 pub enum Delta {
     SetMatches(Vec<MatchSummary>),
-    SetMatchDetails { id: String, detail: MatchDetail },
+    SetMatchDetails {
+        id: String,
+        detail: MatchDetail,
+    },
     UpsertMatch(MatchSummary),
     SetUpcoming(Vec<UpcomingMatch>),
-    AddEvent { id: String, event: Event },
+    AddEvent {
+        id: String,
+        event: Event,
+    },
     SetAnalysis(Vec<TeamAnalysis>),
-    SetSquad { team_name: String, team_id: u32, players: Vec<SquadPlayer> },
+    SetSquad {
+        team_name: String,
+        team_id: u32,
+        players: Vec<SquadPlayer>,
+    },
     SetPlayerDetail(PlayerDetail),
+    ExportStarted {
+        path: String,
+        total: usize,
+    },
+    ExportProgress {
+        current: usize,
+        total: usize,
+        message: String,
+    },
+    ExportFinished {
+        path: String,
+        current: usize,
+        total: usize,
+        teams: usize,
+        players: usize,
+        stats: usize,
+        info_rows: usize,
+        season_breakdown: usize,
+        career_rows: usize,
+        trophies: usize,
+        recent_matches: usize,
+        errors: usize,
+    },
     Log(String),
 }
 
@@ -657,6 +733,7 @@ pub enum ProviderCommand {
     FetchAnalysis,
     FetchSquad { team_id: u32, team_name: String },
     FetchPlayer { player_id: u32, player_name: String },
+    ExportWorldcupAnalysis { path: String },
 }
 
 pub fn apply_delta(state: &mut AppState, delta: Delta) {
@@ -693,14 +770,11 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             }
         }
         Delta::AddEvent { id, event } => {
-            let entry = state
-                .match_detail
-                .entry(id)
-                .or_insert_with(|| MatchDetail {
-                    events: Vec::new(),
-                    lineups: None,
-                    stats: Vec::new(),
-                });
+            let entry = state.match_detail.entry(id).or_insert_with(|| MatchDetail {
+                events: Vec::new(),
+                lineups: None,
+                stats: Vec::new(),
+            });
             entry.events.push(event);
         }
         Delta::SetAnalysis(items) => {
@@ -727,15 +801,59 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.player_detail_section = 0;
             state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
         }
+        Delta::ExportStarted { path, total } => {
+            state.export.active = true;
+            state.export.path = Some(path);
+            state.export.total = total;
+            state.export.current = 0;
+            state.export.message = "Starting export".to_string();
+            state.export.done = false;
+            state.export.error_count = 0;
+            state.export.last_updated = Some(std::time::Instant::now());
+        }
+        Delta::ExportProgress {
+            current,
+            total,
+            message,
+        } => {
+            state.export.active = true;
+            state.export.total = total;
+            state.export.current = current;
+            state.export.message = message;
+            state.export.last_updated = Some(std::time::Instant::now());
+        }
+        Delta::ExportFinished {
+            path,
+            current,
+            total,
+            teams,
+            players,
+            stats,
+            info_rows,
+            season_breakdown,
+            career_rows,
+            trophies,
+            recent_matches,
+            errors,
+        } => {
+            state.export.active = true;
+            state.export.path = Some(path);
+            state.export.current = current;
+            state.export.total = total;
+            state.export.message = format!(
+                "Done: {teams} teams, {players} players, {stats} stats, {info_rows} info, {season_breakdown} seasons, {career_rows} career, {trophies} trophies, {recent_matches} recent ({errors} errors)"
+            );
+            state.export.done = true;
+            state.export.error_count = errors;
+            state.export.last_updated = Some(std::time::Instant::now());
+            state.push_log(format!("[INFO] Export finished ({errors} errors)"));
+        }
         Delta::Log(msg) => state.push_log(msg),
     }
 }
 
 fn parse_ids_env(key: &str) -> Vec<u32> {
-    env::var(key)
-        .ok()
-        .map(parse_ids)
-        .unwrap_or_default()
+    env::var(key).ok().map(parse_ids).unwrap_or_default()
 }
 
 fn parse_ids(raw: String) -> Vec<u32> {

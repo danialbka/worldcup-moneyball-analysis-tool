@@ -3,25 +3,28 @@ use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use chrono::{Duration as ChronoDuration, NaiveDateTime};
+use chrono::{Duration as ChronoDuration, Local, NaiveDateTime};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Clear, Gauge, Paragraph};
 
-mod fake_feed;
+mod analysis_export;
 mod analysis_fetch;
+mod fake_feed;
 mod state;
 mod upcoming_fetch;
 
 use crate::state::{
-    apply_delta, confed_label, league_label, AppState, PlayerDetail, PulseView, Screen,
-    PLAYER_DETAIL_SECTIONS,
+    AppState, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen, apply_delta, confed_label,
+    league_label,
 };
 
 struct App {
@@ -58,6 +61,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if self.state.export.active {
+            if self.state.export.done {
+                self.state.export = crate::state::ExportState::new();
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('1') => self.state.screen = Screen::Pulse,
@@ -67,48 +77,46 @@ impl App {
                     self.request_analysis(true);
                 }
             }
-            KeyCode::Char('d') | KeyCode::Enter => {
-                match self.state.screen {
-                    Screen::Pulse => {
-                        let match_id = self.state.selected_match_id();
-                        if self.state.pulse_view == PulseView::Live {
-                            self.state.screen = Screen::Terminal { match_id };
-                            self.request_match_details(true);
-                        }
+            KeyCode::Char('d') | KeyCode::Enter => match self.state.screen {
+                Screen::Pulse => {
+                    let match_id = self.state.selected_match_id();
+                    if self.state.pulse_view == PulseView::Live {
+                        self.state.screen = Screen::Terminal { match_id };
+                        self.request_match_details(true);
                     }
-                    Screen::Analysis => {
-                        let team = self.state.selected_analysis().cloned();
-                        if let Some(team) = team {
-                            self.state.screen = Screen::Squad;
-                            let needs_fetch = self.state.squad_team_id != Some(team.id)
-                                || self.state.squad.is_empty();
-                            if needs_fetch && !self.state.squad_loading {
-                                self.request_squad(team.id, team.name.clone(), true);
-                            }
-                        }
-                    }
-                    Screen::Squad => {
-                        let player = self.state.selected_squad_player().cloned();
-                        if let Some(player) = player {
-                            self.state.screen = Screen::PlayerDetail;
-                            self.state.player_detail_scroll = 0;
-                            self.state.player_detail_section = 0;
-                            self.state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
-                            let cached_detail = self.state.player_detail.as_ref();
-                            let cached = cached_detail
-                                .map(|detail| detail.id == player.id)
-                                .unwrap_or(false);
-                            let needs_stats_refresh = cached_detail
-                                .map(|detail| !player_detail_has_stats(detail))
-                                .unwrap_or(false);
-                            if (!cached || needs_stats_refresh) && !self.state.player_loading {
-                                self.request_player_detail(player.id, player.name.clone(), true);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                Screen::Analysis => {
+                    let team = self.state.selected_analysis().cloned();
+                    if let Some(team) = team {
+                        self.state.screen = Screen::Squad;
+                        let needs_fetch = self.state.squad_team_id != Some(team.id)
+                            || self.state.squad.is_empty();
+                        if needs_fetch && !self.state.squad_loading {
+                            self.request_squad(team.id, team.name.clone(), true);
+                        }
+                    }
+                }
+                Screen::Squad => {
+                    let player = self.state.selected_squad_player().cloned();
+                    if let Some(player) = player {
+                        self.state.screen = Screen::PlayerDetail;
+                        self.state.player_detail_scroll = 0;
+                        self.state.player_detail_section = 0;
+                        self.state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+                        let cached_detail = self.state.player_detail.as_ref();
+                        let cached = cached_detail
+                            .map(|detail| detail.id == player.id)
+                            .unwrap_or(false);
+                        let needs_stats_refresh = cached_detail
+                            .map(|detail| !player_detail_has_stats(detail))
+                            .unwrap_or(false);
+                        if (!cached || needs_stats_refresh) && !self.state.player_loading {
+                            self.request_player_detail(player.id, player.name.clone(), true);
+                        }
+                    }
+                }
+                _ => {}
+            },
             KeyCode::Char('b') | KeyCode::Esc => {
                 self.state.screen = match self.state.screen {
                     Screen::Terminal { .. } => Screen::Pulse,
@@ -128,7 +136,12 @@ impl App {
                         .state
                         .player_detail
                         .as_ref()
-                        .map(|detail| player_detail_section_max_scroll(detail, self.state.player_detail_section))
+                        .map(|detail| {
+                            player_detail_section_max_scroll(
+                                detail,
+                                self.state.player_detail_section,
+                            )
+                        })
                         .unwrap_or(0);
                     self.state.scroll_player_detail_down(max_scroll);
                 } else {
@@ -192,6 +205,11 @@ impl App {
                 }
             }
             KeyCode::Char('i') | KeyCode::Char('I') => self.request_match_details(true),
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                if matches!(self.state.screen, Screen::Analysis) {
+                    self.request_analysis_export(true);
+                }
+            }
             KeyCode::Char('?') => self.state.help_overlay = !self.state.help_overlay,
             _ => {}
         }
@@ -210,7 +228,8 @@ impl App {
     fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
         let Some(tx) = &self.cmd_tx else {
             if announce {
-                self.state.push_log("[INFO] Match details fetch unavailable");
+                self.state
+                    .push_log("[INFO] Match details fetch unavailable");
             }
             return;
         };
@@ -322,6 +341,30 @@ impl App {
         }
     }
 
+    fn request_analysis_export(&mut self, announce: bool) {
+        let Some(tx) = &self.cmd_tx else {
+            if announce {
+                self.state.push_log("[INFO] Export unavailable");
+            }
+            return;
+        };
+
+        let stamp = Local::now().format("%Y%m%d_%H%M%S");
+        let path = format!("worldcup_analysis_{stamp}.xlsx");
+
+        if tx
+            .send(state::ProviderCommand::ExportWorldcupAnalysis { path: path.clone() })
+            .is_err()
+        {
+            if announce {
+                self.state.push_log("[WARN] Export request failed");
+            }
+        } else if announce {
+            self.state
+                .push_log(format!("[INFO] Export started: {path}"));
+        }
+    }
+
     fn maybe_refresh_upcoming(&mut self) {
         if !matches!(self.state.screen, Screen::Pulse) {
             return;
@@ -398,6 +441,7 @@ fn run_app<B: Backend>(
         while let Ok(delta) = rx.try_recv() {
             apply_delta(&mut app.state, delta);
         }
+        app.state.maybe_clear_export(Instant::now());
 
         app.maybe_refresh_upcoming();
         app.maybe_refresh_match_details();
@@ -435,8 +479,8 @@ fn ui(frame: &mut Frame, app: &App) {
         ])
         .split(frame.size());
 
-    let header = Paragraph::new(header_text(&app.state))
-        .block(Block::default().borders(Borders::BOTTOM));
+    let header =
+        Paragraph::new(header_text(&app.state)).block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, chunks[0]);
 
     match app.state.screen {
@@ -447,10 +491,13 @@ fn ui(frame: &mut Frame, app: &App) {
         Screen::PlayerDetail => render_player_detail(frame, chunks[1], &app.state),
     }
 
-    let footer = Paragraph::new(footer_text(&app.state))
-        .block(Block::default().borders(Borders::TOP));
+    let footer =
+        Paragraph::new(footer_text(&app.state)).block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, chunks[2]);
 
+    if app.state.export.active {
+        render_export_overlay(frame, frame.size(), &app.state);
+    }
     if app.state.help_overlay {
         render_help_overlay(frame, frame.size());
     }
@@ -466,10 +513,7 @@ fn header_text(state: &AppState) -> String {
         ),
         Screen::Terminal { .. } => "WC26 TERMINAL".to_string(),
         Screen::Analysis => {
-            let updated = state
-                .analysis_updated
-                .as_deref()
-                .unwrap_or("-");
+            let updated = state.analysis_updated.as_deref().unwrap_or("-");
             let status = if state.analysis_loading {
                 "LOADING"
             } else {
@@ -484,7 +528,11 @@ fn header_text(state: &AppState) -> String {
         }
         Screen::Squad => {
             let team = state.squad_team.as_deref().unwrap_or("-");
-            let status = if state.squad_loading { "LOADING" } else { "READY" };
+            let status = if state.squad_loading {
+                "LOADING"
+            } else {
+                "READY"
+            };
             format!(
                 "WC26 SQUAD | Team: {} | Players: {} | {}",
                 team,
@@ -597,7 +645,10 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
         };
         let match_name = format!("{}-{}", m.home, m.away);
         let score = format!("{}-{}", m.score_home, m.score_away);
-        let hda = format!("H{:.0} D{:.0} A{:.0}", m.win.p_home, m.win.p_draw, m.win.p_away);
+        let hda = format!(
+            "H{:.0} D{:.0} A{:.0}",
+            m.win.p_home, m.win.p_draw, m.win.p_away
+        );
         let delta = format!("{:+.1}", m.win.delta_home);
         let quality = quality_label(m.win.quality).to_string();
         let conf = format!("{}%", m.win.confidence);
@@ -837,10 +888,7 @@ fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState) {
             .fifa_points
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let updated = row
-            .fifa_updated
-            .clone()
-            .unwrap_or_else(|| "-".to_string());
+        let updated = row.fifa_updated.clone().unwrap_or_else(|| "-".to_string());
         let host = if row.host { "yes" } else { "-" };
 
         let sep_style = Style::default().fg(Color::DarkGray);
@@ -990,7 +1038,9 @@ fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
 }
 
 fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().title("Player Detail").borders(Borders::ALL);
+    let block = Block::default()
+        .title("Player Detail")
+        .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -999,15 +1049,14 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     if state.player_loading {
-        let text = Paragraph::new("Loading player details...")
-            .style(Style::default().fg(Color::DarkGray));
+        let text =
+            Paragraph::new("Loading player details...").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(text, inner);
         return;
     }
 
     let Some(detail) = state.player_detail.as_ref() else {
-        let text = Paragraph::new("No player data yet")
-            .style(Style::default().fg(Color::DarkGray));
+        let text = Paragraph::new("No player data yet").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(text, inner);
         return;
     };
@@ -1241,10 +1290,7 @@ fn player_league_stats_text(detail: &PlayerDetail) -> String {
         return "No all-competitions stats".to_string();
     }
     let mut lines = Vec::new();
-    let season_label = detail
-        .all_competitions_season
-        .as_deref()
-        .unwrap_or("-");
+    let season_label = detail.all_competitions_season.as_deref().unwrap_or("-");
     lines.push(format!("All competitions ({season_label})"));
     for stat in detail.all_competitions.iter().take(8) {
         lines.push(format!("{}: {}", stat.title, stat.value));
@@ -1480,7 +1526,11 @@ fn render_vseparator(frame: &mut Frame, area: Rect, style: Style) {
 }
 
 fn win_bar_chart(win: &state::WinProbRow, selected: bool) -> BarChart<'static> {
-    let base_bg = if selected { Some(Color::DarkGray) } else { None };
+    let base_bg = if selected {
+        Some(Color::DarkGray)
+    } else {
+        None
+    };
 
     let mut home_style = Style::default().fg(Color::Green);
     let mut draw_style = Style::default().fg(Color::Yellow);
@@ -1580,8 +1630,8 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(tape, middle_chunks[1]);
 
     let stats_text = stats_text(state);
-    let stats = Paragraph::new(stats_text)
-        .block(Block::default().title("Stats").borders(Borders::ALL));
+    let stats =
+        Paragraph::new(stats_text).block(Block::default().title("Stats").borders(Borders::ALL));
     frame.render_widget(stats, right_chunks[0]);
 
     render_lineups(frame, right_chunks[1], state);
@@ -1846,6 +1896,70 @@ fn parse_kickoff(raw: &str) -> Option<NaiveDateTime> {
     None
 }
 
+fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let popup_area = centered_rect(70, 22, area);
+    frame.render_widget(Clear, popup_area);
+
+    let title = if state.export.done {
+        "Export complete"
+    } else {
+        "Exporting..."
+    };
+
+    let block = Block::default().title(title).borders(Borders::ALL);
+    frame.render_widget(block.clone(), popup_area);
+
+    let inner = block.inner(popup_area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .margin(1)
+        .split(inner);
+
+    let path = state
+        .export
+        .path
+        .clone()
+        .unwrap_or_else(|| "worldcup_analysis.xlsx".to_string());
+
+    let status = if state.export.total == 0 {
+        format!("{path}\n{}", state.export.message)
+    } else {
+        format!(
+            "{path}\n{} ({}/{})",
+            state.export.message, state.export.current, state.export.total
+        )
+    };
+
+    frame.render_widget(Paragraph::new(status), chunks[0]);
+
+    let ratio = if state.export.total == 0 {
+        0.0
+    } else {
+        (state.export.current as f64 / state.export.total as f64).clamp(0.0, 1.0)
+    };
+
+    let gauge = Gauge::default()
+        .ratio(ratio)
+        .label(format!("{:.0}%", ratio * 100.0))
+        .gauge_style(Style::default().fg(Color::LightGreen))
+        .block(Block::default().borders(Borders::ALL));
+
+    frame.render_widget(gauge, chunks[1]);
+
+    let footer = if state.export.done {
+        "Press any key to close"
+    } else {
+        "Please wait"
+    };
+
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let popup_area = centered_rect(60, 60, area);
     frame.render_widget(Clear, popup_area);
@@ -1861,6 +1975,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "  l            League toggle",
         "  u            Upcoming view",
         "  i            Fetch match details",
+        "  e            Export analysis to XLSX",
         "  r            Refresh analysis/squad/player",
         "  ?            Toggle help",
         "  q            Quit",

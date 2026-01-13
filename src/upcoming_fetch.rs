@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -164,7 +164,9 @@ fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
 
     let trimmed = body.trim();
     if trimmed.is_empty() || trimmed == "null" {
-        return Ok(FotmobResponse { leagues: Vec::new() });
+        return Ok(FotmobResponse {
+            leagues: Vec::new(),
+        });
     }
 
     serde_json::from_str(trimmed).context("invalid fotmob json")
@@ -320,11 +322,7 @@ fn parse_player(value: &Value) -> Option<PlayerSlot> {
     }
     let number = pick_u32(value, &["shirtNumber", "number"]);
     let pos = pick_string(value, &["position", "pos", "role", "positionShort"]);
-    Some(PlayerSlot {
-        name,
-        number,
-        pos,
-    })
+    Some(PlayerSlot { name, number, pos })
 }
 
 fn parse_events(value: Option<&Value>, home: &str, away: &str) -> Vec<Event> {
@@ -336,11 +334,11 @@ fn parse_events(value: Option<&Value>, home: &str, away: &str) -> Vec<Event> {
         let Some(kind) = parse_event_kind(entry.get("type").and_then(|v| v.as_str())) else {
             continue;
         };
-        let minute = entry
-            .get("time")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u16;
-        let is_home = entry.get("isHome").and_then(|v| v.as_bool()).unwrap_or(true);
+        let minute = entry.get("time").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let is_home = entry
+            .get("isHome")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let team = if is_home { home } else { away };
         let player = entry
             .get("player")
@@ -366,7 +364,9 @@ fn parse_events(value: Option<&Value>, home: &str, away: &str) -> Vec<Event> {
 }
 
 fn parse_event_kind(event_type: Option<&str>) -> Option<EventKind> {
-    let Some(event_type) = event_type else { return None };
+    let Some(event_type) = event_type else {
+        return None;
+    };
     let lowered = event_type.to_lowercase();
     if lowered.contains("goal") {
         Some(EventKind::Goal)
@@ -408,7 +408,11 @@ fn value_to_string(value: Option<&Value>) -> String {
         Some(Value::String(s)) => s.trim().to_string(),
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(b)) => {
-            if *b { "yes".to_string() } else { "no".to_string() }
+            if *b {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            }
         }
         Some(Value::Null) | None => "-".to_string(),
         Some(other) => other.to_string(),
