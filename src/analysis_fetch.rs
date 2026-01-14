@@ -628,30 +628,81 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         .context("failed to build http client")?;
 
     let url = format!("https://www.fotmob.com/api/playerData?id={player_id}");
-    let resp = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .context("request failed")?;
+    let mut last_err = None;
+    let mut parsed: Option<PlayerDataResponse> = None;
+    for attempt in 0..3 {
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Accept-Language", "en-GB,en;q=0.9")
+            .send();
 
-    let status = resp.status();
-    let body = resp.text().context("failed reading body")?;
-    if !status.is_success() {
-        return Err(anyhow::anyhow!("http {}: {}", status, body));
+        match resp {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = match resp.text() {
+                    Ok(body) => body,
+                    Err(err) => {
+                        last_err = Some(anyhow::anyhow!("failed reading body: {err}"));
+                        if attempt < 2 {
+                            std::thread::sleep(Duration::from_millis(300));
+                            continue;
+                        }
+                        break;
+                    }
+                };
+                if !status.is_success() {
+                    last_err = Some(anyhow::anyhow!("http {}: {}", status, body));
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    break;
+                }
+
+                let trimmed = body.trim();
+                if trimmed.is_empty() || trimmed == "null" {
+                    last_err = Some(anyhow::anyhow!("empty player response"));
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    break;
+                }
+
+                match serde_json::from_str(trimmed) {
+                    Ok(data) => {
+                        parsed = Some(data);
+                        break;
+                    }
+                    Err(err) => {
+                        last_err = Some(anyhow::anyhow!("invalid player json: {err}"));
+                        if attempt < 2 {
+                            std::thread::sleep(Duration::from_millis(300));
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                last_err = Some(anyhow::anyhow!("request failed: {err}"));
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+                break;
+            }
+        }
     }
 
-    let trimmed = body.trim();
-    if trimmed.is_empty() || trimmed == "null" {
-        return Err(anyhow::anyhow!("empty player response"));
-    }
-
-    let parsed: PlayerDataResponse = serde_json::from_str(trimmed)
-        .map_err(|err| anyhow::anyhow!("invalid player json: {err}"))?;
+    let parsed = parsed.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("player fetch failed")))?;
     let mut info_map = std::collections::HashMap::new();
     if let Some(info) = parsed.player_information {
         for row in info {
-            if let Some(value) = row.value {
-                info_map.insert(row.title, info_value_to_string(&value.fallback));
+            if let Some(ref value) = row.value {
+                let key = normalize_player_info_key(&row);
+                info_map.insert(key, info_value_to_string(&value.fallback));
             }
         }
     }
@@ -956,6 +1007,19 @@ fn info_value_to_string(value: &serde_json::Value) -> String {
     }
 }
 
+fn normalize_player_info_key(row: &PlayerInfoRow) -> String {
+    match row.translation_key.as_deref() {
+        Some("height_sentencecase") => "Height".to_string(),
+        Some("age_sentencecase") => "Age".to_string(),
+        Some("preferred_foot") => "Preferred foot".to_string(),
+        Some("country_sentencecase") => "Country".to_string(),
+        Some("shirt") => "Shirt".to_string(),
+        Some("transfer_value") => "Market value".to_string(),
+        Some("contract_end") => "Contract end".to_string(),
+        _ => row.title.clone(),
+    }
+}
+
 fn optional_info_string(value: Option<&serde_json::Value>) -> Option<String> {
     let value = value?;
     let rendered = info_value_to_string(value);
@@ -973,6 +1037,27 @@ where
 {
     let value = Option::<Vec<T>>::deserialize(deserializer)?;
     Ok(value.unwrap_or_default())
+}
+
+fn string_or_default<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let rendered = match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => {
+            if b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    Ok(rendered)
 }
 
 fn value_to_string(value: &serde_json::Value) -> String {
@@ -1131,11 +1216,11 @@ struct PlayerTournamentStat {
     league_name: String,
     #[serde(rename = "seasonName")]
     season_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_default")]
     goals: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_default")]
     assists: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_default")]
     appearances: String,
     rating: Option<PlayerRating>,
 }
@@ -1207,6 +1292,8 @@ struct PlayerPositionSummary {
 #[derive(Debug, Deserialize)]
 struct PlayerInfoRow {
     title: String,
+    #[serde(rename = "translationKey")]
+    translation_key: Option<String>,
     value: Option<PlayerInfoValue>,
 }
 

@@ -226,8 +226,9 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let _ = tx.send(Delta::SetPlayerDetail(detail));
                         }
                         Err(err) => {
-                            let _ =
-                                tx.send(Delta::Log(format!("[WARN] Player fetch failed: {err}")));
+                            let _ = tx.send(Delta::Log(format!(
+                                "[WARN] Player fetch failed: {err}"
+                            )));
                             let _ = tx.send(Delta::SetPlayerDetail(crate::state::PlayerDetail {
                                 id: player_id,
                                 name: player_name,

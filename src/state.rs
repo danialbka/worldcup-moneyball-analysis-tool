@@ -808,11 +808,19 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.squad_team_id = Some(team_id);
         }
         Delta::SetPlayerDetail(detail) => {
-            state.player_detail = Some(detail);
+            let is_stub = player_detail_is_stub(&detail);
+            let keep_existing = state
+                .player_detail
+                .as_ref()
+                .map(|existing| existing.id == detail.id && !player_detail_is_stub(existing))
+                .unwrap_or(false);
+            if !is_stub || !keep_existing {
+                state.player_detail = Some(detail);
+                state.player_detail_scroll = 0;
+                state.player_detail_section = 0;
+                state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+            }
             state.player_loading = false;
-            state.player_detail_scroll = 0;
-            state.player_detail_section = 0;
-            state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
         }
         Delta::ExportStarted { path, total } => {
             state.export.active = true;
@@ -917,4 +925,31 @@ pub fn confed_label(confed: Confederation) -> &'static str {
         Confederation::UEFA => "UEFA",
         Confederation::OFC => "OFC",
     }
+}
+
+fn player_detail_is_stub(detail: &PlayerDetail) -> bool {
+    detail.team.is_none()
+        && detail.position.is_none()
+        && detail.age.is_none()
+        && detail.country.is_none()
+        && detail.height.is_none()
+        && detail.preferred_foot.is_none()
+        && detail.shirt.is_none()
+        && detail.market_value.is_none()
+        && detail.contract_end.is_none()
+        && detail.birth_date.is_none()
+        && detail.status.is_none()
+        && detail.injury_info.is_none()
+        && detail.international_duty.is_none()
+        && detail.positions.is_empty()
+        && detail.all_competitions.is_empty()
+        && detail.all_competitions_season.is_none()
+        && detail.main_league.is_none()
+        && detail.top_stats.is_empty()
+        && detail.season_groups.is_empty()
+        && detail.traits.is_none()
+        && detail.recent_matches.is_empty()
+        && detail.season_breakdown.is_empty()
+        && detail.career_sections.is_empty()
+        && detail.trophies.is_empty()
 }

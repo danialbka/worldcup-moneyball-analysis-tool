@@ -1298,16 +1298,28 @@ fn player_info_text(detail: &PlayerDetail) -> String {
 }
 
 fn player_league_stats_text(detail: &PlayerDetail) -> String {
-    if detail.all_competitions.is_empty() {
-        return "No all-competitions stats".to_string();
+    if !detail.all_competitions.is_empty() {
+        let mut lines = Vec::new();
+        let season_label = detail.all_competitions_season.as_deref().unwrap_or("-");
+        lines.push(format!("All competitions ({season_label})"));
+        for stat in detail.all_competitions.iter().take(8) {
+            lines.push(format!("{}: {}", stat.title, stat.value));
+        }
+        return lines.join("\n");
     }
-    let mut lines = Vec::new();
-    let season_label = detail.all_competitions_season.as_deref().unwrap_or("-");
-    lines.push(format!("All competitions ({season_label})"));
-    for stat in detail.all_competitions.iter().take(8) {
-        lines.push(format!("{}: {}", stat.title, stat.value));
+
+    if let Some(league) = detail.main_league.as_ref() {
+        if !league.stats.is_empty() {
+            let mut lines = Vec::new();
+            lines.push(format!("{} ({})", league.league_name, league.season));
+            for stat in league.stats.iter().take(8) {
+                lines.push(format!("{}: {}", stat.title, stat.value));
+            }
+            return lines.join("\n");
+        }
     }
-    lines.join("\n")
+
+    "No league stats available".to_string()
 }
 
 fn player_top_stats_text(detail: &PlayerDetail) -> String {
