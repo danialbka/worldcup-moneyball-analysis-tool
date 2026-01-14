@@ -603,11 +603,25 @@ pub struct PlayerDetail {
     pub main_league: Option<PlayerLeagueStats>,
     pub top_stats: Vec<PlayerStatItem>,
     pub season_groups: Vec<PlayerStatGroup>,
+    pub season_performance: Vec<PlayerSeasonPerformanceGroup>,
     pub traits: Option<PlayerTraitGroup>,
     pub recent_matches: Vec<PlayerMatchStat>,
     pub season_breakdown: Vec<PlayerSeasonTournamentStat>,
     pub career_sections: Vec<PlayerCareerSection>,
     pub trophies: Vec<PlayerTrophyEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerSeasonPerformanceGroup {
+    pub title: String,
+    pub items: Vec<PlayerSeasonPerformanceItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerSeasonPerformanceItem {
+    pub title: String,
+    pub total: String,
+    pub per90: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -947,6 +961,7 @@ fn player_detail_is_stub(detail: &PlayerDetail) -> bool {
         && detail.main_league.is_none()
         && detail.top_stats.is_empty()
         && detail.season_groups.is_empty()
+        && detail.season_performance.is_empty()
         && detail.traits.is_none()
         && detail.recent_matches.is_empty()
         && detail.season_breakdown.is_empty()

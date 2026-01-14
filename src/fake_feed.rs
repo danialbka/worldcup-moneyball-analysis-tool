@@ -251,6 +251,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 main_league: None,
                                 top_stats: Vec::new(),
                                 season_groups: Vec::new(),
+                                season_performance: Vec::new(),
                                 traits: None,
                                 recent_matches: Vec::new(),
                                 season_breakdown: Vec::new(),

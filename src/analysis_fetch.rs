@@ -5,8 +5,9 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 
 use crate::state::{
-    Confederation, PlayerDetail, PlayerLeagueStats, PlayerMatchStat, PlayerStatGroup,
-    PlayerStatItem, PlayerTraitGroup, PlayerTraitItem, SquadPlayer, TeamAnalysis,
+    Confederation, PlayerDetail, PlayerLeagueStats, PlayerMatchStat, PlayerSeasonPerformanceGroup,
+    PlayerSeasonPerformanceItem, PlayerStatGroup, PlayerStatItem, PlayerTraitGroup,
+    PlayerTraitItem, SquadPlayer, TeamAnalysis,
 };
 
 const FOTMOB_TEAM_URL: &str = "https://www.fotmob.com/api/teams?id=";
@@ -803,6 +804,41 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         })
         .collect::<Vec<_>>();
 
+    let season_performance = season_items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, group)| {
+            let title = group
+                .title
+                .as_ref()
+                .filter(|t| !t.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("Stats Group {}", idx + 1));
+            let items = group
+                .items
+                .as_ref()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|stat| PlayerSeasonPerformanceItem {
+                            title: stat.title.clone(),
+                            total: format_stat_value(
+                                &stat.stat_value,
+                                stat.stat_format.as_deref(),
+                            ),
+                            per90: format_per90(stat.per90, stat.stat_format.as_deref()),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if items.is_empty() {
+                None
+            } else {
+                Some(PlayerSeasonPerformanceGroup { title, items })
+            }
+        })
+        .collect::<Vec<_>>();
+
     let season_groups = season_items
         .into_iter()
         .enumerate()
@@ -817,7 +853,7 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
                 .into_iter()
                 .map(|stat| PlayerStatItem {
                     title: stat.title,
-                    value: value_to_string(&stat.stat_value),
+                    value: format_stat_value(&stat.stat_value, stat.stat_format.as_deref()),
                 })
                 .collect::<Vec<_>>();
             if items.is_empty() {
@@ -977,6 +1013,7 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         main_league,
         top_stats,
         season_groups,
+        season_performance,
         traits,
         recent_matches,
         season_breakdown,
@@ -1060,6 +1097,19 @@ where
     Ok(rendered)
 }
 
+fn float_or_none<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(n) => Ok(n.as_f64()),
+        serde_json::Value::String(s) => Ok(s.parse::<f64>().ok()),
+        serde_json::Value::Null => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 fn value_to_string(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.trim().to_string(),
@@ -1074,6 +1124,27 @@ fn value_to_string(value: &serde_json::Value) -> String {
         serde_json::Value::Null => "-".to_string(),
         other => other.to_string(),
     }
+}
+
+fn format_stat_value(value: &serde_json::Value, stat_format: Option<&str>) -> String {
+    let mut rendered = value_to_string(value);
+    if stat_format == Some("percent") && rendered != "-" && !rendered.ends_with('%') {
+        rendered.push('%');
+    }
+    rendered
+}
+
+fn format_per90(value: Option<f64>, stat_format: Option<&str>) -> Option<String> {
+    let value = value?;
+    let mut rendered = if value.fract().abs() < 0.005 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    };
+    if stat_format == Some("percent") && !rendered.ends_with('%') {
+        rendered.push('%');
+    }
+    Some(rendered)
 }
 
 fn empty_to_dash(value: String) -> String {
@@ -1332,6 +1403,11 @@ struct PlayerStatValueDetail {
     #[serde(rename = "statValue")]
     #[serde(default)]
     stat_value: serde_json::Value,
+    #[serde(rename = "statFormat")]
+    #[serde(default)]
+    stat_format: Option<String>,
+    #[serde(rename = "per90", default, deserialize_with = "float_or_none")]
+    per90: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

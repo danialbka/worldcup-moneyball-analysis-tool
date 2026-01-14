@@ -1084,7 +1084,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let league_text = player_league_stats_text(detail);
     let top_text = player_top_stats_text(detail);
     let traits_text = player_traits_text(detail);
-    let other_text = player_other_stats_text(detail);
+    let other_text = player_season_performance_text(detail);
     let season_text = player_season_breakdown_text(detail);
     let career_text = player_career_text(detail);
     let trophies_text = player_trophies_text(detail);
@@ -1165,7 +1165,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     render_detail_section(
         frame,
         left_sections[4],
-        "Other Stats",
+        "Season Performance",
         &other_text,
         state.player_detail_section_scrolls[4],
         state.player_detail_section == 4,
@@ -1215,6 +1215,7 @@ fn player_detail_has_stats(detail: &PlayerDetail) -> bool {
         || detail.main_league.is_some()
         || !detail.top_stats.is_empty()
         || !detail.season_groups.is_empty()
+        || !detail.season_performance.is_empty()
         || detail
             .traits
             .as_ref()
@@ -1236,7 +1237,7 @@ fn player_detail_text(detail: &PlayerDetail) -> String {
     lines.push(String::new());
     lines.push(player_traits_text(detail));
     lines.push(String::new());
-    lines.push(player_other_stats_text(detail));
+    lines.push(player_season_performance_text(detail));
     lines.push(String::new());
     lines.push(player_season_breakdown_text(detail));
     lines.push(String::new());
@@ -1345,15 +1346,46 @@ fn player_traits_text(detail: &PlayerDetail) -> String {
     lines.join("\n")
 }
 
-fn player_other_stats_text(detail: &PlayerDetail) -> String {
-    if detail.season_groups.is_empty() {
-        return "No additional stats".to_string();
+fn player_minutes_played(detail: &PlayerDetail) -> Option<String> {
+    let league = detail.main_league.as_ref()?;
+    league
+        .stats
+        .iter()
+        .find(|stat| stat.title.to_lowercase().contains("minutes"))
+        .map(|stat| format_with_commas(&stat.value))
+}
+
+fn format_with_commas(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(trimmed.len() + trimmed.len() / 3);
+    let len = trimmed.len();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        out.push(ch);
+        let remaining = len - idx - 1;
+        if remaining > 0 && remaining % 3 == 0 {
+            out.push(',');
+        }
+    }
+    out
+}
+
+fn player_season_performance_text(detail: &PlayerDetail) -> String {
+    if detail.season_performance.is_empty() {
+        return "No season performance stats".to_string();
     }
     let mut lines = Vec::new();
-    for group in detail.season_groups.iter().take(3) {
+    if let Some(minutes) = player_minutes_played(detail) {
+        lines.push(format!("Minutes played: {minutes}"));
+    }
+    lines.push("Total | Per 90".to_string());
+    for group in &detail.season_performance {
         lines.push(format!("{}:", group.title));
-        for item in group.items.iter().take(5) {
-            lines.push(format!("  {}: {}", item.title, item.value));
+        for item in &group.items {
+            let per90 = item.per90.as_deref().unwrap_or("-");
+            lines.push(format!("  {}: {} | {}", item.title, item.total, per90));
         }
     }
     lines.join("\n")
@@ -1515,7 +1547,7 @@ fn player_detail_section_max_scroll(detail: &PlayerDetail, section: usize) -> u1
         1 => player_league_stats_text(detail),
         2 => player_top_stats_text(detail),
         3 => player_traits_text(detail),
-        4 => player_other_stats_text(detail),
+        4 => player_season_performance_text(detail),
         5 => player_season_breakdown_text(detail),
         6 => player_career_text(detail),
         7 => player_trophies_text(detail),
