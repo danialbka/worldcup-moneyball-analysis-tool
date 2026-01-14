@@ -184,8 +184,15 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                         }
                         last_upcoming = Instant::now();
                     }
-                    ProviderCommand::FetchAnalysis => {
-                        let result = analysis_fetch::fetch_worldcup_team_analysis();
+                    ProviderCommand::FetchAnalysis { mode } => {
+                        let result = match mode {
+                            crate::state::LeagueMode::PremierLeague => {
+                                analysis_fetch::fetch_premier_league_team_analysis()
+                            }
+                            crate::state::LeagueMode::WorldCup => {
+                                analysis_fetch::fetch_worldcup_team_analysis()
+                            }
+                        };
                         for err in result.errors {
                             let _ = tx.send(Delta::Log(format!("[WARN] Analysis fetch: {err}")));
                         }
@@ -251,7 +258,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             }));
                         }
                     },
-                    ProviderCommand::ExportWorldcupAnalysis { path } => {
+                    ProviderCommand::ExportAnalysis { path, mode } => {
                         let tx = tx.clone();
                         std::thread::spawn(move || {
                             let _ = tx.send(Delta::ExportStarted {
@@ -265,8 +272,9 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let mut last_total = 0usize;
 
                             let report =
-                                crate::analysis_export::export_worldcup_analysis_with_progress(
+                                crate::analysis_export::export_analysis_with_progress(
                                     path.as_ref(),
+                                    mode,
                                     |progress| {
                                         last_current = progress.current;
                                         last_total = progress.total;

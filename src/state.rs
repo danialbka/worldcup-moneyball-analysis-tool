@@ -145,6 +145,19 @@ impl AppState {
         };
         self.selected = 0;
         self.upcoming_scroll = 0;
+        self.analysis.clear();
+        self.analysis_selected = 0;
+        self.analysis_loading = false;
+        self.analysis_updated = None;
+        self.squad.clear();
+        self.squad_selected = 0;
+        self.squad_loading = false;
+        self.squad_team = None;
+        self.squad_team_id = None;
+        self.player_detail = None;
+        self.player_loading = false;
+        self.player_last_id = None;
+        self.player_last_name = None;
         self.push_log(format!(
             "[INFO] League mode: {}",
             league_label(self.league_mode)
@@ -730,10 +743,10 @@ pub enum Delta {
 pub enum ProviderCommand {
     FetchMatchDetails { fixture_id: String },
     FetchUpcoming,
-    FetchAnalysis,
+    FetchAnalysis { mode: LeagueMode },
     FetchSquad { team_id: u32, team_name: String },
     FetchPlayer { player_id: u32, player_name: String },
-    ExportWorldcupAnalysis { path: String },
+    ExportAnalysis { path: String, mode: LeagueMode },
 }
 
 pub fn apply_delta(state: &mut AppState, delta: Delta) {

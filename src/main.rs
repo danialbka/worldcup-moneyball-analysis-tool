@@ -23,8 +23,8 @@ mod state;
 mod upcoming_fetch;
 
 use crate::state::{
-    AppState, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen, apply_delta, confed_label,
-    league_label,
+    AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen, apply_delta,
+    confed_label, league_label,
 };
 
 struct App {
@@ -165,6 +165,9 @@ impl App {
                 if self.state.pulse_view == PulseView::Upcoming {
                     self.request_upcoming(true);
                 }
+                if matches!(self.state.screen, Screen::Analysis) {
+                    self.request_analysis(true);
+                }
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 let to_upcoming = self.state.pulse_view == PulseView::Live;
@@ -277,7 +280,8 @@ impl App {
             }
             return;
         };
-        if tx.send(state::ProviderCommand::FetchAnalysis).is_err() {
+        let mode = self.state.league_mode;
+        if tx.send(state::ProviderCommand::FetchAnalysis { mode }).is_err() {
             if announce {
                 self.state.push_log("[WARN] Analysis request failed");
             }
@@ -350,10 +354,17 @@ impl App {
         };
 
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
-        let path = format!("worldcup_analysis_{stamp}.xlsx");
+        let (mode, prefix) = match self.state.league_mode {
+            LeagueMode::PremierLeague => (LeagueMode::PremierLeague, "premier_league"),
+            LeagueMode::WorldCup => (LeagueMode::WorldCup, "worldcup"),
+        };
+        let path = format!("{prefix}_analysis_{stamp}.xlsx");
 
         if tx
-            .send(state::ProviderCommand::ExportWorldcupAnalysis { path: path.clone() })
+            .send(state::ProviderCommand::ExportAnalysis {
+                path: path.clone(),
+                mode,
+            })
             .is_err()
         {
             if announce {
@@ -520,7 +531,8 @@ fn header_text(state: &AppState) -> String {
                 "READY"
             };
             format!(
-                "WC26 ANALYSIS | Teams: {} | FIFA: {} | {}",
+                "WC26 ANALYSIS | {} | Teams: {} | FIFA: {} | {}",
+                league_label(state.league_mode),
                 state.analysis.len(),
                 updated,
                 status
@@ -1924,7 +1936,7 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         .export
         .path
         .clone()
-        .unwrap_or_else(|| "worldcup_analysis.xlsx".to_string());
+        .unwrap_or_else(|| "analysis.xlsx".to_string());
 
     let status = if state.export.total == 0 {
         format!("{path}\n{}", state.export.message)
@@ -1975,7 +1987,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "  l            League toggle",
         "  u            Upcoming view",
         "  i            Fetch match details",
-        "  e            Export analysis to XLSX",
+        "  e            Export analysis to XLSX (current league)",
         "  r            Refresh analysis/squad/player",
         "  ?            Toggle help",
         "  q            Quit",

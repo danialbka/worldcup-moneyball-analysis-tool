@@ -10,6 +10,29 @@ use crate::state::{
 };
 
 const FOTMOB_TEAM_URL: &str = "https://www.fotmob.com/api/teams?id=";
+const FOTMOB_LEAGUE_URL: &str = "https://www.fotmob.com/api/leagues?id=";
+const PREMIER_LEAGUE_FALLBACK: &[(&str, u32)] = &[
+    ("AFC Bournemouth", 8678),
+    ("Arsenal", 9825),
+    ("Aston Villa", 10252),
+    ("Brentford", 9937),
+    ("Brighton & Hove Albion", 10204),
+    ("Burnley", 8191),
+    ("Chelsea", 8455),
+    ("Crystal Palace", 9826),
+    ("Everton", 8668),
+    ("Fulham", 9879),
+    ("Leeds United", 8463),
+    ("Liverpool", 8650),
+    ("Manchester City", 8456),
+    ("Manchester United", 10260),
+    ("Newcastle United", 10261),
+    ("Nottingham Forest", 10203),
+    ("Sunderland", 8472),
+    ("Tottenham Hotspur", 8586),
+    ("West Ham United", 8654),
+    ("Wolverhampton Wanderers", 8602),
+];
 
 pub struct AnalysisFetch {
     pub teams: Vec<TeamAnalysis>,
@@ -22,6 +45,12 @@ struct NationInfo {
     confed: Confederation,
     host: bool,
     team_id: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct LeagueTeam {
+    id: u32,
+    name: String,
 }
 
 const WORLD_CUP_TEAMS: &[NationInfo] = &[
@@ -314,6 +343,52 @@ pub fn fetch_worldcup_team_analysis() -> AnalysisFetch {
     AnalysisFetch { teams, errors }
 }
 
+pub fn fetch_premier_league_team_analysis() -> AnalysisFetch {
+    let mut errors = Vec::new();
+    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(client) => client,
+        Err(err) => {
+            errors.push(format!("analysis client build failed: {err}"));
+            return AnalysisFetch {
+                teams: Vec::new(),
+                errors,
+            };
+        }
+    };
+
+    let teams = match fetch_league_teams(&client, 47) {
+        Ok(teams) => teams,
+        Err(err) => {
+            errors.push(format!("premier league teams fetch failed: {err}"));
+            fallback_premier_league_teams()
+        }
+    };
+
+    let mut analysis = Vec::new();
+    for team in teams {
+        match fetch_team_overview(&client, team.id) {
+            Ok(overview) => analysis.push(TeamAnalysis {
+                id: team.id,
+                name: team.name,
+                confed: Confederation::UEFA,
+                host: false,
+                fifa_rank: overview.fifa_rank,
+                fifa_points: overview.fifa_points,
+                fifa_updated: overview.fifa_updated,
+            }),
+            Err(err) => {
+                errors.push(format!("{} fetch failed: {err}", team.name));
+                analysis.push(empty_club_analysis(&team));
+            }
+        }
+    }
+
+    AnalysisFetch {
+        teams: analysis,
+        errors,
+    }
+}
+
 fn empty_analysis(nation: &NationInfo) -> TeamAnalysis {
     TeamAnalysis {
         id: nation.team_id,
@@ -324,6 +399,79 @@ fn empty_analysis(nation: &NationInfo) -> TeamAnalysis {
         fifa_points: None,
         fifa_updated: None,
     }
+}
+
+fn empty_club_analysis(team: &LeagueTeam) -> TeamAnalysis {
+    TeamAnalysis {
+        id: team.id,
+        name: team.name.clone(),
+        confed: Confederation::UEFA,
+        host: false,
+        fifa_rank: None,
+        fifa_points: None,
+        fifa_updated: None,
+    }
+}
+
+fn fallback_premier_league_teams() -> Vec<LeagueTeam> {
+    PREMIER_LEAGUE_FALLBACK
+        .iter()
+        .map(|(name, id)| LeagueTeam {
+            id: *id,
+            name: (*name).to_string(),
+        })
+        .collect()
+}
+
+fn fetch_league_teams(client: &Client, league_id: u32) -> Result<Vec<LeagueTeam>> {
+    let url = format!("{FOTMOB_LEAGUE_URL}{league_id}");
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .context("league request failed")?;
+
+    let status = resp.status();
+    let body = resp.text().context("failed reading league body")?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("http {}: {}", status, body));
+    }
+
+    let trimmed = body.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Err(anyhow::anyhow!("empty league response"));
+    }
+
+    let parsed: LeagueResponse = serde_json::from_str(trimmed).context("invalid league json")?;
+    let mut teams = parsed
+        .overview
+        .and_then(|overview| overview.matches)
+        .and_then(|matches| matches.fixture_info)
+        .map(|info| info.teams)
+        .unwrap_or_default();
+
+    if teams.is_empty() {
+        teams = parsed
+            .stats
+            .and_then(|stats| stats.teams)
+            .unwrap_or_default();
+    }
+
+    if teams.is_empty() {
+        teams = parsed
+            .fixtures
+            .and_then(|fixtures| fixtures.fixture_info)
+            .map(|info| info.teams)
+            .unwrap_or_default();
+    }
+
+    if teams.is_empty() {
+        return Err(anyhow::anyhow!("no teams found for league {league_id}"));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    teams.retain(|team| seen.insert(team.id));
+    Ok(teams)
 }
 
 fn fetch_team_overview(client: &Client, team_id: u32) -> Result<TeamOverview> {
@@ -360,6 +508,40 @@ struct TeamOverview {
     fifa_rank: Option<u32>,
     fifa_points: Option<u32>,
     fifa_updated: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeagueResponse {
+    overview: Option<LeagueOverview>,
+    fixtures: Option<LeagueFixtures>,
+    stats: Option<LeagueStats>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeagueOverview {
+    matches: Option<LeagueMatches>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeagueMatches {
+    #[serde(rename = "fixtureInfo")]
+    fixture_info: Option<LeagueFixtureInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeagueFixtures {
+    #[serde(rename = "fixtureInfo")]
+    fixture_info: Option<LeagueFixtureInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeagueFixtureInfo {
+    teams: Vec<LeagueTeam>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeagueStats {
+    teams: Option<Vec<LeagueTeam>>,
 }
 
 #[derive(Debug, Deserialize)]

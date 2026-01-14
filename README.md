@@ -45,7 +45,7 @@ Global:
 - `l`: Toggle league mode (Premier League / World Cup)
 - `u`: Toggle Upcoming view and fetch matchday list
 - `i`: Fetch match details (lineups/events/stats)
-- `e`: Export World Cup analysis XLSX (from Analysis screen)
+- `e`: Export analysis XLSX (from Analysis screen, current league)
 - `?`: Help overlay
 - `q`: Quit
 
