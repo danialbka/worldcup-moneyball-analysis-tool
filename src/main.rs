@@ -18,13 +18,15 @@ use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Clear, Gauge, Pa
 
 mod analysis_export;
 mod analysis_fetch;
+mod analysis_rankings;
 mod fake_feed;
+mod persist;
 mod state;
 mod upcoming_fetch;
 
 use crate::state::{
     AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen, apply_delta,
-    confed_label, league_label,
+    confed_label, league_label, metric_label, role_label,
 };
 
 struct App {
@@ -86,13 +88,53 @@ impl App {
                     }
                 }
                 Screen::Analysis => {
-                    let team = self.state.selected_analysis().cloned();
-                    if let Some(team) = team {
-                        self.state.screen = Screen::Squad;
-                        let needs_fetch = self.state.squad_team_id != Some(team.id)
-                            || self.state.squad.is_empty();
-                        if needs_fetch && !self.state.squad_loading {
-                            self.request_squad(team.id, team.name.clone(), true);
+                    if self.state.analysis_tab == crate::state::AnalysisTab::Teams {
+                        let team = self.state.selected_analysis().cloned();
+                        if let Some(team) = team {
+                            self.state.screen = Screen::Squad;
+                            let needs_fetch = self.state.squad_team_id != Some(team.id)
+                                || self.state.squad.is_empty();
+                            if needs_fetch && !self.state.squad_loading {
+                                self.request_squad(team.id, team.name.clone(), true);
+                            }
+                        }
+                    } else {
+                        // Rankings: open player detail directly.
+                        let entry = {
+                            let mut rows: Vec<&crate::state::RoleRankingEntry> = self
+                                .state
+                                .rankings
+                                .iter()
+                                .filter(|r| r.role == self.state.rankings_role)
+                                .collect();
+                            match self.state.rankings_metric {
+                                crate::state::RankMetric::Attacking => {
+                                    rows.sort_by(|a, b| b.attack_score.total_cmp(&a.attack_score))
+                                }
+                                crate::state::RankMetric::Defending => {
+                                    rows.sort_by(|a, b| b.defense_score.total_cmp(&a.defense_score))
+                                }
+                            }
+                            rows.get(self.state.rankings_selected).copied().cloned()
+                        };
+
+                        if let Some(entry) = entry {
+                            self.state.screen = Screen::PlayerDetail;
+                            self.state.player_detail_back = Screen::Analysis;
+                            self.state.player_detail_scroll = 0;
+                            self.state.player_detail_section = 0;
+                            self.state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+                            self.state.player_last_id = Some(entry.player_id);
+                            self.state.player_last_name = Some(entry.player_name.clone());
+
+                            if let Some(cached) =
+                                self.state.rankings_cache_players.get(&entry.player_id).cloned()
+                            {
+                                self.state.player_detail = Some(cached);
+                                self.state.player_loading = false;
+                            } else if !self.state.player_loading {
+                                self.request_player_detail(entry.player_id, entry.player_name.clone(), true);
+                            }
                         }
                     }
                 }
@@ -100,6 +142,7 @@ impl App {
                     let player = self.state.selected_squad_player().cloned();
                     if let Some(player) = player {
                         self.state.screen = Screen::PlayerDetail;
+                        self.state.player_detail_back = Screen::Squad;
                         self.state.player_detail_scroll = 0;
                         self.state.player_detail_section = 0;
                         self.state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
@@ -122,13 +165,16 @@ impl App {
                     Screen::Terminal { .. } => Screen::Pulse,
                     Screen::Analysis => Screen::Pulse,
                     Screen::Squad => Screen::Analysis,
-                    Screen::PlayerDetail => Screen::Squad,
+                    Screen::PlayerDetail => self.state.player_detail_back.clone(),
                     Screen::Pulse => Screen::Pulse,
                 };
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if matches!(self.state.screen, Screen::Analysis) {
-                    self.state.select_analysis_next();
+                    match self.state.analysis_tab {
+                        crate::state::AnalysisTab::Teams => self.state.select_analysis_next(),
+                        crate::state::AnalysisTab::RoleRankings => self.state.select_rankings_next(),
+                    }
                 } else if matches!(self.state.screen, Screen::Squad) {
                     self.state.select_squad_next();
                 } else if matches!(self.state.screen, Screen::PlayerDetail) {
@@ -150,7 +196,10 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if matches!(self.state.screen, Screen::Analysis) {
-                    self.state.select_analysis_prev();
+                    match self.state.analysis_tab {
+                        crate::state::AnalysisTab::Teams => self.state.select_analysis_prev(),
+                        crate::state::AnalysisTab::RoleRankings => self.state.select_rankings_prev(),
+                    }
                 } else if matches!(self.state.screen, Screen::Squad) {
                     self.state.select_squad_prev();
                 } else if matches!(self.state.screen, Screen::PlayerDetail) {
@@ -159,9 +208,21 @@ impl App {
                     self.state.select_prev();
                 }
             }
-            KeyCode::Char('s') => self.state.cycle_sort(),
+            KeyCode::Char('s') => {
+                if matches!(self.state.screen, Screen::Analysis)
+                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                {
+                    self.state.cycle_rankings_metric();
+                } else {
+                    self.state.cycle_sort();
+                }
+            }
             KeyCode::Char('l') | KeyCode::Char('L') => {
+                // Persist current league cache before switching away.
+                crate::persist::save_from_state(&self.state);
                 self.state.cycle_league_mode();
+                // Load cache for the newly selected league.
+                crate::persist::load_into_state(&mut self.state);
                 self.request_upcoming(true);
                 if matches!(self.state.screen, Screen::Analysis) {
                     self.request_analysis(true);
@@ -175,7 +236,13 @@ impl App {
                 }
             }
             KeyCode::Tab => {
-                if matches!(self.state.screen, Screen::PlayerDetail) {
+                if matches!(self.state.screen, Screen::Analysis) {
+                    self.state.cycle_analysis_tab();
+                    if self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings {
+                        self.request_rankings_cache_warm_missing(true);
+                        self.recompute_rankings_from_cache();
+                    }
+                } else if matches!(self.state.screen, Screen::PlayerDetail) {
                     self.state.cycle_player_detail_section_next();
                 }
             }
@@ -184,8 +251,57 @@ impl App {
                     self.state.cycle_player_detail_section_prev();
                 }
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
+            KeyCode::Left => {
+                if matches!(self.state.screen, Screen::Analysis)
+                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                {
+                    self.state.cycle_rankings_role_prev();
+                }
+            }
+            KeyCode::Right => {
+                if matches!(self.state.screen, Screen::Analysis)
+                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                {
+                    self.state.cycle_rankings_role_next();
+                }
+            }
+            KeyCode::Char('r') => {
                 if matches!(self.state.screen, Screen::Analysis) {
+                    match self.state.analysis_tab {
+                        crate::state::AnalysisTab::Teams => self.request_analysis(true),
+                        crate::state::AnalysisTab::RoleRankings => {
+                            // Incremental: fetch only missing squads/players.
+                            self.request_rankings_cache_warm_missing(true);
+                            self.recompute_rankings_from_cache();
+                        }
+                    }
+                } else if matches!(self.state.screen, Screen::Squad) {
+                    if let Some(team_id) = self.state.squad_team_id {
+                        let team_name = self
+                            .state
+                            .squad_team
+                            .clone()
+                            .unwrap_or_else(|| "Team".to_string());
+                        self.request_squad(team_id, team_name, true);
+                    }
+                } else if matches!(self.state.screen, Screen::PlayerDetail) {
+                    if let (Some(player_id), Some(player_name)) = (
+                        self.state.player_last_id,
+                        self.state.player_last_name.clone(),
+                    ) {
+                        self.request_player_detail(player_id, player_name, true);
+                    }
+                }
+            }
+            KeyCode::Char('R') => {
+                if matches!(self.state.screen, Screen::Analysis)
+                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                {
+                    // Full refresh for latest data.
+                    self.clear_rankings_cache();
+                    self.request_rankings_cache_warm_full(true);
+                    self.recompute_rankings_from_cache();
+                } else if matches!(self.state.screen, Screen::Analysis) {
                     self.request_analysis(true);
                 } else if matches!(self.state.screen, Screen::Squad) {
                     if let Some(team_id) = self.state.squad_team_id {
@@ -289,6 +405,145 @@ impl App {
             }
             self.state.analysis_loading = true;
         }
+    }
+
+    fn request_rankings_cache_warm_full(&mut self, announce: bool) {
+        let Some(tx) = &self.cmd_tx else {
+            if announce {
+                self.state.push_log("[INFO] Rankings cache warm unavailable");
+            }
+            return;
+        };
+        let mode = self.state.league_mode;
+        if tx.send(state::ProviderCommand::WarmRankCacheFull { mode }).is_err()
+        {
+            if announce {
+                self.state.push_log("[WARN] Rankings cache warm request failed");
+            }
+        } else {
+            if announce {
+                self.state.push_log("[INFO] Rankings cache warm started");
+            }
+            self.state.rankings_loading = true;
+            self.state.rankings_progress_current = 0;
+            self.state.rankings_progress_total = 0;
+            self.state.rankings_progress_message = "Starting rankings".to_string();
+        }
+    }
+
+    fn request_rankings_cache_warm_missing(&mut self, announce: bool) {
+        let Some(tx) = &self.cmd_tx else {
+            if announce {
+                self.state.push_log("[INFO] Rankings cache warm unavailable");
+            }
+            return;
+        };
+        if self.state.rankings_loading {
+            if announce {
+                self.state.push_log("[INFO] Rankings cache already warming");
+            }
+            return;
+        }
+        if self.state.analysis.is_empty() {
+            if announce {
+                self.state.push_log("[INFO] No teams loaded yet (fetch Analysis first)");
+            }
+            return;
+        }
+
+        let mut team_ids: Vec<u32> = Vec::new();
+        let mut player_ids: Vec<u32> = Vec::new();
+
+        // Missing squads for teams.
+        for team in &self.state.analysis {
+            if !self.state.rankings_cache_squads.contains_key(&team.id) {
+                team_ids.push(team.id);
+            }
+        }
+
+        // Missing player details for cached squads.
+        for squad in self.state.rankings_cache_squads.values() {
+            for p in squad {
+                let missing = self
+                    .state
+                    .rankings_cache_players
+                    .get(&p.id)
+                    .map(|d| crate::state::player_detail_is_stub(d))
+                    .unwrap_or(true);
+                if missing {
+                    player_ids.push(p.id);
+                }
+            }
+        }
+
+        team_ids.sort_unstable();
+        team_ids.dedup();
+        player_ids.sort_unstable();
+        player_ids.dedup();
+
+        if team_ids.is_empty() && player_ids.is_empty() {
+            if announce {
+                self.state.push_log("[INFO] Rankings cache already warm");
+            }
+            return;
+        }
+        if announce {
+            self.state.push_log(format!(
+                "[INFO] Rankings warm missing: {} squads, {} players",
+                team_ids.len(),
+                player_ids.len()
+            ));
+        }
+
+        let mode = self.state.league_mode;
+        if tx
+            .send(state::ProviderCommand::WarmRankCacheMissing {
+                mode,
+                team_ids,
+                player_ids,
+            })
+            .is_err()
+        {
+            if announce {
+                self.state.push_log("[WARN] Rankings missing-cache request failed");
+            }
+        } else {
+            if announce {
+                self.state.push_log("[INFO] Rankings missing-cache request sent");
+            }
+            self.state.rankings_loading = true;
+            self.state.rankings_progress_current = 0;
+            self.state.rankings_progress_total = 0;
+            self.state.rankings_progress_message = "Warming missing cache".to_string();
+        }
+    }
+
+    fn clear_rankings_cache(&mut self) {
+        self.state.rankings_cache_squads.clear();
+        self.state.rankings_cache_players.clear();
+        self.state.rankings.clear();
+        self.state.rankings_selected = 0;
+        self.state.rankings_dirty = true;
+        self.state.rankings_progress_current = 0;
+        self.state.rankings_progress_total = 0;
+        self.state.rankings_progress_message = "Cache cleared".to_string();
+    }
+
+    fn recompute_rankings_from_cache(&mut self) {
+        let rows = crate::analysis_rankings::compute_role_rankings_from_cache(
+            &self.state.analysis,
+            &self.state.rankings_cache_squads,
+            &self.state.rankings_cache_players,
+        );
+        if rows.is_empty() {
+            self.state.rankings_progress_message =
+                "No cached player data yet (warming cache...)".to_string();
+        } else {
+            self.state.rankings_progress_message = format!("Rankings ready (cached: {})", rows.len());
+        }
+        self.state.rankings = rows;
+        self.state.rankings_selected = 0;
+        self.state.rankings_dirty = false;
     }
 
     fn request_squad(&mut self, team_id: u32, team_name: String, announce: bool) {
@@ -419,6 +674,8 @@ fn main() -> io::Result<()> {
     fake_feed::spawn_fake_provider(tx, cmd_rx);
 
     let mut app = App::new(Some(cmd_tx));
+    // Load cached rankings/analysis (if any) for current league.
+    crate::persist::load_into_state(&mut app.state);
     // Keep upcoming fixtures available even while browsing Live.
     app.request_upcoming(false);
     let res = run_app(&mut terminal, &mut app, rx);
@@ -430,6 +687,9 @@ fn main() -> io::Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+
+    // Persist cache on exit.
+    crate::persist::save_from_state(&app.state);
 
     if let Err(err) = res {
         eprintln!("error: {err}");
@@ -448,6 +708,12 @@ fn run_app<B: Backend>(
     loop {
         while let Ok(delta) = rx.try_recv() {
             apply_delta(&mut app.state, delta);
+        }
+        if matches!(app.state.screen, Screen::Analysis)
+            && app.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+            && app.state.rankings_dirty
+        {
+            app.recompute_rankings_from_cache();
         }
         app.state.maybe_clear_export(Instant::now());
 
@@ -527,9 +793,14 @@ fn header_text(state: &AppState) -> String {
             } else {
                 "READY"
             };
+            let tab = match state.analysis_tab {
+                crate::state::AnalysisTab::Teams => "TEAMS",
+                crate::state::AnalysisTab::RoleRankings => "RANKINGS",
+            };
             format!(
-                "WC26 ANALYSIS | {} | Teams: {} | FIFA: {} | {}",
+                "WC26 ANALYSIS | {} | Tab: {} | Teams: {} | FIFA: {} | {}",
                 league_label(state.league_mode),
+                tab,
                 state.analysis.len(),
                 updated,
                 status
@@ -573,8 +844,16 @@ fn footer_text(state: &AppState) -> String {
                 .to_string()
         }
         Screen::Analysis => {
-            "1 Pulse | b/Esc Back | j/k/↑/↓ Move | Enter Squad | r Refresh | ? Help | q Quit"
-                .to_string()
+            match state.analysis_tab {
+                crate::state::AnalysisTab::Teams => {
+                    "1 Pulse | b/Esc Back | j/k/↑/↓ Move | Enter Squad | Tab Rankings | r Refresh | ? Help | q Quit"
+                        .to_string()
+                }
+                crate::state::AnalysisTab::RoleRankings => {
+                    "1 Pulse | b/Esc Back | j/k/↑/↓ Move | ←/→ Role | s Metric | Tab Teams | r Missing | R Full | ? Help | q Quit"
+                        .to_string()
+                }
+            }
         }
         Screen::Squad => {
             "1 Pulse | b/Esc Back | j/k/↑/↓ Move | Enter Player | r Refresh | ? Help | q Quit"
@@ -898,6 +1177,13 @@ fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
 }
 
 fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState) {
+    match state.analysis_tab {
+        crate::state::AnalysisTab::Teams => render_analysis_teams(frame, area, state),
+        crate::state::AnalysisTab::RoleRankings => render_analysis_rankings(frame, area, state),
+    }
+}
+
+fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -975,6 +1261,120 @@ fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState) {
         render_vseparator(frame, cols[9], sep_style);
         render_cell_text(frame, cols[10], host, row_style);
     }
+}
+
+fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(area);
+
+    let role = role_label(state.rankings_role);
+    let metric = metric_label(state.rankings_metric);
+    let header = if state.rankings_loading {
+        if state.rankings_progress_total > 0 {
+            format!(
+                "Role Rankings | Role: {role} | Metric: {metric} | {} ({}/{})",
+                state.rankings_progress_message,
+                state.rankings_progress_current,
+                state.rankings_progress_total
+            )
+        } else {
+            format!(
+                "Role Rankings | Role: {role} | Metric: {metric} | {}",
+                state.rankings_progress_message
+            )
+        }
+    } else {
+        format!("Role Rankings | Role: {role} | Metric: {metric}")
+    };
+    let header_style = Style::default().add_modifier(Modifier::BOLD);
+    frame.render_widget(Paragraph::new(header).style(header_style), sections[0]);
+
+    let list_area = sections[1];
+    if list_area.height == 0 {
+        return;
+    }
+
+    if state.rankings.is_empty() {
+        let message = if state.rankings_loading {
+            "Loading role rankings..."
+        } else {
+            "No role ranking data yet (press r to warm cache)"
+        };
+        let empty = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, list_area);
+        return;
+    }
+
+    let mut rows: Vec<&crate::state::RoleRankingEntry> = state
+        .rankings
+        .iter()
+        .filter(|r| r.role == state.rankings_role)
+        .collect();
+
+    match state.rankings_metric {
+        crate::state::RankMetric::Attacking => {
+            rows.sort_by(|a, b| b.attack_score.total_cmp(&a.attack_score))
+        }
+        crate::state::RankMetric::Defending => {
+            rows.sort_by(|a, b| b.defense_score.total_cmp(&a.defense_score))
+        }
+    }
+
+    let visible = list_area.height as usize;
+    let total = rows.len();
+    let (start, end) = visible_range(state.rankings_selected, total, visible);
+
+    for (i, idx) in (start..end).enumerate() {
+        let row_area = Rect {
+            x: list_area.x,
+            y: list_area.y + i as u16,
+            width: list_area.width,
+            height: 1,
+        };
+
+        let selected = idx == state.rankings_selected;
+        let row_style = if selected {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        if selected {
+            frame.render_widget(Block::default().style(row_style), row_area);
+        }
+
+        let entry = rows[idx];
+        let rank = idx + 1;
+        let score = match state.rankings_metric {
+            crate::state::RankMetric::Attacking => entry.attack_score,
+            crate::state::RankMetric::Defending => entry.defense_score,
+        };
+        let score_text = if score.is_finite() {
+            format!("{score:>7.2}")
+        } else {
+            "   -   ".to_string()
+        };
+        let rating = entry
+            .rating
+            .map(|r| format!("{r:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let text = format!(
+            "{rank:>3}. {:<24} {:<18} Score {}  R {rating}  Club {}",
+            truncate(&entry.player_name, 24),
+            truncate(&entry.team_name, 18),
+            score_text,
+            truncate(&entry.club, 18)
+        );
+        render_cell_text(frame, row_area, &text, row_style);
+    }
+}
+
+fn truncate(raw: &str, max: usize) -> String {
+    if raw.len() <= max {
+        return raw.to_string();
+    }
+    raw.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
 }
 
 fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {

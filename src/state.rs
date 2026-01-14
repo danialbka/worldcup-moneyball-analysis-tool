@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Pulse,
@@ -8,6 +10,26 @@ pub enum Screen {
     Analysis,
     Squad,
     PlayerDetail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisTab {
+    Teams,
+    RoleRankings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RoleCategory {
+    Goalkeeper,
+    Defender,
+    Midfielder,
+    Attacker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankMetric {
+    Attacking,
+    Defending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,13 +60,13 @@ pub enum PulseView {
     Upcoming,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LeagueMode {
     PremierLeague,
     WorldCup,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confederation {
     AFC,
     CAF,
@@ -73,6 +95,18 @@ pub struct AppState {
     pub analysis_selected: usize,
     pub analysis_loading: bool,
     pub analysis_updated: Option<String>,
+    pub analysis_tab: AnalysisTab,
+    pub rankings_loading: bool,
+    pub rankings: Vec<RoleRankingEntry>,
+    pub rankings_selected: usize,
+    pub rankings_role: RoleCategory,
+    pub rankings_metric: RankMetric,
+    pub rankings_progress_current: usize,
+    pub rankings_progress_total: usize,
+    pub rankings_progress_message: String,
+    pub rankings_cache_squads: HashMap<u32, Vec<SquadPlayer>>,
+    pub rankings_cache_players: HashMap<u32, PlayerDetail>,
+    pub rankings_dirty: bool,
     pub squad: Vec<SquadPlayer>,
     pub squad_selected: usize,
     pub squad_loading: bool,
@@ -82,6 +116,7 @@ pub struct AppState {
     pub player_loading: bool,
     pub player_last_id: Option<u32>,
     pub player_last_name: Option<String>,
+    pub player_detail_back: Screen,
     pub player_detail_scroll: u16,
     pub player_detail_section: usize,
     pub player_detail_section_scrolls: [u16; PLAYER_DETAIL_SECTIONS],
@@ -114,6 +149,18 @@ impl AppState {
             analysis_selected: 0,
             analysis_loading: false,
             analysis_updated: None,
+            analysis_tab: AnalysisTab::Teams,
+            rankings_loading: false,
+            rankings: Vec::new(),
+            rankings_selected: 0,
+            rankings_role: RoleCategory::Attacker,
+            rankings_metric: RankMetric::Attacking,
+            rankings_progress_current: 0,
+            rankings_progress_total: 0,
+            rankings_progress_message: String::new(),
+            rankings_cache_squads: HashMap::new(),
+            rankings_cache_players: HashMap::new(),
+            rankings_dirty: false,
             squad: Vec::new(),
             squad_selected: 0,
             squad_loading: false,
@@ -123,6 +170,7 @@ impl AppState {
             player_loading: false,
             player_last_id: None,
             player_last_name: None,
+            player_detail_back: Screen::Squad,
             player_detail_scroll: 0,
             player_detail_section: 0,
             player_detail_section_scrolls: [0; PLAYER_DETAIL_SECTIONS],
@@ -169,6 +217,18 @@ impl AppState {
         self.analysis_selected = 0;
         self.analysis_loading = false;
         self.analysis_updated = None;
+        self.analysis_tab = AnalysisTab::Teams;
+        self.rankings_loading = false;
+        self.rankings.clear();
+        self.rankings_selected = 0;
+        self.rankings_role = RoleCategory::Attacker;
+        self.rankings_metric = RankMetric::Attacking;
+        self.rankings_progress_current = 0;
+        self.rankings_progress_total = 0;
+        self.rankings_progress_message.clear();
+        self.rankings_cache_squads.clear();
+        self.rankings_cache_players.clear();
+        self.rankings_dirty = false;
         self.squad.clear();
         self.squad_selected = 0;
         self.squad_loading = false;
@@ -178,6 +238,7 @@ impl AppState {
         self.player_loading = false;
         self.player_last_id = None;
         self.player_last_name = None;
+        self.player_detail_back = Screen::Squad;
         self.push_log(format!(
             "[INFO] League mode: {}",
             league_label(self.league_mode)
@@ -429,6 +490,72 @@ impl AppState {
         self.analysis.get(self.analysis_selected)
     }
 
+    pub fn cycle_analysis_tab(&mut self) {
+        self.analysis_tab = match self.analysis_tab {
+            AnalysisTab::Teams => AnalysisTab::RoleRankings,
+            AnalysisTab::RoleRankings => AnalysisTab::Teams,
+        };
+        self.analysis_selected = 0;
+        self.rankings_selected = 0;
+    }
+
+    pub fn cycle_rankings_role_next(&mut self) {
+        self.rankings_role = match self.rankings_role {
+            RoleCategory::Goalkeeper => RoleCategory::Defender,
+            RoleCategory::Defender => RoleCategory::Midfielder,
+            RoleCategory::Midfielder => RoleCategory::Attacker,
+            RoleCategory::Attacker => RoleCategory::Goalkeeper,
+        };
+        self.rankings_selected = 0;
+    }
+
+    pub fn cycle_rankings_role_prev(&mut self) {
+        self.rankings_role = match self.rankings_role {
+            RoleCategory::Goalkeeper => RoleCategory::Attacker,
+            RoleCategory::Defender => RoleCategory::Goalkeeper,
+            RoleCategory::Midfielder => RoleCategory::Defender,
+            RoleCategory::Attacker => RoleCategory::Midfielder,
+        };
+        self.rankings_selected = 0;
+    }
+
+    pub fn cycle_rankings_metric(&mut self) {
+        self.rankings_metric = match self.rankings_metric {
+            RankMetric::Attacking => RankMetric::Defending,
+            RankMetric::Defending => RankMetric::Attacking,
+        };
+        self.rankings_selected = 0;
+    }
+
+    pub fn rankings_filtered(&self) -> Vec<&RoleRankingEntry> {
+        self.rankings
+            .iter()
+            .filter(|row| row.role == self.rankings_role)
+            .collect()
+    }
+
+    pub fn select_rankings_next(&mut self) {
+        let total = self.rankings_filtered().len();
+        if total == 0 {
+            self.rankings_selected = 0;
+            return;
+        }
+        self.rankings_selected = (self.rankings_selected + 1) % total;
+    }
+
+    pub fn select_rankings_prev(&mut self) {
+        let total = self.rankings_filtered().len();
+        if total == 0 {
+            self.rankings_selected = 0;
+            return;
+        }
+        if self.rankings_selected == 0 {
+            self.rankings_selected = total - 1;
+        } else {
+            self.rankings_selected -= 1;
+        }
+    }
+
     pub fn selected_squad_player(&self) -> Option<&SquadPlayer> {
         self.squad.get(self.squad_selected)
     }
@@ -638,7 +765,7 @@ pub struct StatRow {
     pub away: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamAnalysis {
     pub id: u32,
     pub name: String,
@@ -649,7 +776,7 @@ pub struct TeamAnalysis {
     pub fifa_updated: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SquadPlayer {
     pub id: u32,
     pub name: String,
@@ -661,7 +788,7 @@ pub struct SquadPlayer {
     pub market_value: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerDetail {
     pub id: u32,
     pub name: String,
@@ -692,51 +819,51 @@ pub struct PlayerDetail {
     pub trophies: Vec<PlayerTrophyEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSeasonPerformanceGroup {
     pub title: String,
     pub items: Vec<PlayerSeasonPerformanceItem>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSeasonPerformanceItem {
     pub title: String,
     pub total: String,
     pub per90: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerStatItem {
     pub title: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerStatGroup {
     pub title: String,
     pub items: Vec<PlayerStatItem>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerLeagueStats {
     pub league_name: String,
     pub season: String,
     pub stats: Vec<PlayerStatItem>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerTraitGroup {
     pub title: String,
     pub items: Vec<PlayerTraitItem>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerTraitItem {
     pub title: String,
     pub value: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerMatchStat {
     pub opponent: String,
     pub league: String,
@@ -746,7 +873,7 @@ pub struct PlayerMatchStat {
     pub rating: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSeasonTournamentStat {
     pub league: String,
     pub season: String,
@@ -756,13 +883,13 @@ pub struct PlayerSeasonTournamentStat {
     pub rating: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCareerSection {
     pub title: String,
     pub entries: Vec<PlayerCareerEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCareerEntry {
     pub team: String,
     pub start_date: Option<String>,
@@ -772,12 +899,25 @@ pub struct PlayerCareerEntry {
     pub assists: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerTrophyEntry {
     pub team: String,
     pub league: String,
     pub seasons_won: Vec<String>,
     pub seasons_runner_up: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoleRankingEntry {
+    pub role: RoleCategory,
+    pub player_id: u32,
+    pub player_name: String,
+    pub team_id: u32,
+    pub team_name: String,
+    pub club: String,
+    pub attack_score: f64,
+    pub defense_score: f64,
+    pub rating: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -802,6 +942,20 @@ pub enum Delta {
         event: Event,
     },
     SetAnalysis(Vec<TeamAnalysis>),
+    CacheSquad {
+        team_id: u32,
+        team_name: String,
+        players: Vec<SquadPlayer>,
+    },
+    CachePlayerDetail(PlayerDetail),
+    RankCacheProgress {
+        current: usize,
+        total: usize,
+        message: String,
+    },
+    RankCacheFinished {
+        errors: Vec<String>,
+    },
     SetSquad {
         team_name: String,
         team_id: u32,
@@ -841,6 +995,12 @@ pub enum ProviderCommand {
     FetchAnalysis { mode: LeagueMode },
     FetchSquad { team_id: u32, team_name: String },
     FetchPlayer { player_id: u32, player_name: String },
+    WarmRankCacheFull { mode: LeagueMode },
+    WarmRankCacheMissing {
+        mode: LeagueMode,
+        team_ids: Vec<u32>,
+        player_ids: Vec<u32>,
+    },
     ExportAnalysis { path: String, mode: LeagueMode },
 }
 
@@ -898,6 +1058,39 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.analysis_loading = false;
             state.analysis_selected = 0;
         }
+        Delta::CacheSquad {
+            team_id,
+            team_name: _,
+            players,
+        } => {
+            state.rankings_cache_squads.insert(team_id, players);
+            state.rankings_dirty = true;
+        }
+        Delta::CachePlayerDetail(detail) => {
+            state.rankings_cache_players.insert(detail.id, detail);
+            state.rankings_dirty = true;
+        }
+        Delta::RankCacheProgress {
+            current,
+            total,
+            message,
+        } => {
+            state.rankings_loading = true;
+            state.rankings_progress_current = current;
+            state.rankings_progress_total = total;
+            state.rankings_progress_message = message;
+        }
+        Delta::RankCacheFinished { errors } => {
+            state.rankings_loading = false;
+            state.rankings_progress_current = state.rankings_progress_total.max(state.rankings_progress_current);
+            state.rankings_progress_message = format!(
+                "Cache warm done ({} errors)",
+                errors.len()
+            );
+            for err in errors {
+                state.push_log(format!("[WARN] Rankings cache: {err}"));
+            }
+        }
         Delta::SetSquad {
             team_name,
             team_id,
@@ -908,6 +1101,11 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.squad_loading = false;
             state.squad_team = Some(team_name);
             state.squad_team_id = Some(team_id);
+            // Also cache for rankings so we don't refetch later.
+            state
+                .rankings_cache_squads
+                .insert(team_id, state.squad.clone());
+            state.rankings_dirty = true;
         }
         Delta::SetPlayerDetail(detail) => {
             let is_stub = player_detail_is_stub(&detail);
@@ -923,6 +1121,11 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
             }
             state.player_loading = false;
+            // Cache for rankings reuse.
+            if let Some(detail) = state.player_detail.clone() {
+                state.rankings_cache_players.insert(detail.id, detail);
+                state.rankings_dirty = true;
+            }
         }
         Delta::ExportStarted { path, total } => {
             state.export.active = true;
@@ -972,6 +1175,22 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.push_log(format!("[INFO] Export finished ({errors} errors)"));
         }
         Delta::Log(msg) => state.push_log(msg),
+    }
+}
+
+pub fn role_label(role: RoleCategory) -> &'static str {
+    match role {
+        RoleCategory::Goalkeeper => "Goalkeeper",
+        RoleCategory::Defender => "Defender",
+        RoleCategory::Midfielder => "Midfielder",
+        RoleCategory::Attacker => "Attacker",
+    }
+}
+
+pub fn metric_label(metric: RankMetric) -> &'static str {
+    match metric {
+        RankMetric::Attacking => "Attacking",
+        RankMetric::Defending => "Defending",
     }
 }
 
@@ -1029,7 +1248,7 @@ pub fn confed_label(confed: Confederation) -> &'static str {
     }
 }
 
-fn player_detail_is_stub(detail: &PlayerDetail) -> bool {
+pub(crate) fn player_detail_is_stub(detail: &PlayerDetail) -> bool {
     detail.team.is_none()
         && detail.position.is_none()
         && detail.age.is_none()
