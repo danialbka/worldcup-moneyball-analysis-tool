@@ -10,6 +10,12 @@ pub enum Screen {
     PlayerDetail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PulseLiveRow {
+    Match(usize),
+    Upcoming(usize),
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelQuality {
@@ -129,13 +135,27 @@ impl AppState {
     }
 
     pub fn selected_match(&self) -> Option<&MatchSummary> {
-        if matches!(self.screen, Screen::Pulse) && self.pulse_view != PulseView::Live {
-            return None;
+        match &self.screen {
+            Screen::Terminal {
+                match_id: Some(id),
+            } => self.matches.iter().find(|m| &m.id == id),
+            Screen::Pulse => {
+                if self.pulse_view != PulseView::Live {
+                    return None;
+                }
+                let rows = self.pulse_live_rows();
+                match rows.get(self.selected) {
+                    Some(PulseLiveRow::Match(idx)) => self.matches.get(*idx),
+                    _ => None,
+                }
+            }
+            _ => {
+                let filtered = self.filtered_indices();
+                filtered
+                    .get(self.selected)
+                    .and_then(|idx| self.matches.get(*idx))
+            }
         }
-        let filtered = self.filtered_indices();
-        filtered
-            .get(self.selected)
-            .and_then(|idx| self.matches.get(*idx))
     }
 
     pub fn cycle_league_mode(&mut self) {
@@ -217,6 +237,21 @@ impl AppState {
             }),
         }
 
+        if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
+            if let Some(id) = selected_id {
+                let rows = self.pulse_live_rows();
+                if let Some(pos) = rows.iter().position(|row| match row {
+                    PulseLiveRow::Match(idx) => self.matches.get(*idx).is_some_and(|m| m.id == id),
+                    PulseLiveRow::Upcoming(_) => false,
+                }) {
+                    self.selected = pos;
+                    return;
+                }
+            }
+            self.selected = 0;
+            return;
+        }
+
         if let Some(id) = selected_id {
             let filtered = self.filtered_indices();
             if let Some(pos) = filtered.iter().position(|idx| self.matches[*idx].id == id) {
@@ -232,7 +267,11 @@ impl AppState {
             self.scroll_upcoming_down();
             return;
         }
-        let total = self.filtered_indices().len();
+        let total = if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
+            self.pulse_live_rows().len()
+        } else {
+            self.filtered_indices().len()
+        };
         if total == 0 {
             self.selected = 0;
             return;
@@ -245,7 +284,11 @@ impl AppState {
             self.scroll_upcoming_up();
             return;
         }
-        let total = self.filtered_indices().len();
+        let total = if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
+            self.pulse_live_rows().len()
+        } else {
+            self.filtered_indices().len()
+        };
         if total == 0 {
             self.selected = 0;
             return;
@@ -258,7 +301,11 @@ impl AppState {
     }
 
     pub fn clamp_selection(&mut self) {
-        let total = self.filtered_indices().len();
+        let total = if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
+            self.pulse_live_rows().len()
+        } else {
+            self.filtered_indices().len()
+        };
         if total == 0 {
             self.selected = 0;
         } else if self.selected >= total {
@@ -281,6 +328,40 @@ impl AppState {
             .into_iter()
             .filter_map(|idx| self.matches.get(idx))
             .collect()
+    }
+
+    pub fn pulse_live_rows(&self) -> Vec<PulseLiveRow> {
+        use std::collections::HashSet;
+
+        // Keep match ordering as already sorted by `self.sort`.
+        let match_indices = self.filtered_indices();
+        let mut seen_ids: HashSet<&str> = HashSet::new();
+        let mut rows = Vec::new();
+        for idx in match_indices {
+            if let Some(m) = self.matches.get(idx) {
+                seen_ids.insert(m.id.as_str());
+                rows.push(PulseLiveRow::Match(idx));
+            }
+        }
+
+        // Upcoming appended (sorted by kickoff text), de-duped by fixture id.
+        let mut upcoming_indices: Vec<usize> = self
+            .upcoming
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| self.upcoming_matches_mode(u) && !seen_ids.contains(u.id.as_str()))
+            .map(|(idx, _)| idx)
+            .collect();
+        upcoming_indices.sort_by(|a, b| {
+            let ka = self.upcoming.get(*a).map(|u| u.kickoff.as_str()).unwrap_or("");
+            let kb = self.upcoming.get(*b).map(|u| u.kickoff.as_str()).unwrap_or("");
+            ka.cmp(kb)
+        });
+        for idx in upcoming_indices {
+            rows.push(PulseLiveRow::Upcoming(idx));
+        }
+
+        rows
     }
 
     pub fn filtered_upcoming(&self) -> Vec<&UpcomingMatch> {
@@ -767,6 +848,10 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
     match delta {
         Delta::SetMatches(mut matches) => {
             let selected_id = state.selected_match_id();
+            let preserve_index = matches!(state.screen, Screen::Pulse)
+                && state.pulse_view == PulseView::Live
+                && selected_id.is_none();
+            let preserved_selected = state.selected;
             for summary in &mut matches {
                 if let Some(existing) = state.matches.iter().find(|m| m.id == summary.id) {
                     summary.win.delta_home = summary.win.p_home - existing.win.p_home;
@@ -776,6 +861,9 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             }
             state.matches = matches;
             state.sort_matches_with_selected_id(selected_id);
+            if preserve_index {
+                state.selected = preserved_selected.min(state.pulse_live_rows().len().saturating_sub(1));
+            }
         }
         Delta::SetMatchDetails { id, detail } => {
             state.match_detail.insert(id, detail);

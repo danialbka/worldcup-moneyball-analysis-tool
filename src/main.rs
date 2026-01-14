@@ -162,9 +162,7 @@ impl App {
             KeyCode::Char('s') => self.state.cycle_sort(),
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 self.state.cycle_league_mode();
-                if self.state.pulse_view == PulseView::Upcoming {
-                    self.request_upcoming(true);
-                }
+                self.request_upcoming(true);
                 if matches!(self.state.screen, Screen::Analysis) {
                     self.request_analysis(true);
                 }
@@ -380,9 +378,6 @@ impl App {
         if !matches!(self.state.screen, Screen::Pulse) {
             return;
         }
-        if self.state.pulse_view != PulseView::Upcoming {
-            return;
-        }
         if self.last_upcoming_refresh.elapsed() >= self.upcoming_refresh {
             self.request_upcoming(false);
         }
@@ -424,6 +419,8 @@ fn main() -> io::Result<()> {
     fake_feed::spawn_fake_provider(tx, cmd_rx);
 
     let mut app = App::new(Some(cmd_tx));
+    // Keep upcoming fixtures available even while browsing Live.
+    app.request_upcoming(false);
     let res = run_app(&mut terminal, &mut app, rx);
 
     disable_raw_mode()?;
@@ -606,8 +603,8 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     render_pulse_header(frame, sections[0], &widths);
 
     let list_area = sections[1];
-    let filtered = state.filtered_matches();
-    if filtered.is_empty() {
+    let rows = state.pulse_live_rows();
+    if rows.is_empty() {
         let empty = Paragraph::new("No matches for this league")
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty, list_area);
@@ -623,7 +620,7 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let visible = (list_area.height / ROW_HEIGHT) as usize;
-    let (start, end) = visible_range(state.selected, filtered.len(), visible);
+    let (start, end) = visible_range(state.selected, rows.len(), visible);
 
     for (i, idx) in (start..end).enumerate() {
         let row_area = Rect {
@@ -634,48 +631,110 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.selected;
-        let row_style = if selected {
-            Style::default().fg(Color::White).bg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-
-        if selected {
-            frame.render_widget(Block::default().style(row_style), row_area);
-        }
-
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(widths)
             .split(row_area);
 
-        let m = filtered[idx];
-        let time = if m.is_live {
-            format!("{}'", m.minute)
-        } else {
-            "FT".to_string()
-        };
-        let match_name = format!("{}-{}", m.home, m.away);
-        let score = format!("{}-{}", m.score_home, m.score_away);
-        let hda = format!(
-            "H{:.0} D{:.0} A{:.0}",
-            m.win.p_home, m.win.p_draw, m.win.p_away
-        );
-        let delta = format!("{:+.1}", m.win.delta_home);
-        let quality = quality_label(m.win.quality).to_string();
-        let conf = format!("{}%", m.win.confidence);
+        match rows[idx] {
+            crate::state::PulseLiveRow::Match(match_idx) => {
+                let Some(m) = state.matches.get(match_idx) else {
+                    continue;
+                };
+                let is_not_started = !m.is_live && m.minute == 0;
+                let is_finished = !m.is_live && m.minute >= 90;
 
-        render_cell_text(frame, cols[0], &time, row_style);
-        render_cell_text(frame, cols[1], &match_name, row_style);
-        render_cell_text(frame, cols[2], &score, row_style);
+                let row_style = if is_not_started {
+                    if selected {
+                        Style::default().fg(Color::Gray).bg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    }
+                } else if selected {
+                    Style::default().fg(Color::White).bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
 
-        let bar = win_bar_chart(&m.win, selected);
-        frame.render_widget(bar, cols[3]);
+                if selected {
+                    frame.render_widget(Block::default().style(row_style), row_area);
+                }
 
-        render_cell_text(frame, cols[4], &hda, row_style);
-        render_cell_text(frame, cols[5], &delta, row_style);
-        render_cell_text(frame, cols[6], &quality, row_style);
-        render_cell_text(frame, cols[7], &conf, row_style);
+                let time = if m.is_live {
+                    format!("{}'", m.minute)
+                } else if is_finished {
+                    "FT".to_string()
+                } else {
+                    state
+                        .upcoming
+                        .iter()
+                        .find(|u| u.id == m.id)
+                        .map(|u| format_kickoff_short(&u.kickoff))
+                        .unwrap_or_else(|| "KO".to_string())
+                };
+                let match_name = format!("{}-{}", m.home, m.away);
+                let score = if is_not_started {
+                    "--".to_string()
+                } else {
+                    format!("{}-{}", m.score_home, m.score_away)
+                };
+
+                render_cell_text(frame, cols[0], &time, row_style);
+                render_cell_text(frame, cols[1], &match_name, row_style);
+                render_cell_text(frame, cols[2], &score, row_style);
+
+                if is_not_started {
+                    render_cell_text(frame, cols[3], "upcoming", row_style);
+                    render_cell_text(frame, cols[4], "-", row_style);
+                    render_cell_text(frame, cols[5], "-", row_style);
+                    render_cell_text(frame, cols[6], "-", row_style);
+                    render_cell_text(frame, cols[7], "-", row_style);
+                } else {
+                    let hda = format!(
+                        "H{:.0} D{:.0} A{:.0}",
+                        m.win.p_home, m.win.p_draw, m.win.p_away
+                    );
+                    let delta = format!("{:+.1}", m.win.delta_home);
+                    let quality = quality_label(m.win.quality).to_string();
+                    let conf = format!("{}%", m.win.confidence);
+
+                    let bar = win_bar_chart(&m.win, selected);
+                    frame.render_widget(bar, cols[3]);
+
+                    render_cell_text(frame, cols[4], &hda, row_style);
+                    render_cell_text(frame, cols[5], &delta, row_style);
+                    render_cell_text(frame, cols[6], &quality, row_style);
+                    render_cell_text(frame, cols[7], &conf, row_style);
+                }
+            }
+            crate::state::PulseLiveRow::Upcoming(upcoming_idx) => {
+                let Some(u) = state.upcoming.get(upcoming_idx) else {
+                    continue;
+                };
+
+                let row_style = if selected {
+                    Style::default().fg(Color::Gray).bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
+                if selected {
+                    frame.render_widget(Block::default().style(row_style), row_area);
+                }
+
+                let time = format_kickoff_short(&u.kickoff);
+                let match_name = format!("{}-{}", u.home, u.away);
+
+                render_cell_text(frame, cols[0], &time, row_style);
+                render_cell_text(frame, cols[1], &match_name, row_style);
+                render_cell_text(frame, cols[2], "--", row_style);
+                render_cell_text(frame, cols[3], "upcoming", row_style);
+                render_cell_text(frame, cols[4], "-", row_style);
+                render_cell_text(frame, cols[5], "-", row_style);
+                render_cell_text(frame, cols[6], "-", row_style);
+                render_cell_text(frame, cols[7], "-", row_style);
+            }
+        }
     }
 }
 
@@ -1708,9 +1767,21 @@ fn match_list_text(state: &AppState) -> String {
         return "No matches yet".to_string();
     }
 
+    let selected_id = state.selected_match_id();
+    let active_id = match &state.screen {
+        Screen::Terminal {
+            match_id: Some(id),
+        } => Some(id.as_str()),
+        _ => selected_id.as_deref(),
+    };
+
     let mut lines = Vec::new();
-    for (idx, m) in filtered.iter().enumerate() {
-        let prefix = if idx == state.selected { "> " } else { "  " };
+    for m in filtered.iter() {
+        let prefix = if active_id == Some(m.id.as_str()) {
+            "> "
+        } else {
+            "  "
+        };
         let line = format!(
             "{prefix}{}-{} {}-{}",
             m.home, m.away, m.score_home, m.score_away
@@ -1932,6 +2003,18 @@ fn format_kickoff(raw: &str) -> String {
         return cleaned[..16].replace('T', " ");
     }
     cleaned.replace('T', " ")
+}
+
+fn format_kickoff_short(raw: &str) -> String {
+    let cleaned = raw.trim();
+    if cleaned.is_empty() {
+        return "TBD".to_string();
+    }
+    if let Some(dt) = parse_kickoff(cleaned) {
+        let sgt = dt + ChronoDuration::hours(8);
+        return sgt.format("%H:%M").to_string();
+    }
+    "KO".to_string()
 }
 
 fn parse_kickoff(raw: &str) -> Option<NaiveDateTime> {
