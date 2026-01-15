@@ -43,6 +43,7 @@ struct App {
     detail_cache_ttl: Duration,
     squad_cache_ttl: Duration,
     player_cache_ttl: Duration,
+    prefetch_players_limit: usize,
 }
 
 impl App {
@@ -77,6 +78,11 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(21600)
             .max(60);
+        let prefetch_players_limit = std::env::var("PREFETCH_PLAYERS")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or(10)
+            .clamp(0, 40);
         Self {
             state: AppState::new(),
             should_quit: false,
@@ -89,6 +95,7 @@ impl App {
             detail_cache_ttl: Duration::from_secs(detail_cache_ttl),
             squad_cache_ttl: Duration::from_secs(squad_cache_ttl),
             player_cache_ttl: Duration::from_secs(player_cache_ttl),
+            prefetch_players_limit,
         }
     }
 
@@ -612,6 +619,7 @@ impl App {
             self.state.squad_loading = false;
             self.state.squad_team = Some(team_name.clone());
             self.state.squad_team_id = Some(team_id);
+            self.prefetch_players(self.state.squad.iter().map(|p| p.id).collect());
             let cached_at = self.state.rankings_cache_squads_at.get(&team_id).copied();
             if cache_fresh(cached_at, self.squad_cache_ttl) {
                 if announce {
@@ -658,6 +666,7 @@ impl App {
         };
         self.state.player_last_id = Some(player_id);
         self.state.player_last_name = Some(player_name.clone());
+        let mut cache_hit = false;
         if let Some(cached) = self
             .state
             .rankings_cache_players
@@ -671,6 +680,7 @@ impl App {
                 .copied();
             self.state.player_detail = Some(cached);
             self.state.player_loading = false;
+            cache_hit = true;
             if cache_fresh(cached_at, self.player_cache_ttl) {
                 if announce {
                     self.state.push_log("[INFO] Player cached (skipping fetch)");
@@ -681,6 +691,10 @@ impl App {
                 self.state
                     .push_log("[INFO] Player cached (refreshing in background)");
             }
+        }
+        if !cache_hit {
+            self.state.player_detail = None;
+            self.state.player_loading = true;
         }
         if tx
             .send(state::ProviderCommand::FetchPlayer {
@@ -698,9 +712,31 @@ impl App {
             }
             if self.state.player_detail.is_none() {
                 self.state.player_loading = true;
-                self.state.player_detail = None;
             }
         }
+    }
+
+    fn prefetch_players(&mut self, player_ids: Vec<u32>) {
+        if self.prefetch_players_limit == 0 {
+            return;
+        }
+        let Some(tx) = &self.cmd_tx else {
+            return;
+        };
+        let mut ids: Vec<u32> = player_ids
+            .into_iter()
+            .filter(|id| {
+                let cached_at = self.state.rankings_cache_players_at.get(id).copied();
+                !cache_fresh(cached_at, self.player_cache_ttl)
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.truncate(self.prefetch_players_limit);
+        let _ = tx.send(state::ProviderCommand::PrefetchPlayers { player_ids: ids });
     }
 
     fn request_analysis_export(&mut self, announce: bool) {
@@ -823,6 +859,9 @@ fn run_app<B: Backend>(
     loop {
         while let Ok(delta) = rx.try_recv() {
             apply_delta(&mut app.state, delta);
+        }
+        if let Some(ids) = app.state.squad_prefetch_pending.take() {
+            app.prefetch_players(ids);
         }
         if matches!(app.state.screen, Screen::Analysis)
             && app.state.analysis_tab == crate::state::AnalysisTab::RoleRankings

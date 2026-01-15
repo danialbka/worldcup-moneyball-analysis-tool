@@ -1,0 +1,42 @@
+{
+  "id": 1,
+  "name": "Test Player",
+  "primaryTeam": { "teamName": "Test FC" },
+  "positionDescription": {
+    "primaryPosition": { "label": "FW" },
+    "positions": [
+      { "strPos": { "label": "FW" }, "isMainPosition": true }
+    ]
+  },
+  "playerInformation": [
+    { "title": "Age", "translationKey": "age_sentencecase", "value": { "fallback": "25" } }
+  ],
+  "mainLeague": {
+    "leagueName": "Test League",
+    "season": "2024/25",
+    "stats": [
+      { "title": "Goals", "value": 10 },
+      { "title": "Minutes played", "value": 900 }
+    ]
+  },
+  "topStatCard": {
+    "items": [
+      { "title": "Goals", "statValue": 10, "statFormat": null, "per90": 0.5 }
+    ]
+  },
+  "statsSection": {
+    "items": [
+      {
+        "title": "Attack",
+        "items": [
+          { "title": "Shots", "statValue": 20, "statFormat": null, "per90": 2.0 }
+        ]
+      }
+    ]
+  },
+  "firstSeasonStats": { "topStatCard": { "items": [] }, "statsSection": { "items": [] } },
+  "traits": { "title": "Traits", "items": [ { "title": "Speed", "value": 0.8 } ] },
+  "recentMatches": [],
+  "careerHistory": { "careerItems": { "senior": { "teamEntries": [], "seasonEntries": [] } } },
+  "trophies": { "playerTrophies": [] }
+}

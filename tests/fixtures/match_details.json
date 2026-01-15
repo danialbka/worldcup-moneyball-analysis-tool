@@ -1,0 +1,47 @@
+{
+  "general": {
+    "homeTeam": { "name": "Arsenal" },
+    "awayTeam": { "name": "Chelsea" }
+  },
+  "content": {
+    "lineup": {
+      "homeTeam": {
+        "name": "Arsenal",
+        "formation": "4-3-3",
+        "starters": [
+          { "name": "Player A", "shirtNumber": 7, "position": "FW" }
+        ],
+        "subs": [
+          { "name": "Player B", "shirtNumber": 12, "position": "MF" }
+        ]
+      },
+      "awayTeam": {
+        "name": "Chelsea",
+        "formation": "4-2-3-1",
+        "starters": [
+          { "name": "Player C", "shirtNumber": 9, "position": "FW" }
+        ],
+        "subs": [
+          { "name": "Player D", "shirtNumber": 14, "position": "DF" }
+        ]
+      }
+    },
+    "matchFacts": {
+      "events": {
+        "events": [
+          { "type": "Goal", "time": 12, "isHome": true, "player": { "name": "Player A" } },
+          { "type": "Card", "time": 33, "isHome": false, "player": { "name": "Player C" } }
+        ]
+      }
+    },
+    "stats": {
+      "stats": [
+        {
+          "stats": [
+            { "title": "Shots", "homeValue": 10, "awayValue": 8 }
+          ]
+        }
+      ]
+    }
+  }
+}

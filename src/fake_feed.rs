@@ -505,6 +505,35 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             }));
                         }
                     },
+                    ProviderCommand::PrefetchPlayers { player_ids } => {
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            let errors = std::sync::Mutex::new(Vec::<String>::new());
+                            let pool = build_fetch_pool();
+                            with_fetch_pool(&pool, || {
+                                player_ids.par_iter().for_each(|player_id| {
+                                    match analysis_fetch::fetch_player_detail(*player_id) {
+                                        Ok(detail) => {
+                                            let _ = tx.send(Delta::CachePlayerDetail(detail));
+                                        }
+                                        Err(err) => {
+                                            let mut guard = errors.lock().unwrap();
+                                            guard.push(format!(
+                                                "prefetch player {player_id}: {err}"
+                                            ));
+                                        }
+                                    }
+                                });
+                            });
+                            let errors = errors.into_inner().unwrap_or_default();
+                            if !errors.is_empty() {
+                                let _ = tx.send(Delta::Log(format!(
+                                    "[WARN] Player prefetch: {} errors",
+                                    errors.len()
+                                )));
+                            }
+                        });
+                    }
                     ProviderCommand::ExportAnalysis { path, mode } => {
                         let tx = tx.clone();
                         std::thread::spawn(move || {

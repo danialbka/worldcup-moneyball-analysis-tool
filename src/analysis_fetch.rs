@@ -621,7 +621,7 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
 
     let url = format!("https://www.fotmob.com/api/playerData?id={player_id}");
     let mut last_err = None;
-    let mut parsed: Option<PlayerDataResponse> = None;
+    let mut parsed: Option<PlayerDetail> = None;
     for attempt in 0..3 {
         let resp = fetch_json_cached(
             client,
@@ -631,23 +631,13 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
 
         match resp {
             Ok(body) => {
-                let trimmed = body.trim();
-                if trimmed.is_empty() || trimmed == "null" {
-                    last_err = Some(anyhow::anyhow!("empty player response"));
-                    if attempt < 2 {
-                        std::thread::sleep(Duration::from_millis(300));
-                        continue;
-                    }
-                    break;
-                }
-
-                match serde_json::from_str(trimmed) {
+                match parse_player_detail_json(&body) {
                     Ok(data) => {
                         parsed = Some(data);
                         break;
                     }
                     Err(err) => {
-                        last_err = Some(anyhow::anyhow!("invalid player json: {err}"));
+                        last_err = Some(err);
                         if attempt < 2 {
                             std::thread::sleep(Duration::from_millis(300));
                             continue;
@@ -667,13 +657,50 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         }
     }
 
-    let parsed = parsed.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("player fetch failed")))?;
-    let mut info_map = std::collections::HashMap::new();
+    let parsed = parsed
+        .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("player fetch failed")))?;
+    Ok(parsed)
+}
+
+pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Err(anyhow::anyhow!("empty player response"));
+    }
+    let parsed: PlayerDataResponse =
+        serde_json::from_str(trimmed).context("invalid player json")?;
+    let mut age: Option<String> = None;
+    let mut country: Option<String> = None;
+    let mut height: Option<String> = None;
+    let mut preferred_foot: Option<String> = None;
+    let mut shirt: Option<String> = None;
+    let mut market_value: Option<String> = None;
+    let mut contract_end: Option<String> = None;
     if let Some(info) = parsed.player_information {
         for row in info {
-            if let Some(ref value) = row.value {
-                let key = normalize_player_info_key(&row);
-                info_map.insert(key, info_value_to_string(&value.fallback));
+            let Some(ref value) = row.value else {
+                continue;
+            };
+            let rendered = info_value_to_string(&value.fallback);
+            let key = match row.translation_key.as_deref() {
+                Some("height_sentencecase") => "Height",
+                Some("age_sentencecase") => "Age",
+                Some("preferred_foot") => "Preferred foot",
+                Some("country_sentencecase") => "Country",
+                Some("shirt") => "Shirt",
+                Some("transfer_value") => "Market value",
+                Some("contract_end") => "Contract end",
+                _ => row.title.as_str(),
+            };
+            match key {
+                "Age" => age = Some(rendered),
+                "Country" => country = Some(rendered),
+                "Height" => height = Some(rendered),
+                "Preferred foot" => preferred_foot = Some(rendered),
+                "Shirt" => shirt = Some(rendered),
+                "Market value" => market_value = Some(rendered),
+                "Contract end" => contract_end = Some(rendered),
+                _ => {}
             }
         }
     }
@@ -682,16 +709,17 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         .position_description
         .as_ref()
         .map(|desc| {
-            desc.positions
-                .iter()
-                .map(|pos| {
-                    if pos.is_main_position {
-                        format!("{} (primary)", pos.str_pos.label)
-                    } else {
-                        pos.str_pos.label.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
+            let mut out = Vec::with_capacity(desc.positions.len());
+            for pos in &desc.positions {
+                if pos.is_main_position {
+                    let mut label = pos.str_pos.label.clone();
+                    label.push_str(" (primary)");
+                    out.push(label);
+                } else {
+                    out.push(pos.str_pos.label.clone());
+                }
+            }
+            out
         })
         .unwrap_or_default();
 
@@ -721,13 +749,14 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         .unwrap_or_default();
 
     let all_competitions = if !season_top_items.is_empty() {
-        season_top_items
-            .iter()
-            .map(|stat| PlayerStatItem {
+        let mut out = Vec::with_capacity(season_top_items.len());
+        for stat in &season_top_items {
+            out.push(PlayerStatItem {
                 title: stat.title.clone(),
                 value: value_to_string(&stat.stat_value),
-            })
-            .collect::<Vec<_>>()
+            });
+        }
+        out
     } else {
         Vec::new()
     };
@@ -737,13 +766,13 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         _ => season_top_items,
     };
 
-    let top_stats = top_items
-        .into_iter()
-        .map(|stat| PlayerStatItem {
+    let mut top_stats = Vec::with_capacity(top_items.len());
+    for stat in top_items {
+        top_stats.push(PlayerStatItem {
             title: stat.title,
             value: value_to_string(&stat.stat_value),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
 
     let season_items = match parsed
         .stats_section
@@ -846,32 +875,35 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
             .collect(),
     });
 
-    let recent_matches = parsed
-        .recent_matches
-        .unwrap_or_default()
-        .into_iter()
-        .map(|item| PlayerMatchStat {
-            opponent: empty_to_dash(item.opponent_team_name),
-            league: empty_to_dash(item.league_name),
-            date: item
-                .match_date
-                .map(|d| empty_to_dash(d.utc_time))
-                .unwrap_or_else(|| "-".to_string()),
-            goals: item.goals as u8,
-            assists: item.assists as u8,
-            rating: item
-                .rating_props
-                .and_then(|r| r.rating)
-                .map(|value| value_to_string(&value)),
-        })
-        .collect::<Vec<_>>();
+    let recent_matches = if let Some(items) = parsed.recent_matches {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(PlayerMatchStat {
+                opponent: empty_to_dash(item.opponent_team_name),
+                league: empty_to_dash(item.league_name),
+                date: item
+                    .match_date
+                    .map(|d| empty_to_dash(d.utc_time))
+                    .unwrap_or_else(|| "-".to_string()),
+                goals: item.goals as u8,
+                assists: item.assists as u8,
+                rating: item
+                    .rating_props
+                    .and_then(|r| r.rating)
+                    .map(|value| value_to_string(&value)),
+            });
+        }
+        out
+    } else {
+        Vec::new()
+    };
 
     let career_sections = parsed
         .career_history
         .as_ref()
         .and_then(|history| history.career_items.as_ref())
         .map(|items| {
-            let mut ordered = Vec::new();
+            let mut ordered = Vec::with_capacity(items.len());
             for key in ["senior", "national team", "youth"] {
                 if let Some(section) = items.get(key) {
                     ordered.push((key.to_string(), section));
@@ -910,27 +942,25 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         .and_then(|items| items.get("senior"))
         .and_then(|section| section.season_entries.first())
         .map(|season| {
-            season
-                .tournament_stats
-                .iter()
-                .map(|stat| {
-                    let rating = stat
-                        .rating
-                        .as_ref()
-                        .and_then(|r| r.rating.as_ref())
-                        .map(value_to_string)
-                        .unwrap_or_else(|| "-".to_string());
-                    let rating = normalize_stat_cell(rating);
-                    crate::state::PlayerSeasonTournamentStat {
-                        league: stat.league_name.clone(),
-                        season: stat.season_name.clone(),
-                        appearances: normalize_stat_cell(stat.appearances.clone()),
-                        goals: normalize_stat_cell(stat.goals.clone()),
-                        assists: normalize_stat_cell(stat.assists.clone()),
-                        rating,
-                    }
-                })
-                .collect::<Vec<_>>()
+            let mut out = Vec::with_capacity(season.tournament_stats.len());
+            for stat in &season.tournament_stats {
+                let rating = stat
+                    .rating
+                    .as_ref()
+                    .and_then(|r| r.rating.as_ref())
+                    .map(value_to_string)
+                    .unwrap_or_else(|| "-".to_string());
+                let rating = normalize_stat_cell(rating);
+                out.push(crate::state::PlayerSeasonTournamentStat {
+                    league: stat.league_name.clone(),
+                    season: stat.season_name.clone(),
+                    appearances: normalize_stat_cell(stat.appearances.clone()),
+                    goals: normalize_stat_cell(stat.goals.clone()),
+                    assists: normalize_stat_cell(stat.assists.clone()),
+                    rating,
+                });
+            }
+            out
         })
         .unwrap_or_default();
 
@@ -954,10 +984,7 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         })
         .unwrap_or_default();
 
-    let contract_end = info_map
-        .get("Contract end")
-        .cloned()
-        .or_else(|| parsed.contract_end.map(|d| d.utc_time));
+    let contract_end = contract_end.or_else(|| parsed.contract_end.map(|d| d.utc_time));
 
     Ok(PlayerDetail {
         id: parsed.id,
@@ -966,12 +993,12 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         position: parsed
             .position_description
             .and_then(|p| p.primary_position.map(|pos| pos.label)),
-        age: info_map.get("Age").cloned(),
-        country: info_map.get("Country").cloned(),
-        height: info_map.get("Height").cloned(),
-        preferred_foot: info_map.get("Preferred foot").cloned(),
-        shirt: info_map.get("Shirt").cloned(),
-        market_value: info_map.get("Market value").cloned(),
+        age,
+        country,
+        height,
+        preferred_foot,
+        shirt,
+        market_value,
         contract_end,
         birth_date: parsed.birth_date.map(|d| d.utc_time),
         status: parsed.status,

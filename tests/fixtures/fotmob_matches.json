@@ -1,0 +1,37 @@
+{
+  "leagues": [
+    {
+      "id": 47,
+      "primaryId": 47,
+      "name": "Premier League",
+      "matches": [
+        {
+          "id": 1001,
+          "tournamentStage": "Matchday 1",
+          "time": "2024-08-10 15:00",
+          "home": { "name": "Arsenal", "shortName": "ARS", "score": 2 },
+          "away": { "name": "Chelsea", "shortName": "CHE", "score": 1 },
+          "status": {
+            "utcTime": "2024-08-10T07:00:00Z",
+            "started": true,
+            "cancelled": false,
+            "finished": true
+          }
+        },
+        {
+          "id": 1002,
+          "tournamentStage": "Matchday 1",
+          "time": "2024-08-11 18:00",
+          "home": { "name": "Liverpool", "shortName": "LIV", "score": null },
+          "away": { "name": "Manchester City", "shortName": "MCI", "score": null },
+          "status": {
+            "utcTime": "2024-08-11T10:00:00Z",
+            "started": false,
+            "cancelled": false,
+            "finished": false
+          }
+        }
+      ]
+    }
+  ]
+}

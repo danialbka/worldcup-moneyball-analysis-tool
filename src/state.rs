@@ -117,6 +117,7 @@ pub struct AppState {
     pub squad_loading: bool,
     pub squad_team: Option<String>,
     pub squad_team_id: Option<u32>,
+    pub squad_prefetch_pending: Option<Vec<u32>>,
     pub player_detail: Option<PlayerDetail>,
     pub player_loading: bool,
     pub player_last_id: Option<u32>,
@@ -175,6 +176,7 @@ impl AppState {
             squad_loading: false,
             squad_team: None,
             squad_team_id: None,
+            squad_prefetch_pending: None,
             player_detail: None,
             player_loading: false,
             player_last_id: None,
@@ -248,6 +250,7 @@ impl AppState {
         self.squad_loading = false;
         self.squad_team = None;
         self.squad_team_id = None;
+        self.squad_prefetch_pending = None;
         self.player_detail = None;
         self.player_loading = false;
         self.player_last_id = None;
@@ -1009,6 +1012,7 @@ pub enum ProviderCommand {
     FetchAnalysis { mode: LeagueMode },
     FetchSquad { team_id: u32, team_name: String },
     FetchPlayer { player_id: u32, player_name: String },
+    PrefetchPlayers { player_ids: Vec<u32> },
     WarmRankCacheFull { mode: LeagueMode },
     WarmRankCacheMissing {
         mode: LeagueMode,
@@ -1126,6 +1130,12 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.squad_loading = false;
             state.squad_team = Some(team_name);
             state.squad_team_id = Some(team_id);
+            if state.squad.is_empty() {
+                state.squad_prefetch_pending = None;
+            } else {
+                state.squad_prefetch_pending =
+                    Some(state.squad.iter().map(|p| p.id).collect());
+            }
             // Also cache for rankings so we don't refetch later.
             state
                 .rankings_cache_squads

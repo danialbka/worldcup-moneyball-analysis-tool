@@ -11,6 +11,15 @@ pub fn compute_role_rankings_from_cache(
 ) -> Vec<RoleRankingEntry> {
     let team_name_map: HashMap<u32, String> = teams.iter().map(|t| (t.id, t.name.clone())).collect();
     let mut features: Vec<PlayerFeatures> = Vec::new();
+    let mut capacity = 0usize;
+    for team in teams {
+        if let Some(team_squad) = squads.get(&team.id) {
+            capacity += team_squad.len();
+        }
+    }
+    if capacity > 0 {
+        features.reserve(capacity);
+    }
 
     for team in teams {
         let Some(team_squad) = squads.get(&team.id) else { continue };
@@ -386,17 +395,24 @@ fn insert_stat_percent(
     }
 }
 
-fn find_stat_value(detail: &PlayerDetail, needles: &[&str], excludes: &[&str], _prefer: Prefer) -> Option<f64> {
-    let needles: Vec<String> = needles.iter().map(|s| s.to_lowercase()).collect();
-    let excludes: Vec<String> = excludes.iter().map(|s| s.to_lowercase()).collect();
-
+fn find_stat_value(
+    detail: &PlayerDetail,
+    needles: &[&str],
+    excludes: &[&str],
+    _prefer: Prefer,
+) -> Option<f64> {
     // Prefer per-90 if available (season_performance has per90).
     for (title, total, per90) in iter_all_stats(detail) {
-        let t = title.to_lowercase();
-        if !needles.iter().any(|n| t.contains(n)) {
+        if !needles
+            .iter()
+            .any(|n| contains_ascii_case_insensitive(title, n))
+        {
             continue;
         }
-        if excludes.iter().any(|e| t.contains(e)) {
+        if excludes
+            .iter()
+            .any(|e| contains_ascii_case_insensitive(title, e))
+        {
             continue;
         }
         if let Some(per90) = per90 {
@@ -412,14 +428,17 @@ fn find_stat_value(detail: &PlayerDetail, needles: &[&str], excludes: &[&str], _
 }
 
 fn find_stat_percent(detail: &PlayerDetail, needles: &[&str], excludes: &[&str]) -> Option<f64> {
-    let needles: Vec<String> = needles.iter().map(|s| s.to_lowercase()).collect();
-    let excludes: Vec<String> = excludes.iter().map(|s| s.to_lowercase()).collect();
     for (title, total, per90) in iter_all_stats(detail) {
-        let t = title.to_lowercase();
-        if !needles.iter().any(|n| t.contains(n)) {
+        if !needles
+            .iter()
+            .any(|n| contains_ascii_case_insensitive(title, n))
+        {
             continue;
         }
-        if excludes.iter().any(|e| t.contains(e)) {
+        if excludes
+            .iter()
+            .any(|e| contains_ascii_case_insensitive(title, e))
+        {
             continue;
         }
         if let Some(per90) = per90 {
@@ -493,5 +512,34 @@ fn parse_percent(raw: &str) -> Option<f64> {
     }
     let s = s.trim_end_matches('%');
     parse_number(s)
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    for start in 0..=h.len() - n.len() {
+        if h[start]
+            .to_ascii_lowercase()
+            .eq(&n[0].to_ascii_lowercase())
+        {
+            let mut matched = true;
+            for idx in 1..n.len() {
+                if h[start + idx].to_ascii_lowercase() != n[idx].to_ascii_lowercase() {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return true;
+            }
+        }
+    }
+    false
 }
 

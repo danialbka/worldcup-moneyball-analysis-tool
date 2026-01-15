@@ -26,63 +26,12 @@ pub struct FotmobMatchRow {
 
 pub fn fetch_upcoming_from_fotmob(date: Option<&str>) -> Result<Vec<UpcomingMatch>> {
     let data = fetch_fotmob_response(date)?;
-    let mut upcoming = Vec::new();
-
-    for league in data.leagues {
-        let league_id = league.primary_id.or(Some(league.id));
-        for fixture in league.matches {
-            if fixture.status.started || fixture.status.finished || fixture.status.cancelled {
-                continue;
-            }
-            let home = fixture.home.short_name.unwrap_or(fixture.home.name);
-            let away = fixture.away.short_name.unwrap_or(fixture.away.name);
-            let kickoff = normalize_utc_time(&fixture.status.utc_time)
-                .or_else(|| fixture.time.map(normalize_local_time))
-                .unwrap_or_default();
-
-            upcoming.push(UpcomingMatch {
-                id: fixture.id.to_string(),
-                league_id,
-                league_name: league.name.clone(),
-                round: fixture.tournament_stage.unwrap_or_default(),
-                kickoff,
-                home,
-                away,
-            });
-        }
-    }
-
-    Ok(upcoming)
+    Ok(build_upcoming_from_response(data))
 }
 
 pub fn fetch_matches_from_fotmob(date: Option<&str>) -> Result<Vec<FotmobMatchRow>> {
     let data = fetch_fotmob_response(date)?;
-    let mut matches = Vec::new();
-
-    for league in data.leagues {
-        let league_id = league.primary_id.unwrap_or(league.id);
-        for fixture in league.matches {
-            let home = fixture.home.short_name.unwrap_or(fixture.home.name);
-            let away = fixture.away.short_name.unwrap_or(fixture.away.name);
-            let home_score = fixture.home.score.unwrap_or(0);
-            let away_score = fixture.away.score.unwrap_or(0);
-
-            matches.push(FotmobMatchRow {
-                id: fixture.id.to_string(),
-                league_id,
-                league_name: league.name.clone(),
-                home,
-                away,
-                home_score,
-                away_score,
-                started: fixture.status.started,
-                finished: fixture.status.finished,
-                cancelled: fixture.status.cancelled,
-            });
-        }
-    }
-
-    Ok(matches)
+    Ok(build_matches_from_response(data))
 }
 
 pub fn fetch_match_details_from_fotmob(match_id: &str) -> Result<MatchDetail> {
@@ -90,7 +39,52 @@ pub fn fetch_match_details_from_fotmob(match_id: &str) -> Result<MatchDetail> {
 
     let url = format!("https://www.fotmob.com/api/data/matchDetails?matchId={match_id}");
     let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
-    let trimmed = body.trim();
+    parse_match_details_json(&body)
+}
+
+fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
+    let client = http_client()?;
+
+    let url = if let Some(date) = date.and_then(non_empty) {
+        format!("{FOTMOB_MATCHES_URL}?date={date}")
+    } else {
+        FOTMOB_MATCHES_URL.to_string()
+    };
+
+    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
+    parse_fotmob_response_json(&body)
+}
+
+#[derive(Debug, Deserialize)]
+struct FotmobResponse {
+    #[serde(default)]
+    leagues: Vec<FotmobLeague>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FotmobLeague {
+    id: u32,
+    #[serde(rename = "primaryId")]
+    primary_id: Option<u32>,
+    name: String,
+    #[serde(default)]
+    matches: Vec<FotmobMatch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FotmobMatch {
+    id: u64,
+    #[serde(rename = "tournamentStage")]
+    tournament_stage: Option<String>,
+    #[serde(default)]
+    time: Option<String>,
+    home: FotmobTeam,
+    away: FotmobTeam,
+    status: FotmobStatus,
+}
+
+pub fn parse_match_details_json(raw: &str) -> Result<MatchDetail> {
+    let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Ok(MatchDetail {
             events: Vec::new(),
@@ -123,52 +117,83 @@ pub fn fetch_match_details_from_fotmob(match_id: &str) -> Result<MatchDetail> {
     })
 }
 
-fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
-    let client = http_client()?;
+pub fn parse_fotmob_matches_json(raw: &str) -> Result<Vec<FotmobMatchRow>> {
+    let response = parse_fotmob_response_json(raw)?;
+    Ok(build_matches_from_response(response))
+}
 
-    let url = if let Some(date) = date.and_then(non_empty) {
-        format!("{FOTMOB_MATCHES_URL}?date={date}")
-    } else {
-        FOTMOB_MATCHES_URL.to_string()
-    };
+pub fn parse_fotmob_upcoming_json(raw: &str) -> Result<Vec<UpcomingMatch>> {
+    let response = parse_fotmob_response_json(raw)?;
+    Ok(build_upcoming_from_response(response))
+}
 
-    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
-    let trimmed = body.trim();
+fn parse_fotmob_response_json(raw: &str) -> Result<FotmobResponse> {
+    let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Ok(FotmobResponse {
             leagues: Vec::new(),
         });
     }
-
     serde_json::from_str(trimmed).context("invalid fotmob json")
 }
 
-#[derive(Debug, Deserialize)]
-struct FotmobResponse {
-    #[serde(default)]
-    leagues: Vec<FotmobLeague>,
+fn build_upcoming_from_response(data: FotmobResponse) -> Vec<UpcomingMatch> {
+    let mut upcoming = Vec::new();
+
+    for league in data.leagues {
+        let league_id = league.primary_id.or(Some(league.id));
+        for fixture in league.matches {
+            if fixture.status.started || fixture.status.finished || fixture.status.cancelled {
+                continue;
+            }
+            let home = fixture.home.short_name.unwrap_or(fixture.home.name);
+            let away = fixture.away.short_name.unwrap_or(fixture.away.name);
+            let kickoff = normalize_utc_time(&fixture.status.utc_time)
+                .or_else(|| fixture.time.map(normalize_local_time))
+                .unwrap_or_default();
+
+            upcoming.push(UpcomingMatch {
+                id: fixture.id.to_string(),
+                league_id,
+                league_name: league.name.clone(),
+                round: fixture.tournament_stage.unwrap_or_default(),
+                kickoff,
+                home,
+                away,
+            });
+        }
+    }
+
+    upcoming
 }
 
-#[derive(Debug, Deserialize)]
-struct FotmobLeague {
-    id: u32,
-    #[serde(rename = "primaryId")]
-    primary_id: Option<u32>,
-    name: String,
-    #[serde(default)]
-    matches: Vec<FotmobMatch>,
-}
+fn build_matches_from_response(data: FotmobResponse) -> Vec<FotmobMatchRow> {
+    let mut matches = Vec::new();
 
-#[derive(Debug, Deserialize)]
-struct FotmobMatch {
-    id: u64,
-    #[serde(rename = "tournamentStage")]
-    tournament_stage: Option<String>,
-    #[serde(default)]
-    time: Option<String>,
-    home: FotmobTeam,
-    away: FotmobTeam,
-    status: FotmobStatus,
+    for league in data.leagues {
+        let league_id = league.primary_id.unwrap_or(league.id);
+        for fixture in league.matches {
+            let home = fixture.home.short_name.unwrap_or(fixture.home.name);
+            let away = fixture.away.short_name.unwrap_or(fixture.away.name);
+            let home_score = fixture.home.score.unwrap_or(0);
+            let away_score = fixture.away.score.unwrap_or(0);
+
+            matches.push(FotmobMatchRow {
+                id: fixture.id.to_string(),
+                league_id,
+                league_name: league.name.clone(),
+                home,
+                away,
+                home_score,
+                away_score,
+                started: fixture.status.started,
+                finished: fixture.status.finished,
+                cancelled: fixture.status.cancelled,
+            });
+        }
+    }
+
+    matches
 }
 
 #[derive(Debug, Deserialize)]
