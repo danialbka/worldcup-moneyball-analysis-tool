@@ -109,6 +109,8 @@ pub struct AppState {
     pub rankings_progress_message: String,
     pub rankings_cache_squads: HashMap<u32, Vec<SquadPlayer>>,
     pub rankings_cache_players: HashMap<u32, PlayerDetail>,
+    pub rankings_cache_squads_at: HashMap<u32, SystemTime>,
+    pub rankings_cache_players_at: HashMap<u32, SystemTime>,
     pub rankings_dirty: bool,
     pub squad: Vec<SquadPlayer>,
     pub squad_selected: usize,
@@ -165,6 +167,8 @@ impl AppState {
             rankings_progress_message: String::new(),
             rankings_cache_squads: HashMap::new(),
             rankings_cache_players: HashMap::new(),
+            rankings_cache_squads_at: HashMap::new(),
+            rankings_cache_players_at: HashMap::new(),
             rankings_dirty: false,
             squad: Vec::new(),
             squad_selected: 0,
@@ -234,6 +238,8 @@ impl AppState {
         self.rankings_progress_message.clear();
         self.rankings_cache_squads.clear();
         self.rankings_cache_players.clear();
+        self.rankings_cache_squads_at.clear();
+        self.rankings_cache_players_at.clear();
         self.rankings_dirty = false;
         self.match_detail.clear();
         self.match_detail_cached_at.clear();
@@ -1076,10 +1082,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             players,
         } => {
             state.rankings_cache_squads.insert(team_id, players);
+            state
+                .rankings_cache_squads_at
+                .insert(team_id, SystemTime::now());
             state.rankings_dirty = true;
         }
         Delta::CachePlayerDetail(detail) => {
-            state.rankings_cache_players.insert(detail.id, detail);
+            let detail_id = detail.id;
+            state.rankings_cache_players.insert(detail_id, detail);
+            state
+                .rankings_cache_players_at
+                .insert(detail_id, SystemTime::now());
             state.rankings_dirty = true;
         }
         Delta::RankCacheProgress {
@@ -1117,6 +1130,9 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state
                 .rankings_cache_squads
                 .insert(team_id, state.squad.clone());
+            state
+                .rankings_cache_squads_at
+                .insert(team_id, SystemTime::now());
             state.rankings_dirty = true;
         }
         Delta::SetPlayerDetail(detail) => {
@@ -1135,7 +1151,11 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.player_loading = false;
             // Cache for rankings reuse.
             if let Some(detail) = state.player_detail.clone() {
-                state.rankings_cache_players.insert(detail.id, detail);
+                let detail_id = detail.id;
+                state.rankings_cache_players.insert(detail_id, detail);
+                state
+                    .rankings_cache_players_at
+                    .insert(detail_id, SystemTime::now());
                 state.rankings_dirty = true;
             }
         }

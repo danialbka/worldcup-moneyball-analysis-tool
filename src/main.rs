@@ -41,6 +41,8 @@ struct App {
     detail_refresh: Duration,
     last_detail_refresh: HashMap<String, Instant>,
     detail_cache_ttl: Duration,
+    squad_cache_ttl: Duration,
+    player_cache_ttl: Duration,
 }
 
 impl App {
@@ -65,6 +67,16 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(3600)
             .max(30);
+        let squad_cache_ttl = std::env::var("SQUAD_CACHE_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(21600)
+            .max(60);
+        let player_cache_ttl = std::env::var("PLAYER_CACHE_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(21600)
+            .max(60);
         Self {
             state: AppState::new(),
             should_quit: false,
@@ -75,6 +87,8 @@ impl App {
             detail_refresh: Duration::from_secs(detail_refresh),
             last_detail_refresh: HashMap::new(),
             detail_cache_ttl: Duration::from_secs(detail_cache_ttl),
+            squad_cache_ttl: Duration::from_secs(squad_cache_ttl),
+            player_cache_ttl: Duration::from_secs(player_cache_ttl),
         }
     }
 
@@ -592,6 +606,24 @@ impl App {
     }
 
     fn request_squad(&mut self, team_id: u32, team_name: String, announce: bool) {
+        if let Some(players) = self.state.rankings_cache_squads.get(&team_id).cloned() {
+            self.state.squad = players;
+            self.state.squad_selected = 0;
+            self.state.squad_loading = false;
+            self.state.squad_team = Some(team_name.clone());
+            self.state.squad_team_id = Some(team_id);
+            let cached_at = self.state.rankings_cache_squads_at.get(&team_id).copied();
+            if cache_fresh(cached_at, self.squad_cache_ttl) {
+                if announce {
+                    self.state.push_log("[INFO] Squad cached (skipping fetch)");
+                }
+                return;
+            }
+            if announce {
+                self.state
+                    .push_log("[INFO] Squad cached (refreshing in background)");
+            }
+        }
         let Some(tx) = &self.cmd_tx else {
             if announce {
                 self.state.push_log("[INFO] Squad fetch unavailable");
@@ -609,9 +641,11 @@ impl App {
             if announce {
                 self.state.push_log("[INFO] Squad request sent");
             }
-            self.state.squad_loading = true;
-            self.state.squad = Vec::new();
-            self.state.squad_selected = 0;
+            if self.state.squad.is_empty() {
+                self.state.squad_loading = true;
+                self.state.squad = Vec::new();
+                self.state.squad_selected = 0;
+            }
         }
     }
 
@@ -624,6 +658,30 @@ impl App {
         };
         self.state.player_last_id = Some(player_id);
         self.state.player_last_name = Some(player_name.clone());
+        if let Some(cached) = self
+            .state
+            .rankings_cache_players
+            .get(&player_id)
+            .cloned()
+        {
+            let cached_at = self
+                .state
+                .rankings_cache_players_at
+                .get(&player_id)
+                .copied();
+            self.state.player_detail = Some(cached);
+            self.state.player_loading = false;
+            if cache_fresh(cached_at, self.player_cache_ttl) {
+                if announce {
+                    self.state.push_log("[INFO] Player cached (skipping fetch)");
+                }
+                return;
+            }
+            if announce {
+                self.state
+                    .push_log("[INFO] Player cached (refreshing in background)");
+            }
+        }
         if tx
             .send(state::ProviderCommand::FetchPlayer {
                 player_id,
@@ -638,8 +696,10 @@ impl App {
             if announce {
                 self.state.push_log("[INFO] Player request sent");
             }
-            self.state.player_loading = true;
-            self.state.player_detail = None;
+            if self.state.player_detail.is_none() {
+                self.state.player_loading = true;
+                self.state.player_detail = None;
+            }
         }
     }
 

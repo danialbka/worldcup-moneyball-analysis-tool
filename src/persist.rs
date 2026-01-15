@@ -26,6 +26,10 @@ struct LeagueCache {
     squads: HashMap<u32, Vec<SquadPlayer>>,
     players: HashMap<u32, PlayerDetail>,
     #[serde(default)]
+    squads_fetched_at: HashMap<u32, u64>,
+    #[serde(default)]
+    players_fetched_at: HashMap<u32, u64>,
+    #[serde(default)]
     rankings: Vec<RoleRankingEntry>,
     #[serde(default)]
     upcoming: Vec<UpcomingMatch>,
@@ -63,6 +67,16 @@ pub fn load_into_state(state: &mut AppState) {
     }
     state.rankings_cache_squads = league.squads.clone();
     state.rankings_cache_players = league.players.clone();
+    state.rankings_cache_squads_at = league
+        .squads_fetched_at
+        .iter()
+        .filter_map(|(id, ts)| system_time_from_secs(*ts).map(|t| (*id, t)))
+        .collect();
+    state.rankings_cache_players_at = league
+        .players_fetched_at
+        .iter()
+        .filter_map(|(id, ts)| system_time_from_secs(*ts).map(|t| (*id, t)))
+        .collect();
     state.rankings = league.rankings.clone();
     state.rankings_dirty = league.rankings.is_empty();
 
@@ -100,6 +114,16 @@ pub fn save_from_state(state: &AppState) {
             analysis: state.analysis.clone(),
             squads: state.rankings_cache_squads.clone(),
             players: state.rankings_cache_players.clone(),
+            squads_fetched_at: state
+                .rankings_cache_squads_at
+                .iter()
+                .filter_map(|(id, ts)| system_time_to_secs(*ts).map(|t| (*id, t)))
+                .collect(),
+            players_fetched_at: state
+                .rankings_cache_players_at
+                .iter()
+                .filter_map(|(id, ts)| system_time_to_secs(*ts).map(|t| (*id, t)))
+                .collect(),
             rankings: state.rankings.clone(),
             upcoming: state.upcoming.clone(),
             upcoming_fetched_at: state.upcoming_cached_at.and_then(system_time_to_secs),
