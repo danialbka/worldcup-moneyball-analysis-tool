@@ -1,9 +1,13 @@
+use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
+use crate::http_cache::fetch_json_cached;
+use crate::http_client::http_client;
 use crate::state::{
     Confederation, PlayerDetail, PlayerLeagueStats, PlayerMatchStat, PlayerSeasonPerformanceGroup,
     PlayerSeasonPerformanceItem, PlayerStatGroup, PlayerStatItem, PlayerTraitGroup,
@@ -311,7 +315,7 @@ const WORLD_CUP_TEAMS: &[NationInfo] = &[
 
 pub fn fetch_worldcup_team_analysis() -> AnalysisFetch {
     let mut errors = Vec::new();
-    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+    let client = match http_client() {
         Ok(client) => client,
         Err(err) => {
             errors.push(format!("analysis client build failed: {err}"));
@@ -322,23 +326,36 @@ pub fn fetch_worldcup_team_analysis() -> AnalysisFetch {
         }
     };
 
-    let mut teams = Vec::new();
-    for nation in WORLD_CUP_TEAMS {
-        match fetch_team_overview(&client, nation.team_id) {
-            Ok(overview) => teams.push(TeamAnalysis {
-                id: nation.team_id,
-                name: nation.name.to_string(),
-                confed: nation.confed,
-                host: nation.host,
-                fifa_rank: overview.fifa_rank,
-                fifa_points: overview.fifa_points,
-                fifa_updated: overview.fifa_updated,
-            }),
-            Err(err) => {
-                errors.push(format!("{} fetch failed: {err}", nation.name));
-                teams.push(empty_analysis(nation));
-            }
+    let results: Vec<(TeamAnalysis, Option<String>)> = with_fetch_pool(|| {
+        WORLD_CUP_TEAMS
+            .par_iter()
+            .map(|nation| match fetch_team_overview(client, nation.team_id) {
+                Ok(overview) => (
+                    TeamAnalysis {
+                        id: nation.team_id,
+                        name: nation.name.to_string(),
+                        confed: nation.confed,
+                        host: nation.host,
+                        fifa_rank: overview.fifa_rank,
+                        fifa_points: overview.fifa_points,
+                        fifa_updated: overview.fifa_updated,
+                    },
+                    None,
+                ),
+                Err(err) => (
+                    empty_analysis(nation),
+                    Some(format!("{} fetch failed: {err}", nation.name)),
+                ),
+            })
+            .collect()
+    });
+
+    let mut teams = Vec::with_capacity(results.len());
+    for (team, err) in results {
+        if let Some(err) = err {
+            errors.push(err);
         }
+        teams.push(team);
     }
 
     AnalysisFetch { teams, errors }
@@ -346,7 +363,7 @@ pub fn fetch_worldcup_team_analysis() -> AnalysisFetch {
 
 pub fn fetch_premier_league_team_analysis() -> AnalysisFetch {
     let mut errors = Vec::new();
-    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+    let client = match http_client() {
         Ok(client) => client,
         Err(err) => {
             errors.push(format!("analysis client build failed: {err}"));
@@ -365,23 +382,36 @@ pub fn fetch_premier_league_team_analysis() -> AnalysisFetch {
         }
     };
 
-    let mut analysis = Vec::new();
-    for team in teams {
-        match fetch_team_overview(&client, team.id) {
-            Ok(overview) => analysis.push(TeamAnalysis {
-                id: team.id,
-                name: team.name,
-                confed: Confederation::UEFA,
-                host: false,
-                fifa_rank: overview.fifa_rank,
-                fifa_points: overview.fifa_points,
-                fifa_updated: overview.fifa_updated,
-            }),
-            Err(err) => {
-                errors.push(format!("{} fetch failed: {err}", team.name));
-                analysis.push(empty_club_analysis(&team));
-            }
+    let results: Vec<(TeamAnalysis, Option<String>)> = with_fetch_pool(|| {
+        teams
+            .par_iter()
+            .map(|team| match fetch_team_overview(client, team.id) {
+                Ok(overview) => (
+                    TeamAnalysis {
+                        id: team.id,
+                        name: team.name.clone(),
+                        confed: Confederation::UEFA,
+                        host: false,
+                        fifa_rank: overview.fifa_rank,
+                        fifa_points: overview.fifa_points,
+                        fifa_updated: overview.fifa_updated,
+                    },
+                    None,
+                ),
+                Err(err) => (
+                    empty_club_analysis(team),
+                    Some(format!("{} fetch failed: {err}", team.name)),
+                ),
+            })
+            .collect()
+    });
+
+    let mut analysis = Vec::with_capacity(results.len());
+    for (team, err) in results {
+        if let Some(err) = err {
+            errors.push(err);
         }
+        analysis.push(team);
     }
 
     AnalysisFetch {
@@ -426,18 +456,7 @@ fn fallback_premier_league_teams() -> Vec<LeagueTeam> {
 
 fn fetch_league_teams(client: &Client, league_id: u32) -> Result<Vec<LeagueTeam>> {
     let url = format!("{FOTMOB_LEAGUE_URL}{league_id}");
-    let resp = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .context("league request failed")?;
-
-    let status = resp.status();
-    let body = resp.text().context("failed reading league body")?;
-    if !status.is_success() {
-        return Err(anyhow::anyhow!("http {}: {}", status, body));
-    }
-
+    let body = fetch_json_cached(client, &url, &[]).context("league request failed")?;
     let trimmed = body.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Err(anyhow::anyhow!("empty league response"));
@@ -477,18 +496,7 @@ fn fetch_league_teams(client: &Client, league_id: u32) -> Result<Vec<LeagueTeam>
 
 fn fetch_team_overview(client: &Client, team_id: u32) -> Result<TeamOverview> {
     let url = format!("{FOTMOB_TEAM_URL}{team_id}");
-    let resp = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .context("request failed")?;
-
-    let status = resp.status();
-    let body = resp.text().context("failed reading body")?;
-    if !status.is_success() {
-        return Err(anyhow::anyhow!("http {}: {}", status, body));
-    }
-
+    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
     let trimmed = body.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Err(anyhow::anyhow!("empty team response"));
@@ -569,24 +577,10 @@ pub struct TeamSquad {
 }
 
 pub fn fetch_team_squad(team_id: u32) -> Result<TeamSquad> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("failed to build http client")?;
+    let client = http_client()?;
 
     let url = format!("{FOTMOB_TEAM_URL}{team_id}");
-    let resp = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .context("request failed")?;
-
-    let status = resp.status();
-    let body = resp.text().context("failed reading body")?;
-    if !status.is_success() {
-        return Err(anyhow::anyhow!("http {}: {}", status, body));
-    }
-
+    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
     let trimmed = body.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Err(anyhow::anyhow!("empty team response"));
@@ -623,44 +617,20 @@ pub fn fetch_team_squad(team_id: u32) -> Result<TeamSquad> {
 }
 
 pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("failed to build http client")?;
+    let client = http_client()?;
 
     let url = format!("https://www.fotmob.com/api/playerData?id={player_id}");
     let mut last_err = None;
     let mut parsed: Option<PlayerDataResponse> = None;
     for attempt in 0..3 {
-        let resp = client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .header("Accept-Language", "en-GB,en;q=0.9")
-            .send();
+        let resp = fetch_json_cached(
+            client,
+            &url,
+            &[("Accept-Language", "en-GB,en;q=0.9")],
+        );
 
         match resp {
-            Ok(resp) => {
-                let status = resp.status();
-                let body = match resp.text() {
-                    Ok(body) => body,
-                    Err(err) => {
-                        last_err = Some(anyhow::anyhow!("failed reading body: {err}"));
-                        if attempt < 2 {
-                            std::thread::sleep(Duration::from_millis(300));
-                            continue;
-                        }
-                        break;
-                    }
-                };
-                if !status.is_success() {
-                    last_err = Some(anyhow::anyhow!("http {}: {}", status, body));
-                    if attempt < 2 {
-                        std::thread::sleep(Duration::from_millis(300));
-                        continue;
-                    }
-                    break;
-                }
-
+            Ok(body) => {
                 let trimmed = body.trim();
                 if trimmed.is_empty() || trimmed == "null" {
                     last_err = Some(anyhow::anyhow!("empty player response"));
@@ -1162,6 +1132,28 @@ fn normalize_stat_cell(value: String) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn with_fetch_pool<T>(action: impl FnOnce() -> T + Send) -> T
+where
+    T: Send,
+{
+    let threads = fetch_parallelism();
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+    {
+        Ok(pool) => pool.install(action),
+        Err(_) => action(),
+    }
+}
+
+fn fetch_parallelism() -> usize {
+    env::var("FETCH_PARALLELISM")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(6)
+        .clamp(2, 32)
 }
 
 #[derive(Debug, Deserialize)]

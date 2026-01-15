@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::env;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use rand::Rng;
+use rayon::prelude::*;
 
 use crate::analysis_fetch;
 use crate::state::{
@@ -211,67 +213,98 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                     analysis_fetch::fetch_worldcup_team_analysis()
                                 }
                             };
-                            let mut errors = analysis.errors;
-
-                            let mut total = analysis.teams.len();
-                            let mut current = 0usize;
+                            let errors = std::sync::Mutex::new(analysis.errors);
+                            let total = AtomicUsize::new(analysis.teams.len());
+                            let current = AtomicUsize::new(0);
+                            let pool = build_fetch_pool();
                             let _ = tx.send(Delta::RankCacheProgress {
-                                current,
-                                total,
+                                current: 0,
+                                total: total.load(Ordering::SeqCst),
                                 message: "Loaded teams".to_string(),
                             });
 
                             for team in analysis.teams {
                                 let _ = tx.send(Delta::RankCacheProgress {
-                                    current,
-                                    total,
+                                    current: current.load(Ordering::SeqCst),
+                                    total: total.load(Ordering::SeqCst),
                                     message: format!("Fetching squad: {}", team.name),
                                 });
                                 match analysis_fetch::fetch_team_squad(team.id) {
                                     Ok(squad) => {
-                                        total = total.saturating_add(squad.players.len());
-                                        current = current.saturating_add(1);
+                                        total.fetch_add(squad.players.len(), Ordering::SeqCst);
+                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::CacheSquad {
                                             team_id: team.id,
                                             team_name: squad.team_name,
                                             players: squad.players.clone(),
                                         });
                                         let _ = tx.send(Delta::RankCacheProgress {
-                                            current,
-                                            total,
-                                            message: format!("Squad loaded: {} ({} players)", team.name, squad.players.len()),
+                                            current: current_val,
+                                            total: total.load(Ordering::SeqCst),
+                                            message: format!(
+                                                "Squad loaded: {} ({} players)",
+                                                team.name,
+                                                squad.players.len()
+                                            ),
                                         });
 
-                                        for player in squad.players {
-                                            match analysis_fetch::fetch_player_detail(player.id) {
-                                                Ok(detail) => {
-                                                    let _ = tx.send(Delta::CachePlayerDetail(detail));
+                                        let players = squad.players;
+                                        let tx_players = tx.clone();
+                                        let total_ref = &total;
+                                        let current_ref = &current;
+                                        let errors_ref = &errors;
+                                        with_fetch_pool(&pool, || {
+                                            players.par_iter().for_each(|player| {
+                                                match analysis_fetch::fetch_player_detail(player.id)
+                                                {
+                                                    Ok(detail) => {
+                                                        let _ = tx_players
+                                                            .send(Delta::CachePlayerDetail(
+                                                                detail,
+                                                            ));
+                                                    }
+                                                    Err(err) => {
+                                                        let mut guard =
+                                                            errors_ref.lock().unwrap();
+                                                        guard.push(format!(
+                                                            "player detail {} ({}): {err}",
+                                                            player.name, player.id
+                                                        ));
+                                                    }
                                                 }
-                                                Err(err) => errors.push(format!(
-                                                    "player detail {} ({}): {err}",
-                                                    player.name, player.id
-                                                )),
-                                            }
-                                            current = current.saturating_add(1);
-                                            let _ = tx.send(Delta::RankCacheProgress {
-                                                current,
-                                                total,
-                                                message: format!("Player: {} ({})", player.name, team.name),
+                                                let current_val =
+                                                    current_ref.fetch_add(1, Ordering::SeqCst)
+                                                        + 1;
+                                                let _ = tx_players.send(
+                                                    Delta::RankCacheProgress {
+                                                        current: current_val,
+                                                        total: total_ref.load(Ordering::SeqCst),
+                                                        message: format!(
+                                                            "Player: {} ({})",
+                                                            player.name, team.name
+                                                        ),
+                                                    },
+                                                );
                                             });
-                                        }
+                                        });
                                     }
                                     Err(err) => {
-                                        errors.push(format!("squad {} ({}): {err}", team.name, team.id));
-                                        current = current.saturating_add(1);
+                                        let mut guard = errors.lock().unwrap();
+                                        guard.push(format!(
+                                            "squad {} ({}): {err}",
+                                            team.name, team.id
+                                        ));
+                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::RankCacheProgress {
-                                            current,
-                                            total,
+                                            current: current_val,
+                                            total: total.load(Ordering::SeqCst),
                                             message: format!("Squad failed: {}", team.name),
                                         });
                                     }
                                 }
                             }
 
+                            let errors = errors.into_inner().unwrap_or_default();
                             let _ = tx.send(Delta::RankCacheFinished { errors });
                         });
                     }
@@ -282,93 +315,131 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                     } => {
                         let tx = tx.clone();
                         std::thread::spawn(move || {
-                            let mut errors: Vec<String> = Vec::new();
-                            let mut total = team_ids.len() + player_ids.len();
-                            if total == 0 {
-                                let _ = tx.send(Delta::RankCacheFinished { errors });
+                            let errors = std::sync::Mutex::new(Vec::<String>::new());
+                            let total = AtomicUsize::new(team_ids.len() + player_ids.len());
+                            let current = AtomicUsize::new(0);
+                            let pool = build_fetch_pool();
+                            if total.load(Ordering::SeqCst) == 0 {
+                                let _ = tx.send(Delta::RankCacheFinished { errors: Vec::new() });
                                 return;
                             }
-                            let mut current = 0usize;
                             let _ = tx.send(Delta::RankCacheProgress {
-                                current,
-                                total,
+                                current: 0,
+                                total: total.load(Ordering::SeqCst),
                                 message: "Warming missing cache".to_string(),
                             });
 
                             for team_id in team_ids {
                                 let _ = tx.send(Delta::RankCacheProgress {
-                                    current,
-                                    total,
+                                    current: current.load(Ordering::SeqCst),
+                                    total: total.load(Ordering::SeqCst),
                                     message: format!("Fetching squad: {team_id}"),
                                 });
                                 match analysis_fetch::fetch_team_squad(team_id) {
                                     Ok(squad) => {
-                                        total = total.saturating_add(squad.players.len());
-                                        current = current.saturating_add(1);
+                                        total.fetch_add(squad.players.len(), Ordering::SeqCst);
+                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::CacheSquad {
                                             team_id,
                                             team_name: squad.team_name,
                                             players: squad.players.clone(),
                                         });
                                         let _ = tx.send(Delta::RankCacheProgress {
-                                            current,
-                                            total,
+                                            current: current_val,
+                                            total: total.load(Ordering::SeqCst),
                                             message: format!(
                                                 "Squad loaded: {team_id} ({} players)",
                                                 squad.players.len()
                                             ),
                                         });
 
-                                        for player in squad.players {
-                                            match analysis_fetch::fetch_player_detail(player.id) {
-                                                Ok(detail) => {
-                                                    let _ = tx.send(Delta::CachePlayerDetail(detail));
+                                        let players = squad.players;
+                                        let tx_players = tx.clone();
+                                        let total_ref = &total;
+                                        let current_ref = &current;
+                                        let errors_ref = &errors;
+                                        with_fetch_pool(&pool, || {
+                                            players.par_iter().for_each(|player| {
+                                                match analysis_fetch::fetch_player_detail(player.id)
+                                                {
+                                                    Ok(detail) => {
+                                                        let _ = tx_players
+                                                            .send(Delta::CachePlayerDetail(
+                                                                detail,
+                                                            ));
+                                                    }
+                                                    Err(err) => {
+                                                        let mut guard =
+                                                            errors_ref.lock().unwrap();
+                                                        guard.push(format!(
+                                                            "player detail {} ({}): {err}",
+                                                            player.name, player.id
+                                                        ));
+                                                    }
                                                 }
-                                                Err(err) => errors.push(format!(
-                                                    "player detail {} ({}): {err}",
-                                                    player.name, player.id
-                                                )),
-                                            }
-                                            current = current.saturating_add(1);
-                                            let _ = tx.send(Delta::RankCacheProgress {
-                                                current,
-                                                total,
-                                                message: format!("Player: {} ({team_id})", player.name),
+                                                let current_val =
+                                                    current_ref.fetch_add(1, Ordering::SeqCst)
+                                                        + 1;
+                                                let _ = tx_players.send(
+                                                    Delta::RankCacheProgress {
+                                                        current: current_val,
+                                                        total: total_ref.load(Ordering::SeqCst),
+                                                        message: format!(
+                                                            "Player: {} ({team_id})",
+                                                            player.name
+                                                        ),
+                                                    },
+                                                );
                                             });
-                                        }
+                                        });
                                     }
                                     Err(err) => {
-                                        errors.push(format!("squad {team_id}: {err}"));
-                                        current = current.saturating_add(1);
+                                        let mut guard = errors.lock().unwrap();
+                                        guard.push(format!("squad {team_id}: {err}"));
+                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::RankCacheProgress {
-                                            current,
-                                            total,
+                                            current: current_val,
+                                            total: total.load(Ordering::SeqCst),
                                             message: format!("Squad failed: {team_id}"),
                                         });
                                     }
                                 }
                             }
 
-                            for player_id in player_ids {
-                                let _ = tx.send(Delta::RankCacheProgress {
-                                    current,
-                                    total,
-                                    message: format!("Fetching player: {player_id}"),
-                                });
-                                match analysis_fetch::fetch_player_detail(player_id) {
-                                    Ok(detail) => {
-                                        let _ = tx.send(Delta::CachePlayerDetail(detail));
+                            let tx_players = tx.clone();
+                            let total_ref = &total;
+                            let current_ref = &current;
+                            let errors_ref = &errors;
+                            with_fetch_pool(&pool, || {
+                                player_ids.par_iter().for_each(|player_id| {
+                                    let _ = tx_players.send(Delta::RankCacheProgress {
+                                        current: current_ref.load(Ordering::SeqCst),
+                                        total: total_ref.load(Ordering::SeqCst),
+                                        message: format!("Fetching player: {player_id}"),
+                                    });
+                                    match analysis_fetch::fetch_player_detail(*player_id) {
+                                        Ok(detail) => {
+                                            let _ = tx_players
+                                                .send(Delta::CachePlayerDetail(detail));
+                                        }
+                                        Err(err) => {
+                                            let mut guard = errors_ref.lock().unwrap();
+                                            guard.push(format!(
+                                                "player detail {player_id}: {err}"
+                                            ));
+                                        }
                                     }
-                                    Err(err) => errors.push(format!("player detail {player_id}: {err}")),
-                                }
-                                current = current.saturating_add(1);
-                                let _ = tx.send(Delta::RankCacheProgress {
-                                    current,
-                                    total,
-                                    message: format!("Player cached: {player_id}"),
+                                    let current_val =
+                                        current_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let _ = tx_players.send(Delta::RankCacheProgress {
+                                        current: current_val,
+                                        total: total_ref.load(Ordering::SeqCst),
+                                        message: format!("Player cached: {player_id}"),
+                                    });
                                 });
-                            }
+                            });
 
+                            let errors = errors.into_inner().unwrap_or_default();
                             let _ = tx.send(Delta::RankCacheFinished { errors });
                         });
                     }
@@ -809,4 +880,31 @@ fn jitter_probs(win: &mut WinProbRow, rng: &mut impl Rng) {
     win.p_home = home / sum * 100.0;
     win.p_draw = draw / sum * 100.0;
     win.p_away = away / sum * 100.0;
+}
+
+fn build_fetch_pool() -> Option<rayon::ThreadPool> {
+    let threads = fetch_parallelism();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .ok()
+}
+
+fn with_fetch_pool<T>(pool: &Option<rayon::ThreadPool>, action: impl FnOnce() -> T + Send) -> T
+where
+    T: Send,
+{
+    if let Some(pool) = pool.as_ref() {
+        pool.install(action)
+    } else {
+        action()
+    }
+}
+
+fn fetch_parallelism() -> usize {
+    env::var("FETCH_PARALLELISM")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(6)
+        .clamp(2, 32)
 }

@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{AppState, LeagueMode, PlayerDetail, SquadPlayer, TeamAnalysis};
+use crate::state::{
+    AppState, LeagueMode, MatchDetail, PlayerDetail, RoleRankingEntry, SquadPlayer, TeamAnalysis,
+    UpcomingMatch,
+};
 
 const CACHE_DIR: &str = "wc26_terminal";
 const CACHE_FILE: &str = "cache.json";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CacheFile {
@@ -21,6 +25,16 @@ struct LeagueCache {
     analysis: Vec<TeamAnalysis>,
     squads: HashMap<u32, Vec<SquadPlayer>>,
     players: HashMap<u32, PlayerDetail>,
+    #[serde(default)]
+    rankings: Vec<RoleRankingEntry>,
+    #[serde(default)]
+    upcoming: Vec<UpcomingMatch>,
+    #[serde(default)]
+    upcoming_fetched_at: Option<u64>,
+    #[serde(default)]
+    match_details: HashMap<String, MatchDetail>,
+    #[serde(default)]
+    match_detail_fetched_at: HashMap<String, u64>,
 }
 
 pub fn load_into_state(state: &mut AppState) {
@@ -49,7 +63,19 @@ pub fn load_into_state(state: &mut AppState) {
     }
     state.rankings_cache_squads = league.squads.clone();
     state.rankings_cache_players = league.players.clone();
-    state.rankings_dirty = true;
+    state.rankings = league.rankings.clone();
+    state.rankings_dirty = league.rankings.is_empty();
+
+    state.upcoming = league.upcoming.clone();
+    state.upcoming_cached_at = league
+        .upcoming_fetched_at
+        .and_then(system_time_from_secs);
+    state.match_detail = league.match_details.clone();
+    state.match_detail_cached_at = league
+        .match_detail_fetched_at
+        .iter()
+        .filter_map(|(id, ts)| system_time_from_secs(*ts).map(|t| (id.clone(), t)))
+        .collect();
 }
 
 pub fn save_from_state(state: &AppState) {
@@ -74,6 +100,15 @@ pub fn save_from_state(state: &AppState) {
             analysis: state.analysis.clone(),
             squads: state.rankings_cache_squads.clone(),
             players: state.rankings_cache_players.clone(),
+            rankings: state.rankings.clone(),
+            upcoming: state.upcoming.clone(),
+            upcoming_fetched_at: state.upcoming_cached_at.and_then(system_time_to_secs),
+            match_details: state.match_detail.clone(),
+            match_detail_fetched_at: state
+                .match_detail_cached_at
+                .iter()
+                .filter_map(|(id, ts)| system_time_to_secs(*ts).map(|t| (id.clone(), t)))
+                .collect(),
         },
     );
 
@@ -104,6 +139,14 @@ fn cache_path() -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(home).join(".cache").join(CACHE_DIR).join(CACHE_FILE))
+}
+
+fn system_time_to_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+fn system_time_from_secs(secs: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
 }
 
 fn league_key(mode: LeagueMode) -> &'static str {

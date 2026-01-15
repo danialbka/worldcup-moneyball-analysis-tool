@@ -1,10 +1,9 @@
-use std::time::Duration;
-
-use anyhow::{Context, Result, anyhow};
-use reqwest::blocking::Client;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::http_cache::fetch_json_cached;
+use crate::http_client::http_client;
 use crate::state::{
     Event, EventKind, LineupSide, MatchDetail, MatchLineups, PlayerSlot, StatRow, UpcomingMatch,
 };
@@ -87,24 +86,10 @@ pub fn fetch_matches_from_fotmob(date: Option<&str>) -> Result<Vec<FotmobMatchRo
 }
 
 pub fn fetch_match_details_from_fotmob(match_id: &str) -> Result<MatchDetail> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("failed to build http client")?;
+    let client = http_client()?;
 
     let url = format!("https://www.fotmob.com/api/data/matchDetails?matchId={match_id}");
-    let resp = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .context("request failed")?;
-
-    let status = resp.status();
-    let body = resp.text().context("failed reading body")?;
-    if !status.is_success() {
-        return Err(anyhow!("http {}: {}", status, body));
-    }
-
+    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
     let trimmed = body.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Ok(MatchDetail {
@@ -139,10 +124,7 @@ pub fn fetch_match_details_from_fotmob(match_id: &str) -> Result<MatchDetail> {
 }
 
 fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("failed to build http client")?;
+    let client = http_client()?;
 
     let url = if let Some(date) = date.and_then(non_empty) {
         format!("{FOTMOB_MATCHES_URL}?date={date}")
@@ -150,18 +132,7 @@ fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
         FOTMOB_MATCHES_URL.to_string()
     };
 
-    let resp = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .context("request failed")?;
-
-    let status = resp.status();
-    let body = resp.text().context("failed reading body")?;
-    if !status.is_success() {
-        return Err(anyhow!("http {}: {}", status, body));
-    }
-
+    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
     let trimmed = body.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Ok(FotmobResponse {

@@ -20,6 +20,8 @@ mod analysis_export;
 mod analysis_fetch;
 mod analysis_rankings;
 mod fake_feed;
+mod http_cache;
+mod http_client;
 mod persist;
 mod state;
 mod upcoming_fetch;
@@ -35,8 +37,10 @@ struct App {
     cmd_tx: Option<mpsc::Sender<state::ProviderCommand>>,
     upcoming_refresh: Duration,
     last_upcoming_refresh: Instant,
+    upcoming_cache_ttl: Duration,
     detail_refresh: Duration,
     last_detail_refresh: HashMap<String, Instant>,
+    detail_cache_ttl: Duration,
 }
 
 impl App {
@@ -46,10 +50,20 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(60)
             .max(10);
+        let upcoming_cache_ttl = std::env::var("UPCOMING_CACHE_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(300)
+            .max(10);
         let detail_refresh = std::env::var("DETAILS_POLL_SECS")
             .ok()
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(60)
+            .max(30);
+        let detail_cache_ttl = std::env::var("DETAILS_CACHE_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(3600)
             .max(30);
         Self {
             state: AppState::new(),
@@ -57,8 +71,10 @@ impl App {
             cmd_tx,
             upcoming_refresh: Duration::from_secs(upcoming_refresh),
             last_upcoming_refresh: Instant::now(),
+            upcoming_cache_ttl: Duration::from_secs(upcoming_cache_ttl),
             detail_refresh: Duration::from_secs(detail_refresh),
             last_detail_refresh: HashMap::new(),
+            detail_cache_ttl: Duration::from_secs(detail_cache_ttl),
         }
     }
 
@@ -343,6 +359,28 @@ impl App {
     }
 
     fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
+        let is_live = self
+            .state
+            .matches
+            .iter()
+            .find(|m| m.id == match_id)
+            .map(|m| m.is_live)
+            .unwrap_or(false);
+        let cached_at = self
+            .state
+            .match_detail_cached_at
+            .get(match_id)
+            .copied();
+        let has_cached = self.state.match_detail.contains_key(match_id);
+        if !is_live && has_cached && cache_fresh(cached_at, self.detail_cache_ttl) {
+            if announce {
+                self.state
+                    .push_log("[INFO] Match details cached (skipping fetch)");
+            }
+            self.last_detail_refresh
+                .insert(match_id.to_string(), Instant::now());
+            return;
+        }
         let Some(tx) = &self.cmd_tx else {
             if announce {
                 self.state
@@ -369,6 +407,13 @@ impl App {
     }
 
     fn request_upcoming(&mut self, announce: bool) {
+        if cache_fresh(self.state.upcoming_cached_at, self.upcoming_cache_ttl) {
+            if announce {
+                self.state.push_log("[INFO] Upcoming cached (skipping fetch)");
+            }
+            self.last_upcoming_refresh = Instant::now();
+            return;
+        }
         let Some(tx) = &self.cmd_tx else {
             if announce {
                 self.state.push_log("[INFO] Upcoming fetch unavailable");
@@ -656,6 +701,16 @@ impl App {
                 self.request_match_details_for(&match_id, false);
             }
         }
+    }
+}
+
+fn cache_fresh(at: Option<std::time::SystemTime>, ttl: Duration) -> bool {
+    let Some(at) = at else {
+        return false;
+    };
+    match at.elapsed() {
+        Ok(elapsed) => elapsed < ttl,
+        Err(_) => false,
     }
 }
 

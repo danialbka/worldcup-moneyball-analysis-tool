@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -88,7 +89,9 @@ pub struct AppState {
     pub matches: Vec<MatchSummary>,
     pub upcoming: Vec<UpcomingMatch>,
     pub upcoming_scroll: u16,
+    pub upcoming_cached_at: Option<SystemTime>,
     pub match_detail: HashMap<String, MatchDetail>,
+    pub match_detail_cached_at: HashMap<String, SystemTime>,
     pub logs: VecDeque<String>,
     pub help_overlay: bool,
     pub analysis: Vec<TeamAnalysis>,
@@ -142,7 +145,9 @@ impl AppState {
             matches: Vec::new(),
             upcoming: Vec::new(),
             upcoming_scroll: 0,
+            upcoming_cached_at: None,
             match_detail: HashMap::new(),
+            match_detail_cached_at: HashMap::new(),
             logs: VecDeque::new(),
             help_overlay: false,
             analysis: Vec::new(),
@@ -213,6 +218,7 @@ impl AppState {
         };
         self.selected = 0;
         self.upcoming_scroll = 0;
+        self.upcoming_cached_at = None;
         self.analysis.clear();
         self.analysis_selected = 0;
         self.analysis_loading = false;
@@ -229,6 +235,8 @@ impl AppState {
         self.rankings_cache_squads.clear();
         self.rankings_cache_players.clear();
         self.rankings_dirty = false;
+        self.match_detail.clear();
+        self.match_detail_cached_at.clear();
         self.squad.clear();
         self.squad_selected = 0;
         self.squad_loading = false;
@@ -710,14 +718,14 @@ pub struct WinProbRow {
     pub confidence: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchDetail {
     pub events: Vec<Event>,
     pub lineups: Option<MatchLineups>,
     pub stats: Vec<StatRow>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpcomingMatch {
     #[allow(dead_code)]
     pub id: String,
@@ -729,7 +737,7 @@ pub struct UpcomingMatch {
     pub away: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub minute: u16,
     pub kind: EventKind,
@@ -737,14 +745,14 @@ pub struct Event {
     pub description: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSlot {
     pub name: String,
     pub number: Option<u32>,
     pub pos: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineupSide {
     pub team: String,
     pub team_abbr: String,
@@ -753,12 +761,12 @@ pub struct LineupSide {
     pub subs: Vec<PlayerSlot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchLineups {
     pub sides: Vec<LineupSide>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatRow {
     pub name: String,
     pub home: String,
@@ -907,7 +915,7 @@ pub struct PlayerTrophyEntry {
     pub seasons_runner_up: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleRankingEntry {
     pub role: RoleCategory,
     pub player_id: u32,
@@ -920,7 +928,7 @@ pub struct RoleRankingEntry {
     pub rating: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     Shot,
     Card,
@@ -1026,7 +1034,10 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             }
         }
         Delta::SetMatchDetails { id, detail } => {
-            state.match_detail.insert(id, detail);
+            state.match_detail.insert(id.clone(), detail);
+            state
+                .match_detail_cached_at
+                .insert(id, SystemTime::now());
         }
         Delta::UpsertMatch(mut summary) => {
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == summary.id) {
@@ -1040,6 +1051,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         }
         Delta::SetUpcoming(fixtures) => {
             state.upcoming = fixtures;
+            state.upcoming_cached_at = Some(SystemTime::now());
             if state.pulse_view == PulseView::Upcoming {
                 state.upcoming_scroll = 0;
             }
