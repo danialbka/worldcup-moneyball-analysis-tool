@@ -1085,11 +1085,13 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             team_name: _,
             players,
         } => {
-            state.rankings_cache_squads.insert(team_id, players);
-            state
-                .rankings_cache_squads_at
-                .insert(team_id, SystemTime::now());
-            state.rankings_dirty = true;
+            if !players.is_empty() {
+                state.rankings_cache_squads.insert(team_id, players);
+                state
+                    .rankings_cache_squads_at
+                    .insert(team_id, SystemTime::now());
+                state.rankings_dirty = true;
+            }
         }
         Delta::CachePlayerDetail(detail) => {
             let detail_id = detail.id;
@@ -1137,13 +1139,15 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     Some(state.squad.iter().map(|p| p.id).collect());
             }
             // Also cache for rankings so we don't refetch later.
-            state
-                .rankings_cache_squads
-                .insert(team_id, state.squad.clone());
-            state
-                .rankings_cache_squads_at
-                .insert(team_id, SystemTime::now());
-            state.rankings_dirty = true;
+            if !state.squad.is_empty() {
+                state
+                    .rankings_cache_squads
+                    .insert(team_id, state.squad.clone());
+                state
+                    .rankings_cache_squads_at
+                    .insert(team_id, SystemTime::now());
+                state.rankings_dirty = true;
+            }
         }
         Delta::SetPlayerDetail(detail) => {
             let is_stub = player_detail_is_stub(&detail);
@@ -1161,12 +1165,14 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.player_loading = false;
             // Cache for rankings reuse.
             if let Some(detail) = state.player_detail.clone() {
-                let detail_id = detail.id;
-                state.rankings_cache_players.insert(detail_id, detail);
-                state
-                    .rankings_cache_players_at
-                    .insert(detail_id, SystemTime::now());
-                state.rankings_dirty = true;
+                if !player_detail_is_stub(&detail) {
+                    let detail_id = detail.id;
+                    state.rankings_cache_players.insert(detail_id, detail);
+                    state
+                        .rankings_cache_players_at
+                        .insert(detail_id, SystemTime::now());
+                    state.rankings_dirty = true;
+                }
             }
         }
         Delta::ExportStarted { path, total } => {

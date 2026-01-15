@@ -520,9 +520,11 @@ impl App {
         let mut team_ids: Vec<u32> = Vec::new();
         let mut player_ids: Vec<u32> = Vec::new();
 
-        // Missing squads for teams.
+        // Missing squads for teams (treat empty cached squads as missing).
         for team in &self.state.analysis {
-            if !self.state.rankings_cache_squads.contains_key(&team.id) {
+            let cached = self.state.rankings_cache_squads.get(&team.id);
+            let missing = cached.map(|players| players.is_empty()).unwrap_or(true);
+            if missing {
                 team_ids.push(team.id);
             }
         }
@@ -587,6 +589,8 @@ impl App {
     fn clear_rankings_cache(&mut self) {
         self.state.rankings_cache_squads.clear();
         self.state.rankings_cache_players.clear();
+        self.state.rankings_cache_squads_at.clear();
+        self.state.rankings_cache_players_at.clear();
         self.state.rankings.clear();
         self.state.rankings_selected = 0;
         self.state.rankings_dirty = true;
@@ -614,22 +618,25 @@ impl App {
 
     fn request_squad(&mut self, team_id: u32, team_name: String, announce: bool) {
         if let Some(players) = self.state.rankings_cache_squads.get(&team_id).cloned() {
+            let has_players = !players.is_empty();
             self.state.squad = players;
             self.state.squad_selected = 0;
             self.state.squad_loading = false;
             self.state.squad_team = Some(team_name.clone());
             self.state.squad_team_id = Some(team_id);
             self.prefetch_players(self.state.squad.iter().map(|p| p.id).collect());
-            let cached_at = self.state.rankings_cache_squads_at.get(&team_id).copied();
-            if cache_fresh(cached_at, self.squad_cache_ttl) {
-                if announce {
-                    self.state.push_log("[INFO] Squad cached (skipping fetch)");
+            if has_players {
+                let cached_at = self.state.rankings_cache_squads_at.get(&team_id).copied();
+                if cache_fresh(cached_at, self.squad_cache_ttl) {
+                    if announce {
+                        self.state.push_log("[INFO] Squad cached (skipping fetch)");
+                    }
+                    return;
                 }
-                return;
-            }
-            if announce {
-                self.state
-                    .push_log("[INFO] Squad cached (refreshing in background)");
+                if announce {
+                    self.state
+                        .push_log("[INFO] Squad cached (refreshing in background)");
+                }
             }
         }
         let Some(tx) = &self.cmd_tx else {
@@ -678,10 +685,11 @@ impl App {
                 .rankings_cache_players_at
                 .get(&player_id)
                 .copied();
+            let is_stub = crate::state::player_detail_is_stub(&cached);
             self.state.player_detail = Some(cached);
             self.state.player_loading = false;
             cache_hit = true;
-            if cache_fresh(cached_at, self.player_cache_ttl) {
+            if cache_fresh(cached_at, self.player_cache_ttl) && !is_stub {
                 if announce {
                     self.state.push_log("[INFO] Player cached (skipping fetch)");
                 }
@@ -726,8 +734,12 @@ impl App {
         let mut ids: Vec<u32> = player_ids
             .into_iter()
             .filter(|id| {
+                let cached = self.state.rankings_cache_players.get(id);
                 let cached_at = self.state.rankings_cache_players_at.get(id).copied();
-                !cache_fresh(cached_at, self.player_cache_ttl)
+                let is_stub = cached
+                    .map(|detail| crate::state::player_detail_is_stub(detail))
+                    .unwrap_or(true);
+                !cache_fresh(cached_at, self.player_cache_ttl) || is_stub
             })
             .collect();
         if ids.is_empty() {
