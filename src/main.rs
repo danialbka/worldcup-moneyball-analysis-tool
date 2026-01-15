@@ -44,6 +44,15 @@ struct App {
     squad_cache_ttl: Duration,
     player_cache_ttl: Duration,
     prefetch_players_limit: usize,
+    auto_warm_mode: AutoWarmMode,
+    auto_warm_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoWarmMode {
+    Off,
+    Missing,
+    Full,
 }
 
 impl App {
@@ -83,6 +92,7 @@ impl App {
             .and_then(|val| val.parse::<usize>().ok())
             .unwrap_or(10)
             .clamp(0, 40);
+        let auto_warm_mode = parse_auto_warm_mode();
         Self {
             state: AppState::new(),
             should_quit: false,
@@ -96,6 +106,8 @@ impl App {
             squad_cache_ttl: Duration::from_secs(squad_cache_ttl),
             player_cache_ttl: Duration::from_secs(player_cache_ttl),
             prefetch_players_limit,
+            auto_warm_pending: auto_warm_mode != AutoWarmMode::Off,
+            auto_warm_mode,
         }
     }
 
@@ -258,6 +270,9 @@ impl App {
                 // Persist current league cache before switching away.
                 crate::persist::save_from_state(&self.state);
                 self.state.cycle_league_mode();
+                if self.auto_warm_mode != AutoWarmMode::Off {
+                    self.auto_warm_pending = true;
+                }
                 // Load cache for the newly selected league.
                 crate::persist::load_into_state(&mut self.state);
                 self.request_upcoming(true);
@@ -470,6 +485,9 @@ impl App {
                 self.state.push_log("[INFO] Analysis request sent");
             }
             self.state.analysis_loading = true;
+            if self.auto_warm_mode != AutoWarmMode::Off {
+                self.auto_warm_pending = true;
+            }
         }
     }
 
@@ -810,6 +828,27 @@ impl App {
             }
         }
     }
+
+    fn maybe_auto_warm_rankings(&mut self) {
+        if self.auto_warm_mode == AutoWarmMode::Off || !self.auto_warm_pending {
+            return;
+        }
+        if self.state.rankings_loading {
+            return;
+        }
+        if self.state.analysis.is_empty() {
+            if !self.state.analysis_loading {
+                self.request_analysis(false);
+            }
+            return;
+        }
+        match self.auto_warm_mode {
+            AutoWarmMode::Missing => self.request_rankings_cache_warm_missing(false),
+            AutoWarmMode::Full => self.request_rankings_cache_warm_full(false),
+            AutoWarmMode::Off => {}
+        }
+        self.auto_warm_pending = false;
+    }
 }
 
 fn cache_fresh(at: Option<std::time::SystemTime>, ttl: Duration) -> bool {
@@ -819,6 +858,19 @@ fn cache_fresh(at: Option<std::time::SystemTime>, ttl: Duration) -> bool {
     match at.elapsed() {
         Ok(elapsed) => elapsed < ttl,
         Err(_) => false,
+    }
+}
+
+fn parse_auto_warm_mode() -> AutoWarmMode {
+    let Ok(raw) = std::env::var("AUTO_WARM_CACHE") else {
+        return AutoWarmMode::Off;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "0" | "off" | "false" | "no" => AutoWarmMode::Off,
+        "full" | "all" => AutoWarmMode::Full,
+        "missing" | "1" | "true" | "yes" => AutoWarmMode::Missing,
+        _ => AutoWarmMode::Off,
     }
 }
 
@@ -853,6 +905,7 @@ fn main() -> io::Result<()> {
 
     // Persist cache on exit.
     crate::persist::save_from_state(&app.state);
+    crate::http_cache::flush_http_cache();
 
     if let Err(err) = res {
         eprintln!("error: {err}");
@@ -885,6 +938,7 @@ fn run_app<B: Backend>(
 
         app.maybe_refresh_upcoming();
         app.maybe_refresh_match_details();
+        app.maybe_auto_warm_rankings();
 
         terminal.draw(|f| ui(f, app))?;
 

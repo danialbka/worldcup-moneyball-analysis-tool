@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -13,8 +14,11 @@ use serde::{Deserialize, Serialize};
 const CACHE_VERSION: u32 = 1;
 const CACHE_DIR: &str = "wc26_terminal";
 const CACHE_FILE: &str = "http_cache.json";
+const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_CACHE_MAX_BYTES: usize = 24 * 1024 * 1024;
+const DEFAULT_CACHE_FLUSH_SECS: u64 = 20;
 
-static CACHE: Mutex<Option<HttpCacheFile>> = Mutex::new(None);
+static CACHE: Mutex<Option<CacheState>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct HttpCacheFile {
@@ -30,6 +34,12 @@ struct CacheEntry {
     fetched_at: u64,
 }
 
+struct CacheState {
+    cache: HttpCacheFile,
+    dirty: bool,
+    last_saved: SystemTime,
+}
+
 pub fn fetch_json_cached(
     client: &Client,
     url: &str,
@@ -37,8 +47,8 @@ pub fn fetch_json_cached(
 ) -> Result<String> {
     let cached_entry = {
         let mut guard = CACHE.lock().expect("http cache lock poisoned");
-        let cache = guard.get_or_insert_with(load_cache_file);
-        cache.entries.get(url).cloned()
+        let state = guard.get_or_insert_with(load_cache_state);
+        state.cache.entries.get(url).cloned()
     };
 
     let mut req = client.get(url).header(USER_AGENT, "Mozilla/5.0");
@@ -91,10 +101,33 @@ pub fn fetch_json_cached(
 
 fn refresh_cache_entry(key: &str, entry: CacheEntry) {
     let mut guard = CACHE.lock().expect("http cache lock poisoned");
-    let cache = guard.get_or_insert_with(load_cache_file);
-    cache.version = CACHE_VERSION;
-    cache.entries.insert(key.to_string(), entry);
-    let _ = save_cache_file(cache);
+    let state = guard.get_or_insert_with(load_cache_state);
+    state.cache.version = CACHE_VERSION;
+    state.cache.entries.insert(key.to_string(), entry);
+    state.dirty = true;
+    maybe_flush_cache(state);
+}
+
+pub fn flush_http_cache() {
+    let mut guard = CACHE.lock().expect("http cache lock poisoned");
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    if state.dirty {
+        prune_cache(&mut state.cache);
+        if save_cache_file(&state.cache).is_ok() {
+            state.last_saved = SystemTime::now();
+            state.dirty = false;
+        }
+    }
+}
+
+fn load_cache_state() -> CacheState {
+    CacheState {
+        cache: load_cache_file(),
+        dirty: false,
+        last_saved: SystemTime::now(),
+    }
 }
 
 fn load_cache_file() -> HttpCacheFile {
@@ -105,9 +138,13 @@ fn load_cache_file() -> HttpCacheFile {
     let Some(raw) = raw else {
         return HttpCacheFile::default();
     };
-    let cache = serde_json::from_str::<HttpCacheFile>(&raw).unwrap_or_default();
+    let mut cache = serde_json::from_str::<HttpCacheFile>(&raw).unwrap_or_default();
     if cache.version != CACHE_VERSION {
         return HttpCacheFile::default();
+    }
+    let pruned = prune_cache(&mut cache);
+    if pruned {
+        let _ = save_cache_file(&cache);
     }
     cache
 }
@@ -128,16 +165,114 @@ fn save_cache_file(cache: &HttpCacheFile) -> Result<()> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    if let Ok(base) = std::env::var("XDG_CACHE_HOME") {
+    if let Ok(base) = env::var("XDG_CACHE_HOME") {
         if !base.trim().is_empty() {
             return Some(PathBuf::from(base).join(CACHE_DIR).join(CACHE_FILE));
         }
     }
-    let home = std::env::var("HOME").ok()?;
+    let home = env::var("HOME").ok()?;
     if home.trim().is_empty() {
         return None;
     }
     Some(PathBuf::from(home).join(".cache").join(CACHE_DIR).join(CACHE_FILE))
+}
+
+fn prune_cache(cache: &mut HttpCacheFile) -> bool {
+    let mut pruned = false;
+    let ttl_secs = cache_ttl_secs();
+    if ttl_secs > 0 {
+        let now = system_time_to_secs(SystemTime::now()).unwrap_or_default();
+        let before = cache.entries.len();
+        cache.entries.retain(|_, entry| {
+            now.saturating_sub(entry.fetched_at) <= ttl_secs
+        });
+        pruned |= cache.entries.len() != before;
+    }
+
+    let max_bytes = cache_max_bytes();
+    if max_bytes > 0 {
+        let mut entries: Vec<(String, u64, usize)> = cache
+            .entries
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    entry.fetched_at,
+                    approx_entry_size(key, entry),
+                )
+            })
+            .collect();
+        let mut total_size: usize = entries.iter().map(|(_, _, size)| *size).sum();
+        if total_size > max_bytes {
+            entries.sort_by_key(|(_, fetched_at, _)| *fetched_at);
+            for (key, _, size) in entries {
+                if total_size <= max_bytes {
+                    break;
+                }
+                if cache.entries.remove(&key).is_some() {
+                    total_size = total_size.saturating_sub(size);
+                    pruned = true;
+                }
+            }
+        }
+    }
+
+    pruned
+}
+
+fn approx_entry_size(key: &str, entry: &CacheEntry) -> usize {
+    let mut size = key.len() + entry.body.len() + 32;
+    if let Some(etag) = entry.etag.as_ref() {
+        size += etag.len();
+    }
+    if let Some(last_modified) = entry.last_modified.as_ref() {
+        size += last_modified.len();
+    }
+    size
+}
+
+fn maybe_flush_cache(state: &mut CacheState) {
+    if !state.dirty {
+        return;
+    }
+    let flush_secs = cache_flush_secs();
+    let should_flush = if flush_secs == 0 {
+        true
+    } else {
+        state
+            .last_saved
+            .elapsed()
+            .map(|elapsed| elapsed.as_secs() >= flush_secs)
+            .unwrap_or(true)
+    };
+    if should_flush {
+        prune_cache(&mut state.cache);
+        if save_cache_file(&state.cache).is_ok() {
+            state.last_saved = SystemTime::now();
+            state.dirty = false;
+        }
+    }
+}
+
+fn cache_ttl_secs() -> u64 {
+    env::var("HTTP_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+}
+
+fn cache_max_bytes() -> usize {
+    env::var("HTTP_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CACHE_MAX_BYTES)
+}
+
+fn cache_flush_secs() -> u64 {
+    env::var("HTTP_CACHE_FLUSH_SECS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_FLUSH_SECS)
 }
 
 fn system_time_to_secs(time: SystemTime) -> Option<u64> {

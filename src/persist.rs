@@ -48,25 +48,25 @@ pub fn load_into_state(state: &mut AppState) {
     let Ok(raw) = fs::read_to_string(&path) else {
         return;
     };
-    let Ok(cache) = serde_json::from_str::<CacheFile>(&raw) else {
+    let Ok(mut cache) = serde_json::from_str::<CacheFile>(&raw) else {
         return;
     };
     if cache.version != CACHE_VERSION {
         return;
     }
-    let key = league_key(state.league_mode);
-    let Some(league) = cache.leagues.get(key) else {
+    let key = league_key(state.league_mode).to_string();
+    let Some(mut league) = cache.leagues.remove(&key) else {
         return;
     };
 
     // Load analysis (so Rankings can compute without refetching teams).
     if !league.analysis.is_empty() {
-        state.analysis = league.analysis.clone();
+        state.analysis = std::mem::take(&mut league.analysis);
         state.analysis_loading = false;
         state.analysis_selected = 0;
     }
-    state.rankings_cache_squads = league.squads.clone();
-    state.rankings_cache_players = league.players.clone();
+    state.rankings_cache_squads = std::mem::take(&mut league.squads);
+    state.rankings_cache_players = std::mem::take(&mut league.players);
     state.rankings_cache_squads_at = league
         .squads_fetched_at
         .iter()
@@ -77,14 +77,14 @@ pub fn load_into_state(state: &mut AppState) {
         .iter()
         .filter_map(|(id, ts)| system_time_from_secs(*ts).map(|t| (*id, t)))
         .collect();
-    state.rankings = league.rankings.clone();
-    state.rankings_dirty = league.rankings.is_empty();
+    state.rankings = std::mem::take(&mut league.rankings);
+    state.rankings_dirty = state.rankings.is_empty();
 
-    state.upcoming = league.upcoming.clone();
+    state.upcoming = std::mem::take(&mut league.upcoming);
     state.upcoming_cached_at = league
         .upcoming_fetched_at
         .and_then(system_time_from_secs);
-    state.match_detail = league.match_details.clone();
+    state.match_detail = std::mem::take(&mut league.match_details);
     state.match_detail_cached_at = league
         .match_detail_fetched_at
         .iter()
@@ -179,4 +179,3 @@ fn league_key(mode: LeagueMode) -> &'static str {
         LeagueMode::WorldCup => "worldcup",
     }
 }
-
