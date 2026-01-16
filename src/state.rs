@@ -98,6 +98,7 @@ pub struct AppState {
     pub analysis_selected: usize,
     pub analysis_loading: bool,
     pub analysis_updated: Option<String>,
+    pub analysis_fetched_at: Option<SystemTime>,
     pub analysis_tab: AnalysisTab,
     pub rankings_loading: bool,
     pub rankings: Vec<RoleRankingEntry>,
@@ -112,6 +113,8 @@ pub struct AppState {
     pub rankings_cache_squads_at: HashMap<u32, SystemTime>,
     pub rankings_cache_players_at: HashMap<u32, SystemTime>,
     pub rankings_dirty: bool,
+    pub rankings_fetched_at: Option<SystemTime>,
+    pub win_prob_history: HashMap<String, Vec<f32>>,
     pub squad: Vec<SquadPlayer>,
     pub squad_selected: usize,
     pub squad_loading: bool,
@@ -157,6 +160,7 @@ impl AppState {
             analysis_selected: 0,
             analysis_loading: false,
             analysis_updated: None,
+            analysis_fetched_at: None,
             analysis_tab: AnalysisTab::Teams,
             rankings_loading: false,
             rankings: Vec::new(),
@@ -171,6 +175,8 @@ impl AppState {
             rankings_cache_squads_at: HashMap::new(),
             rankings_cache_players_at: HashMap::new(),
             rankings_dirty: false,
+            rankings_fetched_at: None,
+            win_prob_history: HashMap::new(),
             squad: Vec::new(),
             squad_selected: 0,
             squad_loading: false,
@@ -229,6 +235,7 @@ impl AppState {
         self.analysis_selected = 0;
         self.analysis_loading = false;
         self.analysis_updated = None;
+        self.analysis_fetched_at = None;
         self.analysis_tab = AnalysisTab::Teams;
         self.rankings_loading = false;
         self.rankings.clear();
@@ -243,6 +250,8 @@ impl AppState {
         self.rankings_cache_squads_at.clear();
         self.rankings_cache_players_at.clear();
         self.rankings_dirty = false;
+        self.rankings_fetched_at = None;
+        self.win_prob_history.clear();
         self.match_detail.clear();
         self.match_detail_cached_at.clear();
         self.squad.clear();
@@ -1050,12 +1059,23 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 .insert(id, SystemTime::now());
         }
         Delta::UpsertMatch(mut summary) => {
+            let match_id = summary.id.clone();
+            let home_prob = summary.win.p_home;
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == summary.id) {
                 summary.win.delta_home = summary.win.p_home - existing.win.p_home;
                 *existing = summary;
             } else {
                 summary.win.delta_home = 0.0;
                 state.matches.push(summary);
+            }
+            let entry = state
+                .win_prob_history
+                .entry(match_id)
+                .or_insert_with(Vec::new);
+            entry.push(home_prob);
+            if entry.len() > 40 {
+                let keep = entry.split_off(entry.len() - 40);
+                *entry = keep;
             }
             state.clamp_selection();
         }
@@ -1076,6 +1096,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         }
         Delta::SetAnalysis(items) => {
             state.analysis_updated = items.iter().find_map(|t| t.fifa_updated.clone());
+            state.analysis_fetched_at = Some(SystemTime::now());
             state.analysis = items;
             state.analysis_loading = false;
             state.analysis_selected = 0;

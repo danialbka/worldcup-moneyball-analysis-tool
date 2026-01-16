@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{Duration as ChronoDuration, Local, NaiveDateTime};
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
 };
@@ -14,7 +14,7 @@ use crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Clear, Gauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline};
 
 mod analysis_export;
 mod analysis_fetch;
@@ -615,6 +615,7 @@ impl App {
         self.state.rankings_progress_current = 0;
         self.state.rankings_progress_total = 0;
         self.state.rankings_progress_message = "Cache cleared".to_string();
+        self.state.rankings_fetched_at = None;
     }
 
     fn recompute_rankings_from_cache(&mut self) {
@@ -628,6 +629,7 @@ impl App {
                 "No cached player data yet (warming cache...)".to_string();
         } else {
             self.state.rankings_progress_message = format!("Rankings ready (cached: {})", rows.len());
+            self.state.rankings_fetched_at = Some(SystemTime::now());
         }
         self.state.rankings = rows;
         self.state.rankings_selected = 0;
@@ -1017,12 +1019,19 @@ fn header_text(state: &AppState) -> String {
                 crate::state::AnalysisTab::Teams => "TEAMS",
                 crate::state::AnalysisTab::RoleRankings => "RANKINGS",
             };
+            let fetched = match state.analysis_tab {
+                crate::state::AnalysisTab::Teams => format_fetched_at(state.analysis_fetched_at),
+                crate::state::AnalysisTab::RoleRankings => {
+                    format_fetched_at(state.rankings_fetched_at)
+                }
+            };
             format!(
-                "WC26 ANALYSIS | {} | Tab: {} | Teams: {} | FIFA: {} | {}",
+                "WC26 ANALYSIS | {} | Tab: {} | Teams: {} | FIFA: {} | Fetched: {} | {}",
                 league_label(state.league_mode),
                 tab,
                 state.analysis.len(),
                 updated,
+                fetched,
                 status
             )
         }
@@ -1046,6 +1055,12 @@ fn header_text(state: &AppState) -> String {
     let line2 = " /___\\".to_string();
     let line3 = "  |_|".to_string();
     format!("{line1}\n{line2}\n{line3}")
+}
+
+fn format_fetched_at(fetched_at: Option<SystemTime>) -> String {
+    fetched_at
+        .map(|stamp| DateTime::<Local>::from(stamp).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn footer_text(state: &AppState) -> String {
@@ -1121,6 +1136,7 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     let visible = (list_area.height / ROW_HEIGHT) as usize;
     let (start, end) = visible_range(state.selected, rows.len(), visible);
 
+    let now = Utc::now();
     for (i, idx) in (start..end).enumerate() {
         let row_area = Rect {
             x: list_area.x,
@@ -1168,7 +1184,7 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                         .upcoming
                         .iter()
                         .find(|u| u.id == m.id)
-                        .map(|u| format_kickoff_short(&u.kickoff))
+                        .map(|u| format_countdown_short(&u.kickoff, now))
                         .unwrap_or_else(|| "KO".to_string())
                 };
                 let match_name = format!("{}-{}", m.home, m.away);
@@ -1197,8 +1213,9 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                     let quality = quality_label(m.win.quality).to_string();
                     let conf = format!("{}%", m.win.confidence);
 
-                    let bar = win_bar_chart(&m.win, selected);
-                    frame.render_widget(bar, cols[3]);
+                    let values = win_prob_values(state.win_prob_history.get(&m.id), m.win.p_home);
+                    let chart = win_line_chart(&values, selected);
+                    frame.render_widget(chart, cols[3]);
 
                     render_cell_text(frame, cols[4], &hda, row_style);
                     render_cell_text(frame, cols[5], &delta, row_style);
@@ -1221,7 +1238,7 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                     frame.render_widget(Block::default().style(row_style), row_area);
                 }
 
-                let time = format_kickoff_short(&u.kickoff);
+                let time = format_countdown_short(&u.kickoff, now);
                 let match_name = format!("{}-{}", u.home, u.away);
 
                 render_cell_text(frame, cols[0], &time, row_style);
@@ -1265,6 +1282,7 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
     let start = (state.upcoming_scroll as usize).min(max_start);
     let end = (start + visible).min(total);
 
+    let now = Utc::now();
     for (i, idx) in (start..end).enumerate() {
         let row_area = Rect {
             x: list_area.x,
@@ -1279,7 +1297,7 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
             .split(row_area);
 
         let m = upcoming[idx];
-        let kickoff = format_kickoff(&m.kickoff);
+        let kickoff = format_countdown(&m.kickoff, now);
         let match_name = format!("{} vs {}", m.home, m.away);
         let league = if m.league_name.is_empty() {
             "-".to_string()
@@ -1372,7 +1390,7 @@ fn render_pulse_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
     render_cell_text(frame, cols[0], "Time", style);
     render_cell_text(frame, cols[1], "Match", style);
     render_cell_text(frame, cols[2], "Score", style);
-    render_cell_text(frame, cols[3], "Win% Bar", style);
+    render_cell_text(frame, cols[3], "Win% Line", style);
     render_cell_text(frame, cols[4], "H/D/A", style);
     render_cell_text(frame, cols[5], "Delta", style);
     render_cell_text(frame, cols[6], "Q", style);
@@ -1387,7 +1405,7 @@ fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
     let style = Style::default().add_modifier(Modifier::BOLD);
     let sep_style = Style::default().fg(Color::DarkGray);
 
-    render_cell_text(frame, cols[0], "Kickoff (SGT)", style);
+    render_cell_text(frame, cols[0], "Starts In", style);
     render_vseparator(frame, cols[1], sep_style);
     render_cell_text(frame, cols[2], "Match", style);
     render_vseparator(frame, cols[3], sep_style);
@@ -2260,42 +2278,26 @@ fn render_vseparator(frame: &mut Frame, area: Rect, style: Style) {
     frame.render_widget(paragraph, area);
 }
 
-fn win_bar_chart(win: &state::WinProbRow, selected: bool) -> BarChart<'static> {
-    let base_bg = if selected {
-        Some(Color::DarkGray)
-    } else {
-        None
+fn win_prob_values(history: Option<&Vec<f32>>, fallback: f32) -> Vec<u64> {
+    let mut values = match history {
+        Some(items) if !items.is_empty() => items
+            .iter()
+            .map(|v| v.round().clamp(0.0, 100.0) as u64)
+            .collect(),
+        _ => vec![fallback.round().clamp(0.0, 100.0) as u64],
     };
-
-    let mut home_style = Style::default().fg(Color::Green);
-    let mut draw_style = Style::default().fg(Color::Yellow);
-    let mut away_style = Style::default().fg(Color::Red);
-    if let Some(bg) = base_bg {
-        home_style = home_style.bg(bg);
-        draw_style = draw_style.bg(bg);
-        away_style = away_style.bg(bg);
+    if values.len() == 1 {
+        values.push(values[0]);
     }
+    values
+}
 
-    let home = Bar::default()
-        .value(win.p_home.round() as u64)
-        .text_value(String::new())
-        .style(home_style);
-    let draw = Bar::default()
-        .value(win.p_draw.round() as u64)
-        .text_value(String::new())
-        .style(draw_style);
-    let away = Bar::default()
-        .value(win.p_away.round() as u64)
-        .text_value(String::new())
-        .style(away_style);
-
-    BarChart::default()
-        .data(BarGroup::default().bars(&[home, draw, away]))
-        .direction(Direction::Horizontal)
-        .bar_width(1)
-        .bar_gap(0)
-        .group_gap(0)
-        .max(100)
+fn win_line_chart(values: &[u64], selected: bool) -> Sparkline<'_> {
+    let mut style = Style::default().fg(Color::Green);
+    if selected {
+        style = style.bg(Color::DarkGray);
+    }
+    Sparkline::default().data(values).max(100).style(style)
 }
 
 fn visible_range(selected: usize, total: usize, visible: usize) -> (usize, usize) {
@@ -2609,32 +2611,64 @@ fn pulse_view_label(view: PulseView) -> &'static str {
     }
 }
 
-fn format_kickoff(raw: &str) -> String {
-    if raw.is_empty() {
-        return "TBD".to_string();
-    }
-    let cleaned = raw.trim();
-    let parsed = parse_kickoff(cleaned);
-    if let Some(dt) = parsed {
-        let sgt = dt + ChronoDuration::hours(8);
-        return format!("{} SGT", sgt.format("%Y-%m-%d %H:%M"));
-    }
-    if cleaned.len() >= 16 {
-        return cleaned[..16].replace('T', " ");
-    }
-    cleaned.replace('T', " ")
-}
-
-fn format_kickoff_short(raw: &str) -> String {
+fn format_countdown(raw: &str, now: DateTime<Utc>) -> String {
     let cleaned = raw.trim();
     if cleaned.is_empty() {
         return "TBD".to_string();
     }
-    if let Some(dt) = parse_kickoff(cleaned) {
-        let sgt = dt + ChronoDuration::hours(8);
-        return sgt.format("%H:%M").to_string();
+    let Some(dt) = parse_kickoff(cleaned) else {
+        return "TBD".to_string();
+    };
+    let kickoff = DateTime::<Utc>::from_utc(dt, Utc);
+    let delta = kickoff.signed_duration_since(now);
+    let total_secs = delta.num_seconds();
+    if total_secs <= 0 {
+        return "LIVE".to_string();
     }
-    "KO".to_string()
+    let total_mins = (total_secs + 59) / 60;
+    let days = total_mins / 1440;
+    let hours = (total_mins % 1440) / 60;
+    let mins = total_mins % 60;
+
+    if days > 0 {
+        format!("{days}d {hours:02}h {mins:02}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins:02}m")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        "<1m".to_string()
+    }
+}
+
+fn format_countdown_short(raw: &str, now: DateTime<Utc>) -> String {
+    let cleaned = raw.trim();
+    if cleaned.is_empty() {
+        return "TBD".to_string();
+    }
+    let Some(dt) = parse_kickoff(cleaned) else {
+        return "TBD".to_string();
+    };
+    let kickoff = DateTime::<Utc>::from_utc(dt, Utc);
+    let delta = kickoff.signed_duration_since(now);
+    let total_secs = delta.num_seconds();
+    if total_secs <= 0 {
+        return "LIVE".to_string();
+    }
+    let total_mins = (total_secs + 59) / 60;
+    let days = total_mins / 1440;
+    let hours = (total_mins % 1440) / 60;
+    let mins = total_mins % 60;
+
+    if days > 0 {
+        format!("{days}d{hours:02}")
+    } else if hours > 0 {
+        format!("{hours}h{mins:02}")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        "<1m".to_string()
+    }
 }
 
 fn parse_kickoff(raw: &str) -> Option<NaiveDateTime> {
