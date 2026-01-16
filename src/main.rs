@@ -27,8 +27,9 @@ mod state;
 mod upcoming_fetch;
 
 use crate::state::{
-    AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen, apply_delta,
-    confed_label, league_label, metric_label, role_label,
+    AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen,
+    PLACEHOLDER_MATCH_ID, apply_delta, confed_label, league_label, metric_label,
+    placeholder_match_detail, placeholder_match_summary, role_label,
 };
 
 struct App {
@@ -345,6 +346,7 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('p') | KeyCode::Char('P') => self.toggle_placeholder_match(),
             KeyCode::Char('R') => {
                 if matches!(self.state.screen, Screen::Analysis)
                     && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
@@ -395,6 +397,20 @@ impl App {
     }
 
     fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
+        if match_id == PLACEHOLDER_MATCH_ID && self.state.placeholder_match_enabled {
+            self.state.match_detail.insert(
+                PLACEHOLDER_MATCH_ID.to_string(),
+                placeholder_match_detail(),
+            );
+            self.state
+                .match_detail_cached_at
+                .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
+            if announce {
+                self.state
+                    .push_log("[INFO] Placeholder details ready (skipping fetch)");
+            }
+            return;
+        }
         let is_live = self
             .state
             .matches
@@ -817,6 +833,7 @@ impl App {
             .filtered_matches()
             .into_iter()
             .filter(|m| m.is_live)
+            .filter(|m| m.id != PLACEHOLDER_MATCH_ID)
             .map(|m| m.id.clone())
             .collect();
 
@@ -850,6 +867,44 @@ impl App {
             AutoWarmMode::Off => {}
         }
         self.auto_warm_pending = false;
+    }
+
+    fn toggle_placeholder_match(&mut self) {
+        if self.state.placeholder_match_enabled {
+            self.disable_placeholder_match();
+        } else {
+            self.enable_placeholder_match();
+        }
+    }
+
+    fn enable_placeholder_match(&mut self) {
+        let summary = placeholder_match_summary(self.state.league_mode);
+        self.state.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
+        self.state.matches.push(summary);
+        self.state.match_detail.insert(
+            PLACEHOLDER_MATCH_ID.to_string(),
+            placeholder_match_detail(),
+        );
+        self.state
+            .match_detail_cached_at
+            .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
+        self.state.win_prob_history.insert(
+            PLACEHOLDER_MATCH_ID.to_string(),
+            vec![42.0, 48.0, 53.0, 49.0, 57.0, 61.0, 58.0, 56.0],
+        );
+        self.state.placeholder_match_enabled = true;
+        self.state.sort_matches();
+        self.state.clamp_selection();
+    }
+
+    fn disable_placeholder_match(&mut self) {
+        self.state.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
+        self.state.match_detail.remove(PLACEHOLDER_MATCH_ID);
+        self.state.match_detail_cached_at.remove(PLACEHOLDER_MATCH_ID);
+        self.state.win_prob_history.remove(PLACEHOLDER_MATCH_ID);
+        self.state.placeholder_match_enabled = false;
+        self.state.sort_matches();
+        self.state.clamp_selection();
     }
 }
 
@@ -1067,15 +1122,15 @@ fn footer_text(state: &AppState) -> String {
     match state.screen {
         Screen::Pulse => match state.pulse_view {
             PulseView::Live => {
-                "1 Pulse | 2 Analysis | Enter/d Terminal | j/k/↑/↓ Move | s Sort | l League | u Upcoming | i Details | ? Help | q Quit".to_string()
+                "1 Pulse | 2 Analysis | Enter/d Terminal | j/k/↑/↓ Move | s Sort | l League | u Upcoming | i Details | p Placeholder | ? Help | q Quit".to_string()
             }
             PulseView::Upcoming => {
-                "1 Pulse | 2 Analysis | u Live | j/k/↑/↓ Scroll | l League | ? Help | q Quit"
+                "1 Pulse | 2 Analysis | u Live | j/k/↑/↓ Scroll | l League | p Placeholder | ? Help | q Quit"
                     .to_string()
             }
         },
         Screen::Terminal { .. } => {
-            "1 Pulse | 2 Analysis | b/Esc Back | i Details | l League | ? Help | q Quit"
+            "1 Pulse | 2 Analysis | b/Esc Back | i Details | l League | p Placeholder | ? Help | q Quit"
                 .to_string()
         }
         Screen::Analysis => {
@@ -2358,9 +2413,7 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         .block(Block::default().title("Group Mini").borders(Borders::ALL));
     frame.render_widget(standings, left_chunks[1]);
 
-    let pitch = Paragraph::new("Pitch canvas placeholder")
-        .block(Block::default().title("Pitch").borders(Borders::ALL));
-    frame.render_widget(pitch, middle_chunks[0]);
+    render_pitch(frame, middle_chunks[0], state);
 
     let tape = Paragraph::new(event_tape_text(state))
         .block(Block::default().title("Event Tape").borders(Borders::ALL));
@@ -2476,6 +2529,113 @@ fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
 
     render_lineup_side(frame, cols[0], left);
     render_lineup_side(frame, cols[1], right);
+}
+
+fn render_pitch(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default().title("Pitch").borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let text = pitch_text(state, inner.width as usize, inner.height as usize);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn pitch_text(state: &AppState, width: usize, height: usize) -> String {
+    let Some(match_id) = state.selected_match_id() else {
+        return "No match selected".to_string();
+    };
+    let Some(detail) = state.match_detail.get(&match_id) else {
+        return "No lineups yet".to_string();
+    };
+    let Some(lineups) = &detail.lineups else {
+        return "No lineups yet".to_string();
+    };
+    if lineups.sides.len() < 2 {
+        return "Lineups incomplete".to_string();
+    }
+
+    let home = &lineups.sides[0];
+    let away = &lineups.sides[1];
+    let mut lines = Vec::new();
+    lines.extend(pitch_team_lines("AWAY", away, width));
+    let sep = "-".repeat(width.min(24).max(4));
+    lines.push(center_line(&sep, width));
+    lines.extend(pitch_team_lines("HOME", home, width));
+
+    if lines.len() > height {
+        lines.truncate(height);
+    }
+    lines.join("\n")
+}
+
+fn pitch_team_lines(label: &str, side: &crate::state::LineupSide, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(crop_line(
+        &format!("{label} {} ({})", side.team_abbr, side.formation),
+        width,
+    ));
+    lines.extend(pitch_pos_lines(&side.starting, width));
+    lines
+}
+
+fn pitch_pos_lines(players: &[crate::state::PlayerSlot], width: usize) -> Vec<String> {
+    let mut gk = Vec::new();
+    let mut df = Vec::new();
+    let mut mf = Vec::new();
+    let mut fw = Vec::new();
+    let mut other = Vec::new();
+
+    for player in players {
+        let name = player.name.as_str();
+        match player.pos.as_deref() {
+            Some("GK") => gk.push(name),
+            Some("DF") => df.push(name),
+            Some("MF") => mf.push(name),
+            Some("FW") => fw.push(name),
+            _ => other.push(name),
+        }
+    }
+
+    let mut lines = Vec::new();
+    lines.push(crop_line(&format_pos_line("GK", &gk), width));
+    lines.push(crop_line(&format_pos_line("DF", &df), width));
+    lines.push(crop_line(&format_pos_line("MF", &mf), width));
+    lines.push(crop_line(&format_pos_line("FW", &fw), width));
+    if !other.is_empty() {
+        lines.push(crop_line(&format_pos_line("OT", &other), width));
+    }
+    lines
+}
+
+fn format_pos_line(label: &str, names: &[&str]) -> String {
+    let body = if names.is_empty() {
+        "-".to_string()
+    } else {
+        names.join(", ")
+    };
+    format!("{label}: {body}")
+}
+
+fn center_line(text: &str, width: usize) -> String {
+    if text.len() >= width {
+        return crop_line(text, width);
+    }
+    let pad = (width - text.len()) / 2;
+    format!("{:pad$}{}", "", text, pad = pad)
+}
+
+fn crop_line(text: &str, width: usize) -> String {
+    if text.len() <= width {
+        return text.to_string();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn render_lineup_side(frame: &mut Frame, area: Rect, side: Option<&state::LineupSide>) {
@@ -2770,6 +2930,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "  i            Fetch match details",
         "  e            Export analysis to XLSX (current league)",
         "  r            Refresh analysis/squad/player",
+        "  p            Toggle placeholder match",
         "  ?            Toggle help",
         "  q            Quit",
         "",

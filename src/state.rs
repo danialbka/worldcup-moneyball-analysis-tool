@@ -13,6 +13,174 @@ pub enum Screen {
     PlayerDetail,
 }
 
+pub const PLACEHOLDER_MATCH_ID: &str = "placeholder-demo";
+pub const PLACEHOLDER_HOME: &str = "ALPHA";
+pub const PLACEHOLDER_AWAY: &str = "OMEGA";
+
+pub fn placeholder_match_summary(mode: LeagueMode) -> MatchSummary {
+    let league_name = match mode {
+        LeagueMode::PremierLeague => "Premier League",
+        LeagueMode::WorldCup => "World Cup",
+    };
+    MatchSummary {
+        id: PLACEHOLDER_MATCH_ID.to_string(),
+        league_id: None,
+        league_name: league_name.to_string(),
+        home: PLACEHOLDER_HOME.to_string(),
+        away: PLACEHOLDER_AWAY.to_string(),
+        minute: 54,
+        score_home: 2,
+        score_away: 1,
+        win: WinProbRow {
+            p_home: 56.0,
+            p_draw: 22.0,
+            p_away: 22.0,
+            delta_home: 0.0,
+            quality: ModelQuality::Event,
+            confidence: 74,
+        },
+        is_live: true,
+    }
+}
+
+pub fn placeholder_match_detail() -> MatchDetail {
+    let stats = vec![
+        StatRow {
+            name: "Possession".to_string(),
+            home: "58%".to_string(),
+            away: "42%".to_string(),
+        },
+        StatRow {
+            name: "Shots".to_string(),
+            home: "14".to_string(),
+            away: "9".to_string(),
+        },
+        StatRow {
+            name: "Shots on target".to_string(),
+            home: "6".to_string(),
+            away: "3".to_string(),
+        },
+        StatRow {
+            name: "xG".to_string(),
+            home: "1.72".to_string(),
+            away: "0.86".to_string(),
+        },
+        StatRow {
+            name: "Passes".to_string(),
+            home: "412".to_string(),
+            away: "298".to_string(),
+        },
+        StatRow {
+            name: "Corners".to_string(),
+            home: "5".to_string(),
+            away: "2".to_string(),
+        },
+    ];
+
+    let events = vec![
+        Event {
+            minute: 6,
+            kind: EventKind::Goal,
+            team: PLACEHOLDER_HOME.to_string(),
+            description: "Goal".to_string(),
+        },
+        Event {
+            minute: 27,
+            kind: EventKind::Card,
+            team: PLACEHOLDER_AWAY.to_string(),
+            description: "Yellow card".to_string(),
+        },
+        Event {
+            minute: 41,
+            kind: EventKind::Goal,
+            team: PLACEHOLDER_HOME.to_string(),
+            description: "Goal".to_string(),
+        },
+        Event {
+            minute: 52,
+            kind: EventKind::Sub,
+            team: PLACEHOLDER_AWAY.to_string(),
+            description: "Substitution".to_string(),
+        },
+    ];
+
+    let lineups = MatchLineups {
+        sides: vec![
+            placeholder_lineup_side(
+                PLACEHOLDER_HOME,
+                "4-3-3",
+                vec![
+                    placeholder_player("A. Stone", 1, "GK"),
+                    placeholder_player("R. Vega", 3, "DF"),
+                    placeholder_player("M. Holt", 4, "DF"),
+                    placeholder_player("J. Nox", 6, "MF"),
+                    placeholder_player("T. Vale", 8, "MF"),
+                    placeholder_player("K. Rook", 9, "FW"),
+                ],
+                vec![
+                    placeholder_player("P. Vale", 12, "DF"),
+                    placeholder_player("S. Quinn", 18, "FW"),
+                ],
+            ),
+            placeholder_lineup_side(
+                PLACEHOLDER_AWAY,
+                "4-2-3-1",
+                vec![
+                    placeholder_player("L. Park", 1, "GK"),
+                    placeholder_player("D. Moss", 2, "DF"),
+                    placeholder_player("I. Noor", 5, "DF"),
+                    placeholder_player("C. Hale", 7, "MF"),
+                    placeholder_player("V. Ash", 10, "MF"),
+                    placeholder_player("E. Pike", 11, "FW"),
+                ],
+                vec![
+                    placeholder_player("N. Gray", 14, "MF"),
+                    placeholder_player("O. Reed", 19, "FW"),
+                ],
+            ),
+        ],
+    };
+
+    MatchDetail {
+        events,
+        lineups: Some(lineups),
+        stats,
+    }
+}
+
+fn placeholder_lineup_side(
+    team: &str,
+    formation: &str,
+    starting: Vec<PlayerSlot>,
+    subs: Vec<PlayerSlot>,
+) -> LineupSide {
+    let abbr = team
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .take(3)
+        .collect::<String>()
+        .to_uppercase();
+    LineupSide {
+        team: team.to_string(),
+        team_abbr: if abbr.is_empty() {
+            "TMP".to_string()
+        } else {
+            abbr
+        },
+        formation: formation.to_string(),
+        starting,
+        subs,
+    }
+}
+
+fn placeholder_player(name: &str, number: u32, pos: &str) -> PlayerSlot {
+    PlayerSlot {
+        name: name.to_string(),
+        number: Some(number),
+        pos: Some(pos.to_string()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisTab {
     Teams,
@@ -115,6 +283,7 @@ pub struct AppState {
     pub rankings_dirty: bool,
     pub rankings_fetched_at: Option<SystemTime>,
     pub win_prob_history: HashMap<String, Vec<f32>>,
+    pub placeholder_match_enabled: bool,
     pub squad: Vec<SquadPlayer>,
     pub squad_selected: usize,
     pub squad_loading: bool,
@@ -177,6 +346,7 @@ impl AppState {
             rankings_dirty: false,
             rankings_fetched_at: None,
             win_prob_history: HashMap::new(),
+            placeholder_match_enabled: false,
             squad: Vec::new(),
             squad_selected: 0,
             squad_loading: false,
@@ -252,6 +422,10 @@ impl AppState {
         self.rankings_dirty = false;
         self.rankings_fetched_at = None;
         self.win_prob_history.clear();
+        self.placeholder_match_enabled = false;
+        self.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
+        self.match_detail.remove(PLACEHOLDER_MATCH_ID);
+        self.match_detail_cached_at.remove(PLACEHOLDER_MATCH_ID);
         self.match_detail.clear();
         self.match_detail_cached_at.clear();
         self.squad.clear();
@@ -1045,6 +1219,21 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 } else {
                     summary.win.delta_home = 0.0;
                 }
+            }
+            if state.placeholder_match_enabled
+                && !matches.iter().any(|m| m.id == PLACEHOLDER_MATCH_ID)
+            {
+                matches.push(placeholder_match_summary(state.league_mode));
+            }
+            if state.placeholder_match_enabled
+                && !state.match_detail.contains_key(PLACEHOLDER_MATCH_ID)
+            {
+                state
+                    .match_detail
+                    .insert(PLACEHOLDER_MATCH_ID.to_string(), placeholder_match_detail());
+                state
+                    .match_detail_cached_at
+                    .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
             }
             state.matches = matches;
             state.sort_matches_with_selected_id(selected_id);
