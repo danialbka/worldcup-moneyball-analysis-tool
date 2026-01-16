@@ -623,29 +623,23 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
     let mut last_err = None;
     let mut parsed: Option<PlayerDetail> = None;
     for attempt in 0..3 {
-        let resp = fetch_json_cached(
-            client,
-            &url,
-            &[("Accept-Language", "en-GB,en;q=0.9")],
-        );
+        let resp = fetch_json_cached(client, &url, &[("Accept-Language", "en-GB,en;q=0.9")]);
 
         match resp {
-            Ok(body) => {
-                match parse_player_detail_json(&body) {
-                    Ok(data) => {
-                        parsed = Some(data);
-                        break;
-                    }
-                    Err(err) => {
-                        last_err = Some(err);
-                        if attempt < 2 {
-                            std::thread::sleep(Duration::from_millis(300));
-                            continue;
-                        }
-                        break;
-                    }
+            Ok(body) => match parse_player_detail_json(&body) {
+                Ok(data) => {
+                    parsed = Some(data);
+                    break;
                 }
-            }
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    break;
+                }
+            },
             Err(err) => {
                 last_err = Some(anyhow::anyhow!("request failed: {err}"));
                 if attempt < 2 {
@@ -657,8 +651,8 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         }
     }
 
-    let parsed = parsed
-        .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("player fetch failed")))?;
+    let parsed =
+        parsed.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("player fetch failed")))?;
     Ok(parsed)
 }
 
@@ -821,11 +815,10 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
                         .iter()
                         .map(|stat| PlayerSeasonPerformanceItem {
                             title: stat.title.clone(),
-                            total: format_stat_value(
-                                &stat.stat_value,
-                                stat.stat_format.as_deref(),
-                            ),
+                            total: format_stat_value(&stat.stat_value, stat.stat_format.as_deref()),
                             per90: format_per90(stat.per90, stat.stat_format.as_deref()),
+                            percentile_rank: stat.percentile_rank,
+                            percentile_rank_per90: stat.percentile_rank_per90,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1041,19 +1034,6 @@ fn info_value_to_string(value: &serde_json::Value) -> String {
     }
 }
 
-fn normalize_player_info_key(row: &PlayerInfoRow) -> String {
-    match row.translation_key.as_deref() {
-        Some("height_sentencecase") => "Height".to_string(),
-        Some("age_sentencecase") => "Age".to_string(),
-        Some("preferred_foot") => "Preferred foot".to_string(),
-        Some("country_sentencecase") => "Country".to_string(),
-        Some("shirt") => "Shirt".to_string(),
-        Some("transfer_value") => "Market value".to_string(),
-        Some("contract_end") => "Contract end".to_string(),
-        _ => row.title.clone(),
-    }
-}
-
 fn optional_info_string(value: Option<&serde_json::Value>) -> Option<String> {
     let value = value?;
     let rendered = info_value_to_string(value);
@@ -1166,10 +1146,7 @@ where
     T: Send,
 {
     let threads = fetch_parallelism();
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-    {
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
         Ok(pool) => pool.install(action),
         Err(_) => action(),
     }
@@ -1295,6 +1272,7 @@ struct PlayerCareerTeamEntry {
 #[derive(Debug, Deserialize)]
 struct PlayerCareerSeasonEntry {
     #[serde(rename = "seasonName")]
+    #[allow(dead_code)]
     season_name: String,
     #[serde(rename = "tournamentStats", default)]
     tournament_stats: Vec<PlayerTournamentStat>,
@@ -1427,6 +1405,14 @@ struct PlayerStatValueDetail {
     stat_format: Option<String>,
     #[serde(rename = "per90", default, deserialize_with = "float_or_none")]
     per90: Option<f64>,
+    #[serde(rename = "percentileRank", default, deserialize_with = "float_or_none")]
+    percentile_rank: Option<f64>,
+    #[serde(
+        rename = "percentileRankPer90",
+        default,
+        deserialize_with = "float_or_none"
+    )]
+    percentile_rank_per90: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

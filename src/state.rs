@@ -371,9 +371,7 @@ impl AppState {
 
     pub fn selected_match(&self) -> Option<&MatchSummary> {
         match &self.screen {
-            Screen::Terminal {
-                match_id: Some(id),
-            } => self.matches.iter().find(|m| &m.id == id),
+            Screen::Terminal { match_id: Some(id) } => self.matches.iter().find(|m| &m.id == id),
             Screen::Pulse => {
                 if self.pulse_view != PulseView::Live {
                     return None;
@@ -614,8 +612,16 @@ impl AppState {
             .map(|(idx, _)| idx)
             .collect();
         upcoming_indices.sort_by(|a, b| {
-            let ka = self.upcoming.get(*a).map(|u| u.kickoff.as_str()).unwrap_or("");
-            let kb = self.upcoming.get(*b).map(|u| u.kickoff.as_str()).unwrap_or("");
+            let ka = self
+                .upcoming
+                .get(*a)
+                .map(|u| u.kickoff.as_str())
+                .unwrap_or("");
+            let kb = self
+                .upcoming
+                .get(*b)
+                .map(|u| u.kickoff.as_str())
+                .unwrap_or("");
             ka.cmp(kb)
         });
         for idx in upcoming_indices {
@@ -1030,6 +1036,8 @@ pub struct PlayerSeasonPerformanceItem {
     pub title: String,
     pub total: String,
     pub per90: Option<String>,
+    pub percentile_rank: Option<f64>,
+    pub percentile_rank_per90: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1144,6 +1152,7 @@ pub enum Delta {
     SetAnalysis(Vec<TeamAnalysis>),
     CacheSquad {
         team_id: u32,
+        #[allow(dead_code)]
         team_name: String,
         players: Vec<SquadPlayer>,
     },
@@ -1190,19 +1199,37 @@ pub enum Delta {
 
 #[derive(Debug, Clone)]
 pub enum ProviderCommand {
-    FetchMatchDetails { fixture_id: String },
+    FetchMatchDetails {
+        fixture_id: String,
+    },
     FetchUpcoming,
-    FetchAnalysis { mode: LeagueMode },
-    FetchSquad { team_id: u32, team_name: String },
-    FetchPlayer { player_id: u32, player_name: String },
-    PrefetchPlayers { player_ids: Vec<u32> },
-    WarmRankCacheFull { mode: LeagueMode },
+    FetchAnalysis {
+        mode: LeagueMode,
+    },
+    FetchSquad {
+        team_id: u32,
+        team_name: String,
+    },
+    FetchPlayer {
+        player_id: u32,
+        player_name: String,
+    },
+    PrefetchPlayers {
+        player_ids: Vec<u32>,
+    },
+    WarmRankCacheFull {
+        mode: LeagueMode,
+    },
     WarmRankCacheMissing {
+        #[allow(dead_code)]
         mode: LeagueMode,
         team_ids: Vec<u32>,
         player_ids: Vec<u32>,
     },
-    ExportAnalysis { path: String, mode: LeagueMode },
+    ExportAnalysis {
+        path: String,
+        mode: LeagueMode,
+    },
 }
 
 pub fn apply_delta(state: &mut AppState, delta: Delta) {
@@ -1238,14 +1265,13 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.matches = matches;
             state.sort_matches_with_selected_id(selected_id);
             if preserve_index {
-                state.selected = preserved_selected.min(state.pulse_live_rows().len().saturating_sub(1));
+                state.selected =
+                    preserved_selected.min(state.pulse_live_rows().len().saturating_sub(1));
             }
         }
         Delta::SetMatchDetails { id, detail } => {
             state.match_detail.insert(id.clone(), detail);
-            state
-                .match_detail_cached_at
-                .insert(id, SystemTime::now());
+            state.match_detail_cached_at.insert(id, SystemTime::now());
         }
         Delta::UpsertMatch(mut summary) => {
             let match_id = summary.id.clone();
@@ -1323,11 +1349,10 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         }
         Delta::RankCacheFinished { errors } => {
             state.rankings_loading = false;
-            state.rankings_progress_current = state.rankings_progress_total.max(state.rankings_progress_current);
-            state.rankings_progress_message = format!(
-                "Cache warm done ({} errors)",
-                errors.len()
-            );
+            state.rankings_progress_current = state
+                .rankings_progress_total
+                .max(state.rankings_progress_current);
+            state.rankings_progress_message = format!("Cache warm done ({} errors)", errors.len());
             for err in errors {
                 state.push_log(format!("[WARN] Rankings cache: {err}"));
             }
@@ -1345,8 +1370,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             if state.squad.is_empty() {
                 state.squad_prefetch_pending = None;
             } else {
-                state.squad_prefetch_pending =
-                    Some(state.squad.iter().map(|p| p.id).collect());
+                state.squad_prefetch_pending = Some(state.squad.iter().map(|p| p.id).collect());
             }
             // Also cache for rankings so we don't refetch later.
             if !state.squad.is_empty() {

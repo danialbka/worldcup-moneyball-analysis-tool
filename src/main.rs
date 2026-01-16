@@ -3,7 +3,7 @@ use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
 };
@@ -27,9 +27,9 @@ mod state;
 mod upcoming_fetch;
 
 use crate::state::{
-    AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen,
-    PLACEHOLDER_MATCH_ID, apply_delta, confed_label, league_label, metric_label,
-    placeholder_match_detail, placeholder_match_summary, role_label,
+    AppState, LeagueMode, PLACEHOLDER_MATCH_ID, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView,
+    Screen, apply_delta, confed_label, league_label, metric_label, placeholder_match_detail,
+    placeholder_match_summary, role_label,
 };
 
 struct App {
@@ -54,6 +54,15 @@ enum AutoWarmMode {
     Off,
     Missing,
     Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayerPositionGroup {
+    Goalkeeper,
+    Defender,
+    Midfielder,
+    Forward,
+    Unknown,
 }
 
 impl App {
@@ -177,13 +186,20 @@ impl App {
                             self.state.player_last_id = Some(entry.player_id);
                             self.state.player_last_name = Some(entry.player_name.clone());
 
-                            if let Some(cached) =
-                                self.state.rankings_cache_players.get(&entry.player_id).cloned()
+                            if let Some(cached) = self
+                                .state
+                                .rankings_cache_players
+                                .get(&entry.player_id)
+                                .cloned()
                             {
                                 self.state.player_detail = Some(cached);
                                 self.state.player_loading = false;
                             } else if !self.state.player_loading {
-                                self.request_player_detail(entry.player_id, entry.player_name.clone(), true);
+                                self.request_player_detail(
+                                    entry.player_id,
+                                    entry.player_name.clone(),
+                                    true,
+                                );
                             }
                         }
                     }
@@ -223,7 +239,9 @@ impl App {
                 if matches!(self.state.screen, Screen::Analysis) {
                     match self.state.analysis_tab {
                         crate::state::AnalysisTab::Teams => self.state.select_analysis_next(),
-                        crate::state::AnalysisTab::RoleRankings => self.state.select_rankings_next(),
+                        crate::state::AnalysisTab::RoleRankings => {
+                            self.state.select_rankings_next()
+                        }
                     }
                 } else if matches!(self.state.screen, Screen::Squad) {
                     self.state.select_squad_next();
@@ -248,7 +266,9 @@ impl App {
                 if matches!(self.state.screen, Screen::Analysis) {
                     match self.state.analysis_tab {
                         crate::state::AnalysisTab::Teams => self.state.select_analysis_prev(),
-                        crate::state::AnalysisTab::RoleRankings => self.state.select_rankings_prev(),
+                        crate::state::AnalysisTab::RoleRankings => {
+                            self.state.select_rankings_prev()
+                        }
                     }
                 } else if matches!(self.state.screen, Screen::Squad) {
                     self.state.select_squad_prev();
@@ -398,10 +418,9 @@ impl App {
 
     fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
         if match_id == PLACEHOLDER_MATCH_ID && self.state.placeholder_match_enabled {
-            self.state.match_detail.insert(
-                PLACEHOLDER_MATCH_ID.to_string(),
-                placeholder_match_detail(),
-            );
+            self.state
+                .match_detail
+                .insert(PLACEHOLDER_MATCH_ID.to_string(), placeholder_match_detail());
             self.state
                 .match_detail_cached_at
                 .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
@@ -418,11 +437,7 @@ impl App {
             .find(|m| m.id == match_id)
             .map(|m| m.is_live)
             .unwrap_or(false);
-        let cached_at = self
-            .state
-            .match_detail_cached_at
-            .get(match_id)
-            .copied();
+        let cached_at = self.state.match_detail_cached_at.get(match_id).copied();
         let has_cached = self.state.match_detail.contains_key(match_id);
         if !is_live && has_cached && cache_fresh(cached_at, self.detail_cache_ttl) {
             if announce {
@@ -461,7 +476,8 @@ impl App {
     fn request_upcoming(&mut self, announce: bool) {
         if cache_fresh(self.state.upcoming_cached_at, self.upcoming_cache_ttl) {
             if announce {
-                self.state.push_log("[INFO] Upcoming cached (skipping fetch)");
+                self.state
+                    .push_log("[INFO] Upcoming cached (skipping fetch)");
             }
             self.last_upcoming_refresh = Instant::now();
             return;
@@ -492,7 +508,10 @@ impl App {
             return;
         };
         let mode = self.state.league_mode;
-        if tx.send(state::ProviderCommand::FetchAnalysis { mode }).is_err() {
+        if tx
+            .send(state::ProviderCommand::FetchAnalysis { mode })
+            .is_err()
+        {
             if announce {
                 self.state.push_log("[WARN] Analysis request failed");
             }
@@ -510,15 +529,19 @@ impl App {
     fn request_rankings_cache_warm_full(&mut self, announce: bool) {
         let Some(tx) = &self.cmd_tx else {
             if announce {
-                self.state.push_log("[INFO] Rankings cache warm unavailable");
+                self.state
+                    .push_log("[INFO] Rankings cache warm unavailable");
             }
             return;
         };
         let mode = self.state.league_mode;
-        if tx.send(state::ProviderCommand::WarmRankCacheFull { mode }).is_err()
+        if tx
+            .send(state::ProviderCommand::WarmRankCacheFull { mode })
+            .is_err()
         {
             if announce {
-                self.state.push_log("[WARN] Rankings cache warm request failed");
+                self.state
+                    .push_log("[WARN] Rankings cache warm request failed");
             }
         } else {
             if announce {
@@ -534,7 +557,8 @@ impl App {
     fn request_rankings_cache_warm_missing(&mut self, announce: bool) {
         let Some(tx) = &self.cmd_tx else {
             if announce {
-                self.state.push_log("[INFO] Rankings cache warm unavailable");
+                self.state
+                    .push_log("[INFO] Rankings cache warm unavailable");
             }
             return;
         };
@@ -546,7 +570,8 @@ impl App {
         }
         if self.state.analysis.is_empty() {
             if announce {
-                self.state.push_log("[INFO] No teams loaded yet (fetch Analysis first)");
+                self.state
+                    .push_log("[INFO] No teams loaded yet (fetch Analysis first)");
             }
             return;
         }
@@ -607,11 +632,13 @@ impl App {
             .is_err()
         {
             if announce {
-                self.state.push_log("[WARN] Rankings missing-cache request failed");
+                self.state
+                    .push_log("[WARN] Rankings missing-cache request failed");
             }
         } else {
             if announce {
-                self.state.push_log("[INFO] Rankings missing-cache request sent");
+                self.state
+                    .push_log("[INFO] Rankings missing-cache request sent");
             }
             self.state.rankings_loading = true;
             self.state.rankings_progress_current = 0;
@@ -644,7 +671,8 @@ impl App {
             self.state.rankings_progress_message =
                 "No cached player data yet (warming cache...)".to_string();
         } else {
-            self.state.rankings_progress_message = format!("Rankings ready (cached: {})", rows.len());
+            self.state.rankings_progress_message =
+                format!("Rankings ready (cached: {})", rows.len());
             self.state.rankings_fetched_at = Some(SystemTime::now());
         }
         self.state.rankings = rows;
@@ -710,12 +738,7 @@ impl App {
         self.state.player_last_id = Some(player_id);
         self.state.player_last_name = Some(player_name.clone());
         let mut cache_hit = false;
-        if let Some(cached) = self
-            .state
-            .rankings_cache_players
-            .get(&player_id)
-            .cloned()
-        {
+        if let Some(cached) = self.state.rankings_cache_players.get(&player_id).cloned() {
             let cached_at = self
                 .state
                 .rankings_cache_players_at
@@ -881,10 +904,9 @@ impl App {
         let summary = placeholder_match_summary(self.state.league_mode);
         self.state.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
         self.state.matches.push(summary);
-        self.state.match_detail.insert(
-            PLACEHOLDER_MATCH_ID.to_string(),
-            placeholder_match_detail(),
-        );
+        self.state
+            .match_detail
+            .insert(PLACEHOLDER_MATCH_ID.to_string(), placeholder_match_detail());
         self.state
             .match_detail_cached_at
             .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
@@ -900,7 +922,9 @@ impl App {
     fn disable_placeholder_match(&mut self) {
         self.state.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
         self.state.match_detail.remove(PLACEHOLDER_MATCH_ID);
-        self.state.match_detail_cached_at.remove(PLACEHOLDER_MATCH_ID);
+        self.state
+            .match_detail_cached_at
+            .remove(PLACEHOLDER_MATCH_ID);
         self.state.win_prob_history.remove(PLACEHOLDER_MATCH_ID);
         self.state.placeholder_match_enabled = false;
         self.state.sort_matches();
@@ -1114,7 +1138,11 @@ fn header_text(state: &AppState) -> String {
 
 fn format_fetched_at(fetched_at: Option<SystemTime>) -> String {
     fetched_at
-        .map(|stamp| DateTime::<Local>::from(stamp).format("%Y-%m-%d %H:%M").to_string())
+        .map(|stamp| {
+            DateTime::<Local>::from(stamp)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -1827,16 +1855,18 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
 
     if inner.height < 8 {
         let text = player_detail_text(detail);
-        let paragraph = Paragraph::new(text).scroll((state.player_detail_scroll, 0));
+        let paragraph = Paragraph::new(styled_detail_text(&text, player_position_group(detail)))
+            .scroll((state.player_detail_scroll, 0));
         frame.render_widget(paragraph, inner);
         return;
     }
 
+    let position_group = player_position_group(detail);
     let info_text = player_info_text(detail);
     let league_text = player_league_stats_text(detail);
     let top_text = player_top_stats_text(detail);
     let traits_text = player_traits_text(detail);
-    let other_text = player_season_performance_text(detail);
+    let other_text_styled = player_season_performance_text_styled(detail, position_group);
     let season_text = player_season_breakdown_text(detail);
     let career_text = player_career_text(detail);
     let trophies_text = player_trophies_text(detail);
@@ -1846,7 +1876,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let league_lines = text_line_count(&league_text);
     let top_lines = text_line_count(&top_text);
     let traits_lines = text_line_count(&traits_text);
-    let other_lines = text_line_count(&other_text);
+    let other_styled_lines = other_text_styled.len() as u16;
     let season_lines = text_line_count(&season_text);
     let career_lines = text_line_count(&career_text);
     let trophies_lines = text_line_count(&trophies_text);
@@ -1886,6 +1916,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[0],
         state.player_detail_section == 0,
         info_lines,
+        position_group,
     );
     render_detail_section(
         frame,
@@ -1895,6 +1926,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[1],
         state.player_detail_section == 1,
         league_lines,
+        position_group,
     );
     render_detail_section(
         frame,
@@ -1904,6 +1936,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[2],
         state.player_detail_section == 2,
         top_lines,
+        position_group,
     );
     render_detail_section(
         frame,
@@ -1913,15 +1946,16 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[3],
         state.player_detail_section == 3,
         traits_lines,
+        position_group,
     );
-    render_detail_section(
+    render_detail_section_lines(
         frame,
         left_sections[4],
         "Season Performance",
-        &other_text,
+        other_text_styled,
         state.player_detail_section_scrolls[4],
         state.player_detail_section == 4,
-        other_lines,
+        other_styled_lines,
     );
 
     render_detail_section(
@@ -1932,6 +1966,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[5],
         state.player_detail_section == 5,
         season_lines,
+        position_group,
     );
     render_detail_section(
         frame,
@@ -1941,6 +1976,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[6],
         state.player_detail_section == 6,
         career_lines,
+        position_group,
     );
     render_detail_section(
         frame,
@@ -1950,6 +1986,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[7],
         state.player_detail_section == 7,
         trophies_lines,
+        position_group,
     );
     render_detail_section(
         frame,
@@ -1959,6 +1996,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         state.player_detail_section_scrolls[8],
         state.player_detail_section == 8,
         recent_lines,
+        position_group,
     );
 }
 
@@ -1968,15 +2006,40 @@ fn player_detail_has_stats(detail: &PlayerDetail) -> bool {
         || !detail.top_stats.is_empty()
         || !detail.season_groups.is_empty()
         || !detail.season_performance.is_empty()
-        || detail
-            .traits
-            .as_ref()
-            .map(|traits| !traits.items.is_empty())
-            .unwrap_or(false)
+        || detail.traits.is_some()
         || !detail.recent_matches.is_empty()
         || !detail.season_breakdown.is_empty()
         || !detail.career_sections.is_empty()
         || !detail.trophies.is_empty()
+}
+
+fn player_position_group(detail: &PlayerDetail) -> PlayerPositionGroup {
+    let position = detail
+        .position
+        .as_deref()
+        .or_else(|| detail.positions.first().map(|p| p.as_str()))
+        .unwrap_or("-")
+        .to_lowercase();
+
+    if position.contains("gk") || position.contains("goalkeeper") {
+        PlayerPositionGroup::Goalkeeper
+    } else if position.contains("cb")
+        || position.contains("lb")
+        || position.contains("rb")
+        || position.contains("def")
+    {
+        PlayerPositionGroup::Defender
+    } else if position.contains("mid") || position.contains("cm") || position.contains("am") {
+        PlayerPositionGroup::Midfielder
+    } else if position.contains("fw")
+        || position.contains("st")
+        || position.contains("wing")
+        || position.contains("att")
+    {
+        PlayerPositionGroup::Forward
+    } else {
+        PlayerPositionGroup::Unknown
+    }
 }
 
 fn player_detail_text(detail: &PlayerDetail) -> String {
@@ -2143,6 +2206,40 @@ fn player_season_performance_text(detail: &PlayerDetail) -> String {
     lines.join("\n")
 }
 
+fn player_season_performance_text_styled(
+    detail: &PlayerDetail,
+    position_group: PlayerPositionGroup,
+) -> Vec<Line<'static>> {
+    if detail.season_performance.is_empty() {
+        return vec![Line::from("No season performance stats")];
+    }
+    let mut lines = Vec::new();
+    if let Some(minutes) = player_minutes_played(detail) {
+        lines.push(Line::from(style_detail_line_value(
+            "Minutes played",
+            &minutes,
+            None,
+            PlayerPositionGroup::Unknown,
+        )));
+    }
+    lines.push(Line::from("Total | Per 90"));
+    for group in &detail.season_performance {
+        lines.push(Line::from(format!("{}:", group.title)));
+        for item in &group.items {
+            let per90 = item.per90.as_deref().unwrap_or("-");
+            lines.push(Line::from(style_stat_with_rank(
+                &item.title,
+                &item.total,
+                per90,
+                item.percentile_rank,
+                item.percentile_rank_per90,
+                position_group,
+            )));
+        }
+    }
+    lines
+}
+
 fn player_season_breakdown_text(detail: &PlayerDetail) -> String {
     if detail.season_breakdown.is_empty() {
         return "No season breakdown".to_string();
@@ -2237,6 +2334,41 @@ fn render_detail_section(
     scroll: u16,
     active: bool,
     total_lines: u16,
+    position_group: PlayerPositionGroup,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let border_style = if active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let max_scroll = total_lines.saturating_sub(1);
+    let current = scroll.min(max_scroll) + 1;
+    let total = max_scroll + 1;
+    let title = format!("{title}  {current}/{total}");
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let paragraph = Paragraph::new(styled_detail_text(body, position_group)).scroll((scroll, 0));
+    frame.render_widget(paragraph, inner);
+}
+
+fn render_detail_section_lines(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: Vec<Line<'static>>,
+    scroll: u16,
+    active: bool,
+    total_lines: u16,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -2261,6 +2393,413 @@ fn render_detail_section(
     }
     let paragraph = Paragraph::new(body).scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
+}
+
+fn style_percentile_line(line: &str) -> Vec<Span<'_>> {
+    const PUNCH: Color = Color::Rgb(221, 54, 54);
+    const PRINCETON_ORANGE: Color = Color::Rgb(240, 128, 34);
+    const UFO_GREEN: Color = Color::Rgb(51, 199, 113);
+
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for (idx, ch) in line.char_indices() {
+        if ch == '%' {
+            let percent_start = line[..idx]
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+                .last()
+                .map(|(pos, _)| pos)
+                .unwrap_or(idx);
+            if percent_start == idx {
+                continue;
+            }
+            let raw = &line[percent_start..idx];
+            if let Ok(value) = raw.parse::<f64>() {
+                if percent_start > start {
+                    spans.push(Span::raw(line[start..percent_start].to_string()));
+                }
+                let color = if value < 30.0 {
+                    PUNCH
+                } else if value < 70.0 {
+                    PRINCETON_ORANGE
+                } else {
+                    UFO_GREEN
+                };
+                spans.push(Span::styled(
+                    format!("{}%", raw),
+                    Style::default().fg(color),
+                ));
+                start = idx + 1;
+            }
+        }
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::raw(line.to_string()));
+    } else if start < line.len() {
+        spans.push(Span::raw(line[start..].to_string()));
+    }
+
+    spans
+}
+
+fn styled_stat_line(line: &str, position_group: PlayerPositionGroup) -> Vec<Span<'_>> {
+    if line.trim().is_empty() || line.ends_with(':') || line.contains('|') {
+        return vec![Span::raw(line.to_string())];
+    }
+
+    let (prefix, value) = match line.rsplit_once(':') {
+        Some((lhs, rhs)) => (lhs, rhs.trim()),
+        None => return vec![Span::raw(line.to_string())],
+    };
+
+    style_detail_line_value(prefix.trim(), value, None, position_group)
+}
+
+fn style_detail_line_value(
+    label: &str,
+    raw_value: &str,
+    percentile: Option<f64>,
+    position_group: PlayerPositionGroup,
+) -> Vec<Span<'static>> {
+    let value_spans = style_value_only(label, raw_value, percentile, position_group);
+    if label.is_empty() {
+        return value_spans;
+    }
+
+    let mut spans = Vec::new();
+    spans.push(Span::raw(format!("{label}: ")));
+    spans.extend(value_spans);
+    spans
+}
+
+fn style_value_only(
+    label: &str,
+    raw_value: &str,
+    percentile: Option<f64>,
+    position_group: PlayerPositionGroup,
+) -> Vec<Span<'static>> {
+    let Some((value, suffix)) = parse_stat_value(raw_value) else {
+        return vec![Span::raw(raw_value.to_string())];
+    };
+
+    if should_skip_stat_color(label) {
+        return vec![Span::raw(format!("{value}{suffix}"))];
+    }
+
+    let score = percentile
+        .map(|v| (v / 100.0).clamp(0.0, 1.0))
+        .unwrap_or_else(|| normalize_stat_value(label, value, position_group));
+    let color = stat_color(score);
+
+    vec![Span::styled(
+        format!("{value}{suffix}"),
+        Style::default().fg(color),
+    )]
+}
+
+fn should_skip_stat_color(label: &str) -> bool {
+    let lowered = label.to_lowercase();
+    lowered == "id" || lowered == "age" || lowered.contains("shirt") || lowered.contains("troph")
+}
+
+fn style_stat_with_rank(
+    label: &str,
+    total: &str,
+    per90: &str,
+    total_rank: Option<f64>,
+    per90_rank: Option<f64>,
+    position_group: PlayerPositionGroup,
+) -> Vec<Span<'static>> {
+    let total_text = style_detail_line_value(label, total, total_rank, position_group);
+    let per90_text = if per90 == "-" {
+        vec![Span::raw("-".to_string())]
+    } else {
+        style_value_only(label, per90, per90_rank, position_group)
+    };
+
+    let mut out = Vec::new();
+    out.extend(total_text);
+    out.push(Span::raw(" | ".to_string()));
+    out.extend(per90_text);
+
+    out
+}
+
+fn styled_detail_text(text: &str, position_group: PlayerPositionGroup) -> Text<'_> {
+    Text::from(
+        text.lines()
+            .map(|line| {
+                let spans = if line.contains('%') {
+                    style_percentile_line(line)
+                } else {
+                    styled_stat_line(line, position_group)
+                };
+                Line::from(spans)
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn parse_stat_value(raw: &str) -> Option<(f64, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return None;
+    }
+    let value_str = trimmed
+        .trim_end_matches('%')
+        .trim_end_matches(|c: char| c == 'm' || c == 'M' || c == 'k' || c == 'K')
+        .trim_start_matches('+');
+    let value = value_str.parse::<f64>().ok()?;
+    let suffix = if trimmed.ends_with('%') {
+        "%".to_string()
+    } else if trimmed.ends_with('m') || trimmed.ends_with('M') {
+        "M".to_string()
+    } else if trimmed.ends_with('k') || trimmed.ends_with('K') {
+        "K".to_string()
+    } else {
+        "".to_string()
+    };
+    Some((value, suffix))
+}
+
+fn normalize_stat_value(label: &str, value: f64, position_group: PlayerPositionGroup) -> f64 {
+    let lowered = label.to_lowercase();
+    let is_per90 = lowered.contains("per 90") || lowered.contains("per90");
+    let Some((bounds, higher_better)) = stat_bounds(&lowered, position_group, is_per90) else {
+        return (value / 100.0).clamp(0.0, 1.0);
+    };
+    let raw_score = ((value - bounds.0) / (bounds.1 - bounds.0)).clamp(0.0, 1.0);
+    if higher_better {
+        raw_score
+    } else {
+        1.0 - raw_score
+    }
+}
+
+fn stat_bounds(
+    label: &str,
+    position_group: PlayerPositionGroup,
+    per90: bool,
+) -> Option<((f64, f64), bool)> {
+    for (needle, bounds, higher_better) in global_bounds() {
+        if label.contains(needle) {
+            return Some((bounds, higher_better));
+        }
+    }
+
+    let base = if per90 {
+        per90_bounds(position_group)
+    } else {
+        total_bounds(position_group)
+    };
+
+    for (needle, bounds, higher_better) in base {
+        if label.contains(needle) {
+            return Some((bounds, higher_better));
+        }
+    }
+
+    None
+}
+
+fn global_bounds() -> Vec<(&'static str, (f64, f64), bool)> {
+    vec![
+        ("rating", (0.0, 10.0), true),
+        ("minutes", (0.0, 4000.0), true),
+        ("matches started", (0.0, 60.0), true),
+        ("started", (0.0, 60.0), true),
+        ("appearances", (0.0, 60.0), true),
+        ("matches", (0.0, 60.0), true),
+    ]
+}
+
+fn total_bounds(position_group: PlayerPositionGroup) -> Vec<(&'static str, (f64, f64), bool)> {
+    match position_group {
+        PlayerPositionGroup::Goalkeeper => vec![
+            ("save", (0.0, 180.0), true),
+            ("clean sheet", (0.0, 20.0), true),
+            ("conceded", (0.0, 80.0), false),
+            ("penalty", (0.0, 10.0), true),
+            ("distribution", (0.0, 2000.0), true),
+            ("pass", (0.0, 2500.0), true),
+            ("touch", (0.0, 2000.0), true),
+            ("error", (0.0, 10.0), false),
+        ],
+        PlayerPositionGroup::Defender => vec![
+            ("tackle", (0.0, 200.0), true),
+            ("interception", (0.0, 200.0), true),
+            ("clearance", (0.0, 500.0), true),
+            ("block", (0.0, 150.0), true),
+            ("aerial duel", (0.0, 300.0), true),
+            ("duel", (0.0, 400.0), true),
+            ("recover", (0.0, 400.0), true),
+            ("touch", (0.0, 3500.0), true),
+            ("pass", (0.0, 4000.0), true),
+            ("cross", (0.0, 120.0), true),
+            ("conceded", (0.0, 80.0), false),
+            ("foul", (0.0, 80.0), false),
+            ("yellow", (0.0, 15.0), false),
+            ("red", (0.0, 5.0), false),
+            ("goal", (0.0, 10.0), true),
+            ("assist", (0.0, 10.0), true),
+        ],
+        PlayerPositionGroup::Midfielder => vec![
+            ("goal", (0.0, 20.0), true),
+            ("assist", (0.0, 20.0), true),
+            ("expected goals", (0.0, 12.0), true),
+            ("xg", (0.0, 12.0), true),
+            ("expected assists", (0.0, 12.0), true),
+            ("xa", (0.0, 12.0), true),
+            ("shot", (0.0, 120.0), true),
+            ("shots on target", (0.0, 80.0), true),
+            ("chances created", (0.0, 150.0), true),
+            ("key pass", (0.0, 150.0), true),
+            ("pass", (0.0, 5000.0), true),
+            ("accurate long balls", (0.0, 300.0), true),
+            ("cross", (0.0, 120.0), true),
+            ("dribble", (0.0, 300.0), true),
+            ("touch", (0.0, 5000.0), true),
+            ("tackle", (0.0, 200.0), true),
+            ("interception", (0.0, 200.0), true),
+            ("duel", (0.0, 400.0), true),
+            ("recover", (0.0, 400.0), true),
+            ("foul", (0.0, 80.0), false),
+            ("yellow", (0.0, 15.0), false),
+            ("red", (0.0, 5.0), false),
+        ],
+        PlayerPositionGroup::Forward => vec![
+            ("goal", (0.0, 30.0), true),
+            ("assist", (0.0, 15.0), true),
+            ("expected goals", (0.0, 15.0), true),
+            ("xg", (0.0, 15.0), true),
+            ("expected assists", (0.0, 8.0), true),
+            ("xa", (0.0, 8.0), true),
+            ("xgot", (0.0, 18.0), true),
+            ("shot", (0.0, 150.0), true),
+            ("shots on target", (0.0, 100.0), true),
+            ("chances created", (0.0, 120.0), true),
+            ("key pass", (0.0, 120.0), true),
+            ("dribble", (0.0, 350.0), true),
+            ("touch", (0.0, 4000.0), true),
+            ("touches in opposition box", (0.0, 300.0), true),
+            ("aerial duel", (0.0, 250.0), true),
+            ("duel", (0.0, 350.0), true),
+            ("foul", (0.0, 80.0), false),
+            ("yellow", (0.0, 15.0), false),
+            ("red", (0.0, 5.0), false),
+        ],
+        PlayerPositionGroup::Unknown => vec![
+            ("goal", (0.0, 25.0), true),
+            ("assist", (0.0, 20.0), true),
+            ("xg", (0.0, 12.0), true),
+            ("xa", (0.0, 10.0), true),
+            ("shot", (0.0, 120.0), true),
+            ("chances created", (0.0, 120.0), true),
+            ("pass", (0.0, 4000.0), true),
+            ("touch", (0.0, 5000.0), true),
+            ("tackle", (0.0, 200.0), true),
+            ("interception", (0.0, 200.0), true),
+            ("duel", (0.0, 400.0), true),
+            ("foul", (0.0, 80.0), false),
+            ("yellow", (0.0, 15.0), false),
+            ("red", (0.0, 5.0), false),
+            ("minutes", (0.0, 4000.0), true),
+            ("rating", (0.0, 10.0), true),
+        ],
+    }
+}
+
+fn per90_bounds(position_group: PlayerPositionGroup) -> Vec<(&'static str, (f64, f64), bool)> {
+    match position_group {
+        PlayerPositionGroup::Goalkeeper => vec![
+            ("save", (0.0, 6.0), true),
+            ("conceded", (0.0, 2.5), false),
+            ("pass", (0.0, 40.0), true),
+            ("touch", (0.0, 50.0), true),
+            ("error", (0.0, 0.5), false),
+        ],
+        PlayerPositionGroup::Defender => vec![
+            ("tackle", (0.0, 4.0), true),
+            ("interception", (0.0, 3.5), true),
+            ("clearance", (0.0, 8.0), true),
+            ("block", (0.0, 3.0), true),
+            ("aerial duel", (0.0, 6.0), true),
+            ("duel", (0.0, 10.0), true),
+            ("recover", (0.0, 10.0), true),
+            ("pass", (0.0, 80.0), true),
+            ("cross", (0.0, 2.0), true),
+            ("goal", (0.0, 0.5), true),
+            ("assist", (0.0, 0.4), true),
+            ("foul", (0.0, 3.0), false),
+        ],
+        PlayerPositionGroup::Midfielder => vec![
+            ("goal", (0.0, 0.8), true),
+            ("assist", (0.0, 0.8), true),
+            ("xg", (0.0, 0.6), true),
+            ("xa", (0.0, 0.6), true),
+            ("shot", (0.0, 4.0), true),
+            ("shots on target", (0.0, 2.0), true),
+            ("chances created", (0.0, 3.5), true),
+            ("key pass", (0.0, 3.5), true),
+            ("pass", (0.0, 90.0), true),
+            ("accurate long balls", (0.0, 6.0), true),
+            ("cross", (0.0, 2.0), true),
+            ("dribble", (0.0, 5.0), true),
+            ("touch", (0.0, 100.0), true),
+            ("tackle", (0.0, 3.5), true),
+            ("interception", (0.0, 2.5), true),
+            ("duel", (0.0, 10.0), true),
+            ("recover", (0.0, 10.0), true),
+            ("foul", (0.0, 3.0), false),
+        ],
+        PlayerPositionGroup::Forward => vec![
+            ("goal", (0.0, 1.2), true),
+            ("assist", (0.0, 0.6), true),
+            ("xg", (0.0, 0.9), true),
+            ("xa", (0.0, 0.4), true),
+            ("xgot", (0.0, 1.1), true),
+            ("shot", (0.0, 5.5), true),
+            ("shots on target", (0.0, 2.8), true),
+            ("chances created", (0.0, 3.0), true),
+            ("key pass", (0.0, 2.5), true),
+            ("dribble", (0.0, 6.0), true),
+            ("touch", (0.0, 80.0), true),
+            ("touches in opposition box", (0.0, 8.0), true),
+            ("aerial duel", (0.0, 6.0), true),
+            ("duel", (0.0, 9.0), true),
+            ("foul", (0.0, 3.0), false),
+        ],
+        PlayerPositionGroup::Unknown => vec![
+            ("goal", (0.0, 1.0), true),
+            ("assist", (0.0, 0.6), true),
+            ("xg", (0.0, 0.8), true),
+            ("xa", (0.0, 0.5), true),
+            ("shot", (0.0, 5.0), true),
+            ("chances created", (0.0, 3.0), true),
+            ("pass", (0.0, 80.0), true),
+            ("touch", (0.0, 90.0), true),
+            ("tackle", (0.0, 3.0), true),
+            ("interception", (0.0, 2.5), true),
+            ("duel", (0.0, 9.0), true),
+            ("foul", (0.0, 3.0), false),
+        ],
+    }
+}
+
+fn stat_color(score: f64) -> Color {
+    const PUNCH: Color = Color::Rgb(221, 54, 54);
+    const PRINCETON_ORANGE: Color = Color::Rgb(240, 128, 34);
+    const UFO_GREEN: Color = Color::Rgb(51, 199, 113);
+
+    if score < 0.30 {
+        PUNCH
+    } else if score < 0.70 {
+        PRINCETON_ORANGE
+    } else {
+        UFO_GREEN
+    }
 }
 
 fn text_line_count(text: &str) -> u16 {
@@ -2444,9 +2983,7 @@ fn match_list_text(state: &AppState) -> String {
 
     let selected_id = state.selected_match_id();
     let active_id = match &state.screen {
-        Screen::Terminal {
-            match_id: Some(id),
-        } => Some(id.as_str()),
+        Screen::Terminal { match_id: Some(id) } => Some(id.as_str()),
         _ => selected_id.as_deref(),
     };
 
@@ -2779,8 +3316,9 @@ fn format_countdown(raw: &str, now: DateTime<Utc>) -> String {
     let Some(dt) = parse_kickoff(cleaned) else {
         return "TBD".to_string();
     };
-    let kickoff = DateTime::<Utc>::from_utc(dt, Utc);
+    let kickoff = Utc.from_utc_datetime(&dt);
     let delta = kickoff.signed_duration_since(now);
+
     let total_secs = delta.num_seconds();
     if total_secs <= 0 {
         return "LIVE".to_string();
@@ -2809,7 +3347,7 @@ fn format_countdown_short(raw: &str, now: DateTime<Utc>) -> String {
     let Some(dt) = parse_kickoff(cleaned) else {
         return "TBD".to_string();
     };
-    let kickoff = DateTime::<Utc>::from_utc(dt, Utc);
+    let kickoff = Utc.from_utc_datetime(&dt);
     let delta = kickoff.signed_duration_since(now);
     let total_secs = delta.num_seconds();
     if total_secs <= 0 {

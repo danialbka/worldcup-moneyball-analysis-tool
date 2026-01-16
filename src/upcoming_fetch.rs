@@ -117,16 +117,6 @@ pub fn parse_match_details_json(raw: &str) -> Result<MatchDetail> {
     })
 }
 
-pub fn parse_fotmob_matches_json(raw: &str) -> Result<Vec<FotmobMatchRow>> {
-    let response = parse_fotmob_response_json(raw)?;
-    Ok(build_matches_from_response(response))
-}
-
-pub fn parse_fotmob_upcoming_json(raw: &str) -> Result<Vec<UpcomingMatch>> {
-    let response = parse_fotmob_response_json(raw)?;
-    Ok(build_upcoming_from_response(response))
-}
-
 fn parse_fotmob_response_json(raw: &str) -> Result<FotmobResponse> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "null" {
