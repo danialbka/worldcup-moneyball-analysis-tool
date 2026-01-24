@@ -13,6 +13,17 @@ pub enum Screen {
     PlayerDetail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalFocus {
+    MatchList,
+    Pitch,
+    EventTape,
+    Stats,
+    Lineups,
+    Prediction,
+    Console,
+}
+
 pub const PLACEHOLDER_MATCH_ID: &str = "placeholder-demo";
 pub const PLACEHOLDER_HOME: &str = "ALPHA";
 pub const PLACEHOLDER_AWAY: &str = "OMEGA";
@@ -299,6 +310,9 @@ pub struct AppState {
     pub player_detail_section: usize,
     pub player_detail_section_scrolls: [u16; PLAYER_DETAIL_SECTIONS],
     pub export: ExportState,
+    pub terminal_focus: TerminalFocus,
+    pub terminal_detail: Option<TerminalFocus>,
+    pub terminal_detail_scroll: u16,
 }
 
 impl AppState {
@@ -362,6 +376,9 @@ impl AppState {
             player_detail_section: 0,
             player_detail_section_scrolls: [0; PLAYER_DETAIL_SECTIONS],
             export: ExportState::new(),
+            terminal_focus: TerminalFocus::MatchList,
+            terminal_detail: None,
+            terminal_detail_scroll: 0,
         }
     }
 
@@ -439,6 +456,12 @@ impl AppState {
         self.player_last_id = None;
         self.player_last_name = None;
         self.player_detail_back = Screen::Squad;
+        self.player_detail_scroll = 0;
+        self.player_detail_section = 0;
+        self.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+        self.terminal_focus = TerminalFocus::MatchList;
+        self.terminal_detail = None;
+        self.terminal_detail_scroll = 0;
         self.push_log(format!(
             "[INFO] League mode: {}",
             league_label(self.league_mode)
@@ -697,6 +720,30 @@ impl AppState {
         };
         self.analysis_selected = 0;
         self.rankings_selected = 0;
+    }
+
+    pub fn cycle_terminal_focus_next(&mut self) {
+        self.terminal_focus = match self.terminal_focus {
+            TerminalFocus::MatchList => TerminalFocus::Pitch,
+            TerminalFocus::Pitch => TerminalFocus::EventTape,
+            TerminalFocus::EventTape => TerminalFocus::Stats,
+            TerminalFocus::Stats => TerminalFocus::Lineups,
+            TerminalFocus::Lineups => TerminalFocus::Prediction,
+            TerminalFocus::Prediction => TerminalFocus::Console,
+            TerminalFocus::Console => TerminalFocus::MatchList,
+        };
+    }
+
+    pub fn cycle_terminal_focus_prev(&mut self) {
+        self.terminal_focus = match self.terminal_focus {
+            TerminalFocus::MatchList => TerminalFocus::Console,
+            TerminalFocus::Pitch => TerminalFocus::MatchList,
+            TerminalFocus::EventTape => TerminalFocus::Pitch,
+            TerminalFocus::Stats => TerminalFocus::EventTape,
+            TerminalFocus::Lineups => TerminalFocus::Stats,
+            TerminalFocus::Prediction => TerminalFocus::Lineups,
+            TerminalFocus::Console => TerminalFocus::Prediction,
+        };
     }
 
     pub fn cycle_rankings_role_next(&mut self) {

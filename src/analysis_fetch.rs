@@ -682,17 +682,8 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
                 continue;
             };
             let rendered = info_value_to_string(&value.fallback);
-            let key = match row.translation_key.as_deref() {
-                Some("height_sentencecase") => "Height",
-                Some("age_sentencecase") => "Age",
-                Some("preferred_foot") => "Preferred foot",
-                Some("country_sentencecase") => "Country",
-                Some("shirt") => "Shirt",
-                Some("transfer_value") => "Market value",
-                Some("contract_end") => "Contract end",
-                _ => row.title.as_str(),
-            };
-            match key {
+            let key = normalize_player_info_key(&row);
+            match key.as_str() {
                 "Age" => age = Some(rendered),
                 "Country" => country = Some(rendered),
                 "Height" => height = Some(rendered),
@@ -1295,6 +1286,7 @@ struct PlayerCareerTeamEntry {
 #[derive(Debug, Deserialize)]
 struct PlayerCareerSeasonEntry {
     #[serde(rename = "seasonName")]
+    #[allow(dead_code)]
     season_name: String,
     #[serde(rename = "tournamentStats", default)]
     tournament_stats: Vec<PlayerTournamentStat>,

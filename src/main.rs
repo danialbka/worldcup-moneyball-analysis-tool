@@ -14,7 +14,7 @@ use crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
 
 mod analysis_export;
 mod analysis_fetch;
@@ -28,7 +28,7 @@ mod upcoming_fetch;
 
 use crate::state::{
     AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen,
-    PLACEHOLDER_MATCH_ID, apply_delta, confed_label, league_label, metric_label,
+    PLACEHOLDER_MATCH_ID, TerminalFocus, apply_delta, confed_label, league_label, metric_label,
     placeholder_match_detail, placeholder_match_summary, role_label,
 };
 
@@ -119,6 +119,24 @@ impl App {
             }
             return;
         }
+        if self.state.terminal_detail.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('b') | KeyCode::Enter => {
+                    self.state.terminal_detail = None;
+                    self.state.terminal_detail_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Left => {
+                    self.state.terminal_detail_scroll =
+                        self.state.terminal_detail_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Right => {
+                    self.state.terminal_detail_scroll =
+                        self.state.terminal_detail_scroll.saturating_add(1);
+                }
+                _ => {}
+            }
+            return;
+        }
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -134,6 +152,9 @@ impl App {
                     let match_id = self.state.selected_match_id();
                     if self.state.pulse_view == PulseView::Live {
                         self.state.screen = Screen::Terminal { match_id };
+                        self.state.terminal_focus = TerminalFocus::MatchList;
+                        self.state.terminal_detail = None;
+                        self.state.terminal_detail_scroll = 0;
                         self.request_match_details(true);
                     }
                 }
@@ -207,6 +228,10 @@ impl App {
                             self.request_player_detail(player.id, player.name.clone(), true);
                         }
                     }
+                }
+                Screen::Terminal { .. } => {
+                    self.state.terminal_detail = Some(self.state.terminal_focus);
+                    self.state.terminal_detail_scroll = 0;
                 }
                 _ => {}
             },
@@ -295,12 +320,16 @@ impl App {
                         self.request_rankings_cache_warm_missing(true);
                         self.recompute_rankings_from_cache();
                     }
+                } else if matches!(self.state.screen, Screen::Terminal { .. }) {
+                    self.state.cycle_terminal_focus_next();
                 } else if matches!(self.state.screen, Screen::PlayerDetail) {
                     self.state.cycle_player_detail_section_next();
                 }
             }
             KeyCode::BackTab => {
-                if matches!(self.state.screen, Screen::PlayerDetail) {
+                if matches!(self.state.screen, Screen::Terminal { .. }) {
+                    self.state.cycle_terminal_focus_prev();
+                } else if matches!(self.state.screen, Screen::PlayerDetail) {
                     self.state.cycle_player_detail_section_prev();
                 }
             }
@@ -1052,6 +1081,9 @@ fn ui(frame: &mut Frame, app: &App) {
     if app.state.help_overlay {
         render_help_overlay(frame, frame.size());
     }
+    if app.state.terminal_detail.is_some() {
+        render_terminal_detail_overlay(frame, frame.size(), &app.state);
+    }
 }
 
 fn header_text(state: &AppState) -> String {
@@ -1130,7 +1162,7 @@ fn footer_text(state: &AppState) -> String {
             }
         },
         Screen::Terminal { .. } => {
-            "1 Pulse | 2 Analysis | b/Esc Back | i Details | l League | p Placeholder | ? Help | q Quit"
+            "1 Pulse | 2 Analysis | Tab Focus | Enter Detail | b/Esc Back | i Details | l League | p Placeholder | ? Help | q Quit"
                 .to_string()
         }
         Screen::Analysis => {
@@ -2370,6 +2402,14 @@ fn visible_range(selected: usize, total: usize, visible: usize) -> (usize, usize
     (start, start + visible)
 }
 
+fn terminal_block(title: &str, focused: bool) -> Block<'_> {
+    let mut block = Block::default().title(title).borders(Borders::ALL);
+    if focused {
+        block = block.border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    }
+    block
+}
+
 fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -2406,33 +2446,47 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let match_list = match_list_text(state);
     let left_match = Paragraph::new(match_list)
-        .block(Block::default().title("Match List").borders(Borders::ALL));
+        .block(terminal_block(
+            "Match List",
+            state.terminal_focus == TerminalFocus::MatchList,
+        ));
     frame.render_widget(left_match, left_chunks[0]);
 
     let standings = Paragraph::new("Standings placeholder")
-        .block(Block::default().title("Group Mini").borders(Borders::ALL));
+        .block(terminal_block("Group Mini", false));
     frame.render_widget(standings, left_chunks[1]);
 
     render_pitch(frame, middle_chunks[0], state);
 
     let tape = Paragraph::new(event_tape_text(state))
-        .block(Block::default().title("Event Tape").borders(Borders::ALL));
+        .block(terminal_block(
+            "Event Tape",
+            state.terminal_focus == TerminalFocus::EventTape,
+        ));
     frame.render_widget(tape, middle_chunks[1]);
 
     let stats_text = stats_text(state);
-    let stats =
-        Paragraph::new(stats_text).block(Block::default().title("Stats").borders(Borders::ALL));
+    let stats = Paragraph::new(stats_text).block(terminal_block(
+        "Stats",
+        state.terminal_focus == TerminalFocus::Stats,
+    ));
     frame.render_widget(stats, right_chunks[0]);
 
     render_lineups(frame, right_chunks[1], state);
 
     let preds_text = prediction_text(state);
     let preds = Paragraph::new(preds_text)
-        .block(Block::default().title("Prediction").borders(Borders::ALL));
+        .block(terminal_block(
+            "Prediction",
+            state.terminal_focus == TerminalFocus::Prediction,
+        ));
     frame.render_widget(preds, right_chunks[2]);
 
     let console = Paragraph::new(console_text(state))
-        .block(Block::default().title("Console").borders(Borders::ALL));
+        .block(terminal_block(
+            "Console",
+            state.terminal_focus == TerminalFocus::Console,
+        ));
     frame.render_widget(console, rows[1]);
 }
 
@@ -2491,7 +2545,7 @@ fn stats_text(state: &AppState) -> String {
 }
 
 fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().title("Lineups").borders(Borders::ALL);
+    let block = terminal_block("Lineups", state.terminal_focus == TerminalFocus::Lineups);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2532,7 +2586,7 @@ fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_pitch(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().title("Pitch").borders(Borders::ALL);
+    let block = terminal_block("Pitch", state.terminal_focus == TerminalFocus::Pitch);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2656,13 +2710,15 @@ fn lineup_text(side: &state::LineupSide) -> String {
         format!("{} {} ({})", side.team_abbr, side.team, side.formation)
     };
     lines.push(heading);
+    lines.push(String::new());
     lines.push("Starters:".to_string());
     for player in &side.starting {
-        lines.push(format_player(player));
+        lines.push(format!("  {}", format_player(player)));
     }
+    lines.push(String::new());
     lines.push("Subs:".to_string());
     for player in &side.subs {
-        lines.push(format_player(player));
+        lines.push(format!("  {}", format_player(player)));
     }
     lines.join("\n")
 }
@@ -2705,6 +2761,191 @@ fn event_tape_text(state: &AppState) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn events_full_text(state: &AppState) -> String {
+    let Some(match_id) = state.selected_match_id() else {
+        return "No match selected".to_string();
+    };
+    let Some(detail) = state.match_detail.get(&match_id) else {
+        return "No events yet".to_string();
+    };
+    if detail.events.is_empty() {
+        return "No events yet".to_string();
+    }
+    detail
+        .events
+        .iter()
+        .map(|event| {
+            format!(
+                "{}' {} {} {}",
+                event.minute,
+                event_kind_label(event.kind),
+                event.team,
+                event.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn stats_full_text(state: &AppState) -> String {
+    let Some(match_id) = state.selected_match_id() else {
+        return "No match selected".to_string();
+    };
+    let Some(detail) = state.match_detail.get(&match_id) else {
+        return "No stats yet".to_string();
+    };
+    if detail.stats.is_empty() {
+        return "No stats yet".to_string();
+    }
+    detail
+        .stats
+        .iter()
+        .map(|row| format!("{}: {}-{}", row.name, row.home, row.away))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn lineups_full_text(state: &AppState) -> String {
+    let Some(match_id) = state.selected_match_id() else {
+        return "No match selected".to_string();
+    };
+    let Some(detail) = state.match_detail.get(&match_id) else {
+        return "No lineups yet".to_string();
+    };
+    let Some(lineups) = &detail.lineups else {
+        return "No lineups yet".to_string();
+    };
+    if lineups.sides.is_empty() {
+        return "No lineups yet".to_string();
+    }
+
+    let mut sides = lineups.sides.clone();
+    sides.sort_by(|a, b| a.team_abbr.cmp(&b.team_abbr));
+
+    let mut lines = Vec::new();
+    for (idx, side) in sides.iter().enumerate() {
+        if idx > 0 {
+            lines.push(String::new());
+        }
+        lines.extend(lineup_text(side).lines().map(|line| line.to_string()));
+    }
+    lines.join("\n")
+}
+
+fn prediction_detail_text(state: &AppState) -> String {
+    let Some(m) = state.selected_match() else {
+        return "No prediction data".to_string();
+    };
+
+    let mut lines = vec![
+        format!("Home win: {:.1}%", m.win.p_home),
+        format!("Draw: {:.1}%", m.win.p_draw),
+        format!("Away win: {:.1}%", m.win.p_away),
+        format!("Delta home: {:+.1}", m.win.delta_home),
+        format!("Model: {}", quality_label(m.win.quality)),
+        format!("Confidence: {}", m.win.confidence),
+    ];
+
+    if let Some(history) = state.win_prob_history.get(&m.id) {
+        if !history.is_empty() {
+            let start = history.len().saturating_sub(10);
+            let slice = &history[start..];
+            let points = slice
+                .iter()
+                .map(|val| format!("{:.0}", val))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(String::new());
+            lines.push(format!(
+                "Home win history (last {}): {}",
+                slice.len(),
+                points
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn console_full_text(state: &AppState) -> String {
+    if state.logs.is_empty() {
+        return "No alerts yet".to_string();
+    }
+    state.logs.iter().cloned().collect::<Vec<_>>().join("\n")
+}
+
+fn match_detail_overview_text(state: &AppState) -> String {
+    let Some(m) = state.selected_match() else {
+        return "No match selected".to_string();
+    };
+
+    let status = if m.is_live {
+        format!("Minute: {}'", m.minute)
+    } else {
+        "Status: FT".to_string()
+    };
+
+    let mut lines = vec![
+        format!("{} vs {}", m.home, m.away),
+        format!("Score: {}-{}", m.score_home, m.score_away),
+        status,
+        format!("League: {}", m.league_name),
+        format!(
+            "Model: {} (confidence {})",
+            quality_label(m.win.quality),
+            m.win.confidence
+        ),
+    ];
+
+    let Some(detail) = state.match_detail.get(&m.id) else {
+        lines.push(String::new());
+        lines.push("Match details not loaded. Press i to fetch.".to_string());
+        return lines.join("\n");
+    };
+
+    if !detail.stats.is_empty() {
+        lines.push(String::new());
+        lines.push("Stats:".to_string());
+        lines.extend(
+            detail
+                .stats
+                .iter()
+                .map(|row| format!("{}: {}-{}", row.name, row.home, row.away)),
+        );
+    }
+
+    if !detail.events.is_empty() {
+        lines.push(String::new());
+        lines.push("Events:".to_string());
+        lines.extend(detail.events.iter().map(|event| {
+            format!(
+                "{}' {} {} {}",
+                event.minute,
+                event_kind_label(event.kind),
+                event.team,
+                event.description
+            )
+        }));
+    }
+
+    if let Some(lineups) = &detail.lineups {
+        if !lineups.sides.is_empty() {
+            lines.push(String::new());
+            lines.push("Lineups:".to_string());
+            let mut sides = lineups.sides.clone();
+            sides.sort_by(|a, b| a.team_abbr.cmp(&b.team_abbr));
+            for (idx, side) in sides.iter().enumerate() {
+                if idx > 0 {
+                    lines.push(String::new());
+                }
+                lines.extend(lineup_text(side).lines().map(|line| line.to_string()));
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn prediction_text(state: &AppState) -> String {
@@ -2913,6 +3154,79 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
+fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let Some(focus) = state.terminal_detail else {
+        return;
+    };
+
+    let popup_area = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup_area);
+
+    let title = match focus {
+        TerminalFocus::MatchList => "Match Details",
+        TerminalFocus::Pitch => "Pitch",
+        TerminalFocus::EventTape => "Event Tape",
+        TerminalFocus::Stats => "Stats",
+        TerminalFocus::Lineups => "Lineups",
+        TerminalFocus::Prediction => "Prediction",
+        TerminalFocus::Console => "Console",
+    };
+
+    let block = Block::default().title(title).borders(Borders::ALL);
+    frame.render_widget(block.clone(), popup_area);
+
+    let inner = block.inner(popup_area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .margin(1)
+        .split(inner);
+
+    let text = match focus {
+        TerminalFocus::MatchList => match_detail_overview_text(state),
+        TerminalFocus::Pitch => {
+            pitch_text(state, chunks[0].width as usize, chunks[0].height as usize)
+        }
+        TerminalFocus::EventTape => events_full_text(state),
+        TerminalFocus::Stats => stats_full_text(state),
+        TerminalFocus::Lineups => lineups_full_text(state),
+        TerminalFocus::Prediction => prediction_detail_text(state),
+        TerminalFocus::Console => console_full_text(state),
+    };
+
+    let (content, line_count) = if matches!(focus, TerminalFocus::Pitch) {
+        let count = text.lines().count().max(1);
+        (Paragraph::new(text), count)
+    } else {
+        let count = wrapped_line_count(&text, chunks[0].width);
+        (
+            Paragraph::new(text).wrap(Wrap { trim: false }),
+            count.max(1),
+        )
+    };
+    let max_scroll = line_count
+        .saturating_sub(chunks[0].height as usize)
+        .min(u16::MAX as usize) as u16;
+    let scroll = state.terminal_detail_scroll.min(max_scroll);
+    let content = content.scroll((scroll, 0));
+    frame.render_widget(content, chunks[0]);
+
+    let footer = Paragraph::new("Arrows scroll | Enter/Esc/b close")
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
+}
+
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let width = width.max(1) as usize;
+    text.lines()
+        .map(|line| {
+            let len = line.chars().count();
+            let chunks = (len + width - 1) / width;
+            chunks.max(1)
+        })
+        .sum()
+}
+
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let popup_area = centered_rect(60, 60, area);
     frame.render_widget(Clear, popup_area);
@@ -2937,6 +3251,11 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "Pulse:",
         "  j/k or ↑/↓   Move/scroll",
         "  s            Cycle sort mode",
+        "",
+        "Terminal:",
+        "  Tab          Cycle focus",
+        "  Enter        Open focused detail",
+        "  Arrows       Scroll detail view",
         "",
         "Analysis/Squad:",
         "  Enter        Open squad / player detail",
