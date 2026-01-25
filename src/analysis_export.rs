@@ -5,8 +5,7 @@ use rust_xlsxwriter::{Workbook, Worksheet};
 
 use crate::analysis_fetch;
 use crate::state::{
-    LeagueMode,
-    PlayerCareerEntry, PlayerCareerSection, PlayerDetail, PlayerMatchStat,
+    LeagueMode, PlayerCareerEntry, PlayerCareerSection, PlayerDetail, PlayerMatchStat,
     PlayerSeasonTournamentStat, PlayerStatItem, PlayerTraitGroup, PlayerTrophyEntry, SquadPlayer,
     TeamAnalysis,
 };
@@ -36,6 +35,7 @@ pub fn export_analysis_with_progress(
 ) -> Result<ExportReport> {
     let analysis = match mode {
         LeagueMode::PremierLeague => analysis_fetch::fetch_premier_league_team_analysis(),
+        LeagueMode::LaLiga => analysis_fetch::fetch_la_liga_team_analysis(),
         LeagueMode::WorldCup => analysis_fetch::fetch_worldcup_team_analysis(),
     };
     let mut errors = analysis.errors;
@@ -273,7 +273,6 @@ pub fn export_analysis_with_progress(
         errors,
     })
 }
-
 
 fn team_row(team: &TeamAnalysis) -> Vec<String> {
     vec![

@@ -12,7 +12,7 @@ use crate::state::{
 
 const CACHE_DIR: &str = "wc26_terminal";
 const CACHE_FILE: &str = "cache.json";
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CacheFile {
@@ -48,25 +48,26 @@ pub fn load_into_state(state: &mut AppState) {
     let Ok(raw) = fs::read_to_string(&path) else {
         return;
     };
-    let Ok(mut cache) = serde_json::from_str::<CacheFile>(&raw) else {
+    let Ok(cache) = serde_json::from_str::<CacheFile>(&raw) else {
         return;
     };
     if cache.version != CACHE_VERSION {
         return;
     }
-    let key = league_key(state.league_mode).to_string();
-    let Some(mut league) = cache.leagues.remove(&key) else {
+
+    let key = league_key(state.league_mode);
+    let Some(league) = cache.leagues.get(key) else {
         return;
     };
 
     // Load analysis (so Rankings can compute without refetching teams).
     if !league.analysis.is_empty() {
-        state.analysis = std::mem::take(&mut league.analysis);
+        state.analysis = league.analysis.clone();
         state.analysis_loading = false;
         state.analysis_selected = 0;
     }
-    state.rankings_cache_squads = std::mem::take(&mut league.squads);
-    state.rankings_cache_players = std::mem::take(&mut league.players);
+    state.rankings_cache_squads = league.squads.clone();
+    state.rankings_cache_players = league.players.clone();
     state.rankings_cache_squads_at = league
         .squads_fetched_at
         .iter()
@@ -77,14 +78,32 @@ pub fn load_into_state(state: &mut AppState) {
         .iter()
         .filter_map(|(id, ts)| system_time_from_secs(*ts).map(|t| (*id, t)))
         .collect();
-    state.rankings = std::mem::take(&mut league.rankings);
+    state.rankings = league.rankings.clone();
     state.rankings_dirty = state.rankings.is_empty();
 
-    state.upcoming = std::mem::take(&mut league.upcoming);
-    state.upcoming_cached_at = league
-        .upcoming_fetched_at
-        .and_then(system_time_from_secs);
-    state.match_detail = std::mem::take(&mut league.match_details);
+    state.combined_player_cache.clear();
+    state
+        .combined_player_cache
+        .extend(league.players.clone().into_iter());
+    if matches!(
+        state.league_mode,
+        LeagueMode::PremierLeague | LeagueMode::LaLiga
+    ) {
+        let other_key = match state.league_mode {
+            LeagueMode::PremierLeague => "laliga",
+            LeagueMode::LaLiga => "premier_league",
+            LeagueMode::WorldCup => "",
+        };
+        if let Some(other) = cache.leagues.get(other_key) {
+            state
+                .combined_player_cache
+                .extend(other.players.clone().into_iter());
+        }
+    }
+
+    state.upcoming = league.upcoming.clone();
+    state.upcoming_cached_at = league.upcoming_fetched_at.and_then(system_time_from_secs);
+    state.match_detail = league.match_details.clone();
     state.match_detail_cached_at = league
         .match_detail_fetched_at
         .iter()
@@ -162,7 +181,12 @@ fn cache_path() -> Option<PathBuf> {
     if home.trim().is_empty() {
         return None;
     }
-    Some(PathBuf::from(home).join(".cache").join(CACHE_DIR).join(CACHE_FILE))
+    Some(
+        PathBuf::from(home)
+            .join(".cache")
+            .join(CACHE_DIR)
+            .join(CACHE_FILE),
+    )
 }
 
 fn system_time_to_secs(time: SystemTime) -> Option<u64> {
@@ -176,6 +200,7 @@ fn system_time_from_secs(secs: u64) -> Option<SystemTime> {
 fn league_key(mode: LeagueMode) -> &'static str {
     match mode {
         LeagueMode::PremierLeague => "premier_league",
+        LeagueMode::LaLiga => "laliga",
         LeagueMode::WorldCup => "worldcup",
     }
 }

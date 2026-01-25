@@ -31,6 +31,7 @@ pub const PLACEHOLDER_AWAY: &str = "OMEGA";
 pub fn placeholder_match_summary(mode: LeagueMode) -> MatchSummary {
     let league_name = match mode {
         LeagueMode::PremierLeague => "Premier League",
+        LeagueMode::LaLiga => "La Liga",
         LeagueMode::WorldCup => "World Cup",
     };
     MatchSummary {
@@ -243,6 +244,7 @@ pub enum PulseView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LeagueMode {
     PremierLeague,
+    LaLiga,
     WorldCup,
 }
 
@@ -264,6 +266,7 @@ pub struct AppState {
     pub pulse_view: PulseView,
     pub selected: usize,
     pub league_pl_ids: Vec<u32>,
+    pub league_ll_ids: Vec<u32>,
     pub league_wc_ids: Vec<u32>,
     pub matches: Vec<MatchSummary>,
     pub upcoming: Vec<UpcomingMatch>,
@@ -291,6 +294,7 @@ pub struct AppState {
     pub rankings_cache_players: HashMap<u32, PlayerDetail>,
     pub rankings_cache_squads_at: HashMap<u32, SystemTime>,
     pub rankings_cache_players_at: HashMap<u32, SystemTime>,
+    pub combined_player_cache: HashMap<u32, PlayerDetail>,
     pub rankings_dirty: bool,
     pub rankings_fetched_at: Option<SystemTime>,
     pub win_prob_history: HashMap<String, Vec<f32>>,
@@ -309,6 +313,7 @@ pub struct AppState {
     pub player_detail_scroll: u16,
     pub player_detail_section: usize,
     pub player_detail_section_scrolls: [u16; PLAYER_DETAIL_SECTIONS],
+    pub player_detail_expanded: bool,
     pub export: ExportState,
     pub terminal_focus: TerminalFocus,
     pub terminal_detail: Option<TerminalFocus>,
@@ -322,6 +327,7 @@ impl AppState {
 
     pub fn new() -> Self {
         let league_pl_ids = parse_ids_env("APP_LEAGUE_PREMIER_IDS");
+        let league_ll_ids = parse_ids_env("APP_LEAGUE_LALIGA_IDS");
         let league_wc_ids = parse_ids_env("APP_LEAGUE_WORLDCUP_IDS");
         Self {
             screen: Screen::Pulse,
@@ -330,6 +336,7 @@ impl AppState {
             pulse_view: PulseView::Live,
             selected: 0,
             league_pl_ids,
+            league_ll_ids,
             league_wc_ids,
             matches: Vec::new(),
             upcoming: Vec::new(),
@@ -357,6 +364,7 @@ impl AppState {
             rankings_cache_players: HashMap::new(),
             rankings_cache_squads_at: HashMap::new(),
             rankings_cache_players_at: HashMap::new(),
+            combined_player_cache: HashMap::new(),
             rankings_dirty: false,
             rankings_fetched_at: None,
             win_prob_history: HashMap::new(),
@@ -375,6 +383,7 @@ impl AppState {
             player_detail_scroll: 0,
             player_detail_section: 0,
             player_detail_section_scrolls: [0; PLAYER_DETAIL_SECTIONS],
+            player_detail_expanded: false,
             export: ExportState::new(),
             terminal_focus: TerminalFocus::MatchList,
             terminal_detail: None,
@@ -412,7 +421,8 @@ impl AppState {
 
     pub fn cycle_league_mode(&mut self) {
         self.league_mode = match self.league_mode {
-            LeagueMode::PremierLeague => LeagueMode::WorldCup,
+            LeagueMode::PremierLeague => LeagueMode::LaLiga,
+            LeagueMode::LaLiga => LeagueMode::WorldCup,
             LeagueMode::WorldCup => LeagueMode::PremierLeague,
         };
         self.selected = 0;
@@ -436,6 +446,7 @@ impl AppState {
         self.rankings_cache_players.clear();
         self.rankings_cache_squads_at.clear();
         self.rankings_cache_players_at.clear();
+        self.combined_player_cache.clear();
         self.rankings_dirty = false;
         self.rankings_fetched_at = None;
         self.win_prob_history.clear();
@@ -459,6 +470,7 @@ impl AppState {
         self.player_detail_scroll = 0;
         self.player_detail_section = 0;
         self.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+        self.player_detail_expanded = false;
         self.terminal_focus = TerminalFocus::MatchList;
         self.terminal_detail = None;
         self.terminal_detail_scroll = 0;
@@ -670,6 +682,11 @@ impl AppState {
                 &self.league_pl_ids,
                 &["premier league", "premier", "epl"],
             ),
+            LeagueMode::LaLiga => matches_league(
+                m,
+                &self.league_ll_ids,
+                &["la liga", "laliga", "primera division"],
+            ),
             LeagueMode::WorldCup => {
                 matches_league(m, &self.league_wc_ids, &["world cup", "worldcup"])
             }
@@ -682,6 +699,11 @@ impl AppState {
                 m,
                 &self.league_pl_ids,
                 &["premier league", "premier", "epl"],
+            ),
+            LeagueMode::LaLiga => matches_league_upcoming(
+                m,
+                &self.league_ll_ids,
+                &["la liga", "laliga", "primera division"],
             ),
             LeagueMode::WorldCup => {
                 matches_league_upcoming(m, &self.league_wc_ids, &["world cup", "worldcup"])
@@ -775,9 +797,19 @@ impl AppState {
     }
 
     pub fn rankings_filtered(&self) -> Vec<&RoleRankingEntry> {
+        let league_team_ids: std::collections::HashSet<u32> =
+            self.analysis.iter().map(|t| t.id).collect();
+        let filter_by_team = !league_team_ids.is_empty();
         self.rankings
             .iter()
             .filter(|row| row.role == self.rankings_role)
+            .filter(|row| {
+                if filter_by_team {
+                    league_team_ids.contains(&row.team_id)
+                } else {
+                    true
+                }
+            })
             .collect()
     }
 
@@ -1077,12 +1109,20 @@ pub struct PlayerSeasonPerformanceItem {
     pub title: String,
     pub total: String,
     pub per90: Option<String>,
+    #[serde(default)]
+    pub percentile_rank: Option<f64>,
+    #[serde(default)]
+    pub percentile_rank_per90: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerStatItem {
     pub title: String,
     pub value: String,
+    #[serde(default)]
+    pub percentile_rank: Option<f64>,
+    #[serde(default)]
+    pub percentile_rank_per90: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1352,6 +1392,9 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         }
         Delta::CachePlayerDetail(detail) => {
             let detail_id = detail.id;
+            state
+                .combined_player_cache
+                .insert(detail_id, detail.clone());
             state.rankings_cache_players.insert(detail_id, detail);
             state
                 .rankings_cache_players_at
@@ -1538,6 +1581,7 @@ fn matches_league_upcoming(m: &UpcomingMatch, ids: &[u32], keywords: &[&str]) ->
 pub fn league_label(mode: LeagueMode) -> &'static str {
     match mode {
         LeagueMode::PremierLeague => "Premier League",
+        LeagueMode::LaLiga => "La Liga",
         LeagueMode::WorldCup => "World Cup",
     }
 }

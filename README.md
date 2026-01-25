@@ -90,7 +90,7 @@ The application provides a terminal-based interface with multiple views:
 2. Press `1` to view the Pulse screen with live matches
 3. Use `j/k` or arrow keys to navigate through matches
 4. Press `Enter` or `d` to view detailed match information
-5. Press `l` to switch between Premier League and World Cup leagues
+5. Press `l` to switch between Premier League, La Liga, and World Cup leagues
 6. Press `u` to view upcoming matches
 7. Press `?` anytime to see available keyboard shortcuts
 8. Press `q` to quit
@@ -101,7 +101,7 @@ Copy `.env.example` to `.env.local` and edit as needed.
 
 ### Key Configuration Variables
 
-- `APP_LEAGUE_PREMIER_IDS` / `APP_LEAGUE_WORLDCUP_IDS`: League filters (FotMob IDs: 47 = PL, 77 = World Cup).
+- `APP_LEAGUE_PREMIER_IDS` / `APP_LEAGUE_LALIGA_IDS` / `APP_LEAGUE_WORLDCUP_IDS`: League filters (FotMob IDs: 47 = PL, 87 = La Liga, 77 = World Cup).
 - `PULSE_POLL_SECS`: Live match refresh interval (seconds).
 - `PULSE_DATE`: Optional matchday override (YYYYMMDD). Empty uses FotMob default (today).
 - `UPCOMING_SOURCE`: `fotmob` or `auto` (same behavior right now).

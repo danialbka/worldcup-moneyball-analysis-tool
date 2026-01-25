@@ -14,6 +14,7 @@ use crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
 
 mod analysis_export;
@@ -27,9 +28,9 @@ mod state;
 mod upcoming_fetch;
 
 use crate::state::{
-    AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PulseView, Screen,
-    PLACEHOLDER_MATCH_ID, TerminalFocus, apply_delta, confed_label, league_label, metric_label,
-    placeholder_match_detail, placeholder_match_summary, role_label,
+    AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PlayerStatItem, PulseView,
+    RoleCategory, Screen, PLACEHOLDER_MATCH_ID, TerminalFocus, apply_delta, confed_label,
+    league_label, metric_label, placeholder_match_detail, placeholder_match_summary, role_label,
 };
 
 struct App {
@@ -47,6 +48,7 @@ struct App {
     prefetch_players_limit: usize,
     auto_warm_mode: AutoWarmMode,
     auto_warm_pending: bool,
+    detail_dist_cache: Option<DetailDistCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +111,7 @@ impl App {
             prefetch_players_limit,
             auto_warm_pending: auto_warm_mode != AutoWarmMode::Off,
             auto_warm_mode,
+            detail_dist_cache: None,
         }
     }
 
@@ -172,12 +175,7 @@ impl App {
                     } else {
                         // Rankings: open player detail directly.
                         let entry = {
-                            let mut rows: Vec<&crate::state::RoleRankingEntry> = self
-                                .state
-                                .rankings
-                                .iter()
-                                .filter(|r| r.role == self.state.rankings_role)
-                                .collect();
+                            let mut rows = self.state.rankings_filtered();
                             match self.state.rankings_metric {
                                 crate::state::RankMetric::Attacking => {
                                     rows.sort_by(|a, b| b.attack_score.total_cmp(&a.attack_score))
@@ -195,6 +193,8 @@ impl App {
                             self.state.player_detail_scroll = 0;
                             self.state.player_detail_section = 0;
                             self.state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+                            self.state.player_detail_expanded = false;
+                            self.detail_dist_cache = None;
                             self.state.player_last_id = Some(entry.player_id);
                             self.state.player_last_name = Some(entry.player_name.clone());
 
@@ -217,6 +217,8 @@ impl App {
                         self.state.player_detail_scroll = 0;
                         self.state.player_detail_section = 0;
                         self.state.player_detail_section_scrolls = [0; PLAYER_DETAIL_SECTIONS];
+                        self.state.player_detail_expanded = false;
+                        self.detail_dist_cache = None;
                         let cached_detail = self.state.player_detail.as_ref();
                         let cached = cached_detail
                             .map(|detail| detail.id == player.id)
@@ -233,7 +235,10 @@ impl App {
                     self.state.terminal_detail = Some(self.state.terminal_focus);
                     self.state.terminal_detail_scroll = 0;
                 }
-                _ => {}
+                Screen::PlayerDetail => {
+                    self.state.player_detail_expanded = !self.state.player_detail_expanded;
+                    self.state.player_detail_scroll = 0;
+                }
             },
             KeyCode::Char('b') | KeyCode::Esc => {
                 self.state.screen = match self.state.screen {
@@ -257,13 +262,10 @@ impl App {
                         .state
                         .player_detail
                         .as_ref()
-                        .map(|detail| {
-                            player_detail_section_max_scroll(
-                                detail,
-                                self.state.player_detail_section,
-                            )
-                        })
-                        .unwrap_or(0);
+                    .map(|detail| {
+                        player_detail_section_max_scroll(detail, self.state.player_detail_section)
+                    })
+                    .unwrap_or(0);
                     self.state.scroll_player_detail_down(max_scroll);
                 } else {
                     self.state.select_next();
@@ -296,6 +298,7 @@ impl App {
                 // Persist current league cache before switching away.
                 crate::persist::save_from_state(&self.state);
                 self.state.cycle_league_mode();
+                self.detail_dist_cache = None;
                 if self.auto_warm_mode != AutoWarmMode::Off {
                     self.auto_warm_pending = true;
                 }
@@ -371,6 +374,7 @@ impl App {
                         self.state.player_last_id,
                         self.state.player_last_name.clone(),
                     ) {
+                        self.detail_dist_cache = None;
                         self.request_player_detail(player_id, player_name, true);
                     }
                 }
@@ -654,6 +658,8 @@ impl App {
         self.state.rankings_cache_players.clear();
         self.state.rankings_cache_squads_at.clear();
         self.state.rankings_cache_players_at.clear();
+        self.state.combined_player_cache.clear();
+        self.detail_dist_cache = None;
         self.state.rankings.clear();
         self.state.rankings_selected = 0;
         self.state.rankings_dirty = true;
@@ -827,6 +833,7 @@ impl App {
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
         let (mode, prefix) = match self.state.league_mode {
             LeagueMode::PremierLeague => (LeagueMode::PremierLeague, "premier_league"),
+            LeagueMode::LaLiga => (LeagueMode::LaLiga, "laliga"),
             LeagueMode::WorldCup => (LeagueMode::WorldCup, "worldcup"),
         };
         let path = format!("{prefix}_analysis_{stamp}.xlsx");
@@ -1049,7 +1056,7 @@ fn run_app<B: Backend>(
     }
 }
 
-fn ui(frame: &mut Frame, app: &App) {
+fn ui(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1068,7 +1075,7 @@ fn ui(frame: &mut Frame, app: &App) {
         Screen::Terminal { .. } => render_terminal(frame, chunks[1], &app.state),
         Screen::Analysis => render_analysis(frame, chunks[1], &app.state),
         Screen::Squad => render_squad(frame, chunks[1], &app.state),
-        Screen::PlayerDetail => render_player_detail(frame, chunks[1], &app.state),
+        Screen::PlayerDetail => render_player_detail(frame, chunks[1], app),
     }
 
     let footer =
@@ -1632,11 +1639,7 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let mut rows: Vec<&crate::state::RoleRankingEntry> = state
-        .rankings
-        .iter()
-        .filter(|r| r.role == state.rankings_role)
-        .collect();
+    let mut rows: Vec<&crate::state::RoleRankingEntry> = state.rankings_filtered();
 
     match state.rankings_metric {
         crate::state::RankMetric::Attacking => {
@@ -1833,7 +1836,8 @@ fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
     render_cell_text(frame, cols[12], "Value", style);
 }
 
-fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    let state = &app.state;
     let block = Block::default()
         .title("Player Detail")
         .borders(Borders::ALL);
@@ -1864,6 +1868,25 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    let player_id = state.player_last_id;
+    let cache_needs_rebuild = app
+        .detail_dist_cache
+        .as_ref()
+        .map(|cache| cache.player_id != player_id)
+        .unwrap_or(true);
+    if cache_needs_rebuild {
+        let dist = build_stat_distributions(state);
+        app.detail_dist_cache = Some(DetailDistCache { player_id, dist });
+    }
+    let dist = match app.detail_dist_cache.as_ref() {
+        Some(cache) => &cache.dist,
+        None => {
+            let dist = build_stat_distributions(state);
+            app.detail_dist_cache = Some(DetailDistCache { player_id, dist });
+            &app.detail_dist_cache.as_ref().expect("detail dist").dist
+        }
+    };
+
     let info_text = player_info_text(detail);
     let league_text = player_league_stats_text(detail);
     let top_text = player_top_stats_text(detail);
@@ -1883,6 +1906,72 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let career_lines = text_line_count(&career_text);
     let trophies_lines = text_line_count(&trophies_text);
     let recent_lines = text_line_count(&recent_text);
+
+    let info_text = Text::from(info_text);
+    let league_text = player_league_stats_text_styled(detail, &dist);
+    let top_text = player_top_stats_text_styled(detail, &dist);
+    let traits_text = Text::from(traits_text);
+    let other_text = player_season_performance_text_styled(detail, &dist);
+    let season_text = player_season_breakdown_text_styled(detail, &dist);
+    let career_text = Text::from(career_text);
+    let trophies_text = Text::from(trophies_text);
+    let recent_text = player_recent_matches_text_styled(detail, &dist);
+
+    if state.player_detail_expanded {
+        let (title, body, lines, scroll) = match state.player_detail_section {
+            0 => ("Player Info", info_text.clone(), info_lines, state.player_detail_section_scrolls[0]),
+            1 => (
+                "All Competitions",
+                league_text.clone(),
+                league_lines,
+                state.player_detail_section_scrolls[1],
+            ),
+            2 => (
+                "Top Stats (All Competitions)",
+                top_text.clone(),
+                top_lines,
+                state.player_detail_section_scrolls[2],
+            ),
+            3 => (
+                "Player Traits",
+                traits_text.clone(),
+                traits_lines,
+                state.player_detail_section_scrolls[3],
+            ),
+            4 => (
+                "Season Performance",
+                other_text.clone(),
+                other_lines,
+                state.player_detail_section_scrolls[4],
+            ),
+            5 => (
+                "Season Breakdown",
+                season_text.clone(),
+                season_lines,
+                state.player_detail_section_scrolls[5],
+            ),
+            6 => (
+                "Career Summary",
+                career_text.clone(),
+                career_lines,
+                state.player_detail_section_scrolls[6],
+            ),
+            7 => (
+                "Trophies",
+                trophies_text.clone(),
+                trophies_lines,
+                state.player_detail_section_scrolls[7],
+            ),
+            _ => (
+                "Match Stats (Recent)",
+                recent_text.clone(),
+                recent_lines,
+                state.player_detail_section_scrolls[8],
+            ),
+        };
+        render_detail_section(frame, inner, title, body, scroll, true, lines);
+        return;
+    }
 
     let left = Layout::default()
         .direction(Direction::Horizontal)
@@ -1914,7 +2003,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         left_sections[0],
         "Player Info",
-        &info_text,
+        info_text,
         state.player_detail_section_scrolls[0],
         state.player_detail_section == 0,
         info_lines,
@@ -1923,7 +2012,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         left_sections[1],
         "All Competitions",
-        &league_text,
+        league_text,
         state.player_detail_section_scrolls[1],
         state.player_detail_section == 1,
         league_lines,
@@ -1932,7 +2021,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         left_sections[2],
         "Top Stats (All Competitions)",
-        &top_text,
+        top_text,
         state.player_detail_section_scrolls[2],
         state.player_detail_section == 2,
         top_lines,
@@ -1941,7 +2030,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         left_sections[3],
         "Player Traits",
-        &traits_text,
+        traits_text,
         state.player_detail_section_scrolls[3],
         state.player_detail_section == 3,
         traits_lines,
@@ -1950,7 +2039,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         left_sections[4],
         "Season Performance",
-        &other_text,
+        other_text,
         state.player_detail_section_scrolls[4],
         state.player_detail_section == 4,
         other_lines,
@@ -1960,7 +2049,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         right_sections[0],
         "Season Breakdown",
-        &season_text,
+        season_text,
         state.player_detail_section_scrolls[5],
         state.player_detail_section == 5,
         season_lines,
@@ -1969,7 +2058,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         right_sections[1],
         "Career Summary",
-        &career_text,
+        career_text,
         state.player_detail_section_scrolls[6],
         state.player_detail_section == 6,
         career_lines,
@@ -1978,7 +2067,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         right_sections[2],
         "Trophies",
-        &trophies_text,
+        trophies_text,
         state.player_detail_section_scrolls[7],
         state.player_detail_section == 7,
         trophies_lines,
@@ -1987,7 +2076,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         frame,
         right_sections[3],
         "Match Stats (Recent)",
-        &recent_text,
+        recent_text,
         state.player_detail_section_scrolls[8],
         state.player_detail_section == 8,
         recent_lines,
@@ -2031,6 +2120,254 @@ fn player_detail_text(detail: &PlayerDetail) -> String {
     lines.push(String::new());
     lines.push(player_recent_matches_text(detail));
     lines.join("\n")
+}
+
+struct StatDistributions {
+    by_title_role: HashMap<(RoleCategory, String), Vec<f64>>,
+    by_title: HashMap<String, Vec<f64>>,
+    ratings_role: HashMap<RoleCategory, Vec<f64>>,
+    ratings: Vec<f64>,
+}
+
+struct DetailDistCache {
+    player_id: Option<u32>,
+    dist: StatDistributions,
+}
+
+fn build_stat_distributions(state: &AppState) -> StatDistributions {
+    const MIN_MINUTES: f64 = 450.0;
+    let mut by_title: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut by_title_role: HashMap<(RoleCategory, String), Vec<f64>> = HashMap::new();
+    let mut ratings: Vec<f64> = Vec::new();
+    let mut ratings_role: HashMap<RoleCategory, Vec<f64>> = HashMap::new();
+
+    let cache = if state.combined_player_cache.is_empty() {
+        &state.rankings_cache_players
+    } else {
+        &state.combined_player_cache
+    };
+
+    for detail in cache.values() {
+        let role = role_from_detail(detail);
+        let minutes = detail_minutes(detail);
+        collect_stat_items(&mut by_title, &detail.all_competitions);
+        collect_stat_items_role(&mut by_title_role, role, &detail.all_competitions);
+        if let Some(league) = detail.main_league.as_ref() {
+            collect_stat_items(&mut by_title, &league.stats);
+            collect_stat_items_role(&mut by_title_role, role, &league.stats);
+        }
+        collect_stat_items(&mut by_title, &detail.top_stats);
+        collect_stat_items_role(&mut by_title_role, role, &detail.top_stats);
+
+        if minutes.map(|m| m >= MIN_MINUTES).unwrap_or(false) {
+            for group in &detail.season_performance {
+                for item in &group.items {
+                    let value = item.per90.as_deref().and_then(parse_stat_value);
+                    if let Some(v) = value {
+                        by_title
+                            .entry(normalize_stat_title(&item.title))
+                            .or_default()
+                            .push(v);
+                        if let Some(role) = role {
+                            by_title_role
+                                .entry((role, normalize_stat_title(&item.title)))
+                                .or_default()
+                                .push(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        for row in &detail.season_breakdown {
+            if let Some(v) = parse_stat_value(&row.rating) {
+                ratings.push(v);
+                if let Some(role) = role {
+                    ratings_role.entry(role).or_default().push(v);
+                }
+            }
+        }
+        for row in &detail.recent_matches {
+            if let Some(v) = row.rating.as_deref().and_then(parse_stat_value) {
+                ratings.push(v);
+                if let Some(role) = role {
+                    ratings_role.entry(role).or_default().push(v);
+                }
+            }
+        }
+    }
+
+    for values in by_title.values_mut() {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    for values in by_title_role.values_mut() {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    ratings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    for values in ratings_role.values_mut() {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    StatDistributions {
+        by_title_role,
+        by_title,
+        ratings_role,
+        ratings,
+    }
+}
+
+fn collect_stat_items(target: &mut HashMap<String, Vec<f64>>, items: &[PlayerStatItem]) {
+    for stat in items {
+        if let Some(v) = parse_stat_value(&stat.value) {
+            target
+                .entry(normalize_stat_title(&stat.title))
+                .or_default()
+                .push(v);
+        }
+    }
+}
+
+fn collect_stat_items_role(
+    target: &mut HashMap<(RoleCategory, String), Vec<f64>>,
+    role: Option<RoleCategory>,
+    items: &[PlayerStatItem],
+) {
+    let Some(role) = role else {
+        return;
+    };
+    for stat in items {
+        if let Some(v) = parse_stat_value(&stat.value) {
+            target
+                .entry((role, normalize_stat_title(&stat.title)))
+                .or_default()
+                .push(v);
+        }
+    }
+}
+
+fn role_from_detail(detail: &PlayerDetail) -> Option<RoleCategory> {
+    let text = detail
+        .position
+        .as_ref()
+        .or_else(|| detail.positions.first())
+        .map(|s| s.as_str())?;
+    role_from_text(text)
+}
+
+fn role_from_text(raw: &str) -> Option<RoleCategory> {
+    let s = raw.to_lowercase();
+    if s.contains("goalkeeper") || s.contains("keeper") || s == "gk" {
+        return Some(RoleCategory::Goalkeeper);
+    }
+    if s.contains("defender")
+        || s.contains("back")
+        || s.contains("centre-back")
+        || s.contains("center-back")
+    {
+        return Some(RoleCategory::Defender);
+    }
+    if s.contains("midfield") || s.contains("midfielder") {
+        return Some(RoleCategory::Midfielder);
+    }
+    if s.contains("attacker")
+        || s.contains("forward")
+        || s.contains("striker")
+        || s.contains("wing")
+    {
+        return Some(RoleCategory::Attacker);
+    }
+    None
+}
+
+fn detail_minutes(detail: &PlayerDetail) -> Option<f64> {
+    let league = detail.main_league.as_ref()?;
+    let stat = league
+        .stats
+        .iter()
+        .find(|stat| stat.title.to_lowercase().contains("minutes"))?;
+    parse_stat_value(&stat.value)
+}
+
+fn normalize_stat_title(title: &str) -> String {
+    title.trim().to_lowercase()
+}
+
+fn parse_stat_value(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return None;
+    }
+    let filtered: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    filtered.parse::<f64>().ok()
+}
+
+fn percentile(values: &[f64], value: f64) -> Option<f64> {
+    if values.is_empty() || !value.is_finite() {
+        return None;
+    }
+    let idx = values.partition_point(|v| *v <= value);
+    Some(idx as f64 / values.len() as f64 * 100.0)
+}
+
+fn color_for_percentile(percentile: f64) -> Color {
+    if percentile >= 80.0 {
+        Color::LightGreen
+    } else if percentile >= 60.0 {
+        Color::Green
+    } else if percentile >= 40.0 {
+        Color::Yellow
+    } else if percentile >= 20.0 {
+        Color::LightRed
+    } else {
+        Color::Red
+    }
+}
+
+fn style_from_percentile(percentile: Option<f64>) -> Option<Style> {
+    percentile.map(|p| Style::default().fg(color_for_percentile(p)))
+}
+
+fn style_for_stat(
+    dist: &StatDistributions,
+    role: Option<RoleCategory>,
+    title: &str,
+    value: Option<f64>,
+) -> Style {
+    let Some(value) = value else {
+        return Style::default();
+    };
+    let key = normalize_stat_title(title);
+    let values = role
+        .and_then(|r| dist.by_title_role.get(&(r, key.clone())))
+        .or_else(|| dist.by_title.get(&key));
+    let Some(values) = values else {
+        return Style::default();
+    };
+    percentile(values, value)
+        .map(|p| Style::default().fg(color_for_percentile(p)))
+        .unwrap_or_default()
+}
+
+fn style_for_rating(
+    dist: &StatDistributions,
+    role: Option<RoleCategory>,
+    value: Option<f64>,
+) -> Style {
+    let Some(value) = value else {
+        return Style::default();
+    };
+    let values = role
+        .and_then(|r| dist.ratings_role.get(&r))
+        .unwrap_or(&dist.ratings);
+    percentile(values, value)
+        .map(|p| Style::default().fg(color_for_percentile(p)))
+        .unwrap_or_default()
 }
 
 fn player_info_text(detail: &PlayerDetail) -> String {
@@ -2107,6 +2444,57 @@ fn player_league_stats_text(detail: &PlayerDetail) -> String {
     "No league stats available".to_string()
 }
 
+fn player_league_stats_text_styled(
+    detail: &PlayerDetail,
+    dist: &StatDistributions,
+) -> Text<'static> {
+    let role = role_from_detail(detail);
+    let mut lines: Vec<Line> = Vec::new();
+    if !detail.all_competitions.is_empty() {
+        let season_label = detail.all_competitions_season.as_deref().unwrap_or("-");
+        lines.push(Line::from(format!(
+            "All competitions ({season_label})"
+        )));
+        for stat in detail.all_competitions.iter().take(8) {
+            let value = stat.value.clone();
+            let style = style_from_percentile(stat.percentile_rank_per90)
+                .or_else(|| style_from_percentile(stat.percentile_rank))
+                .unwrap_or_else(|| {
+                    style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
+                });
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", stat.title)),
+                Span::styled(value, style),
+            ]));
+        }
+    }
+    if let Some(league) = detail.main_league.as_ref() {
+        if !league.stats.is_empty() {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(format!("{} ({})", league.league_name, league.season)));
+            for stat in league.stats.iter().take(8) {
+                let value = stat.value.clone();
+                let style = style_from_percentile(stat.percentile_rank_per90)
+                    .or_else(|| style_from_percentile(stat.percentile_rank))
+                    .unwrap_or_else(|| {
+                        style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
+                    });
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {}: ", stat.title)),
+                    Span::styled(value, style),
+                ]));
+            }
+        }
+    }
+    if lines.is_empty() {
+        Text::from("No league stats available".to_string())
+    } else {
+        Text::from(lines)
+    }
+}
+
 fn player_top_stats_text(detail: &PlayerDetail) -> String {
     if detail.top_stats.is_empty() {
         return "No all-competitions top stats".to_string();
@@ -2116,6 +2504,30 @@ fn player_top_stats_text(detail: &PlayerDetail) -> String {
         lines.push(format!("{}: {}", stat.title, stat.value));
     }
     lines.join("\n")
+}
+
+fn player_top_stats_text_styled(
+    detail: &PlayerDetail,
+    dist: &StatDistributions,
+) -> Text<'static> {
+    if detail.top_stats.is_empty() {
+        return Text::from("No all-competitions top stats".to_string());
+    }
+    let role = role_from_detail(detail);
+    let mut lines = Vec::new();
+    for stat in detail.top_stats.iter().take(8) {
+        let value = stat.value.clone();
+        let style = style_from_percentile(stat.percentile_rank_per90)
+            .or_else(|| style_from_percentile(stat.percentile_rank))
+            .unwrap_or_else(|| {
+                style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
+            });
+        lines.push(Line::from(vec![
+            Span::raw(format!("{}: ", stat.title)),
+            Span::styled(value, style),
+        ]));
+    }
+    Text::from(lines)
 }
 
 fn player_traits_text(detail: &PlayerDetail) -> String {
@@ -2175,6 +2587,40 @@ fn player_season_performance_text(detail: &PlayerDetail) -> String {
     lines.join("\n")
 }
 
+fn player_season_performance_text_styled(
+    detail: &PlayerDetail,
+    dist: &StatDistributions,
+) -> Text<'static> {
+    if detail.season_performance.is_empty() {
+        return Text::from("No season performance stats".to_string());
+    }
+    let role = role_from_detail(detail);
+    let mut lines = Vec::new();
+    if let Some(minutes) = player_minutes_played(detail) {
+        lines.push(Line::from(format!("Minutes played: {minutes}")));
+    }
+    lines.push(Line::from("Total | Per 90"));
+    for group in &detail.season_performance {
+        lines.push(Line::from(format!("{}:", group.title)));
+        for item in &group.items {
+            let per90 = item.per90.as_deref().unwrap_or("-");
+            let style = style_from_percentile(item.percentile_rank_per90)
+                .or_else(|| style_from_percentile(item.percentile_rank))
+                .unwrap_or_else(|| {
+                    let color_value = item.per90.as_deref().and_then(parse_stat_value);
+                    style_for_stat(dist, role, &item.title, color_value)
+                });
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", item.title)),
+                Span::styled(item.total.clone(), style),
+                Span::raw(" | "),
+                Span::styled(per90.to_string(), style),
+            ]));
+        }
+    }
+    Text::from(lines)
+}
+
 fn player_season_breakdown_text(detail: &PlayerDetail) -> String {
     if detail.season_breakdown.is_empty() {
         return "No season breakdown".to_string();
@@ -2187,6 +2633,28 @@ fn player_season_breakdown_text(detail: &PlayerDetail) -> String {
         ));
     }
     lines.join("\n")
+}
+
+fn player_season_breakdown_text_styled(
+    detail: &PlayerDetail,
+    dist: &StatDistributions,
+) -> Text<'static> {
+    if detail.season_breakdown.is_empty() {
+        return Text::from("No season breakdown".to_string());
+    }
+    let role = role_from_detail(detail);
+    let mut lines = Vec::new();
+    for row in detail.season_breakdown.iter().take(10) {
+        let rating_style = style_for_rating(dist, role, parse_stat_value(&row.rating));
+        lines.push(Line::from(vec![
+            Span::raw(format!(
+                "{} {} | Apps {} G {} A {} | R ",
+                row.season, row.league, row.appearances, row.goals, row.assists
+            )),
+            Span::styled(row.rating.clone(), rating_style),
+        ]));
+    }
+    Text::from(lines)
 }
 
 fn player_career_text(detail: &PlayerDetail) -> String {
@@ -2261,11 +2729,39 @@ fn player_recent_matches_text(detail: &PlayerDetail) -> String {
     lines.join("\n")
 }
 
+fn player_recent_matches_text_styled(
+    detail: &PlayerDetail,
+    dist: &StatDistributions,
+) -> Text<'static> {
+    if detail.recent_matches.is_empty() {
+        return Text::from("No recent matches".to_string());
+    }
+    let role = role_from_detail(detail);
+    let mut lines = Vec::new();
+    for m in detail.recent_matches.iter().take(10) {
+        let date = shorten_date(&m.date);
+        let rating = m.rating.as_deref().unwrap_or("-");
+        let rating_style = style_for_rating(
+            dist,
+            role,
+            m.rating.as_deref().and_then(parse_stat_value),
+        );
+        lines.push(Line::from(vec![
+            Span::raw(format!(
+                "{date} vs {} | {} | G {} A {} | R ",
+                m.opponent, m.league, m.goals, m.assists
+            )),
+            Span::styled(rating.to_string(), rating_style),
+        ]));
+    }
+    Text::from(lines)
+}
+
 fn render_detail_section(
     frame: &mut Frame,
     area: Rect,
     title: &str,
-    body: &str,
+    body: Text,
     scroll: u16,
     active: bool,
     total_lines: u16,
@@ -3262,6 +3758,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "",
         "Player detail:",
         "  j/k or ↑/↓   Scroll",
+        "  Enter        Expand/collapse section",
     ]
     .join("\n");
 

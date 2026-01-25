@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::http_cache::fetch_json_cached;
 use crate::http_client::http_client;
@@ -361,6 +361,7 @@ pub fn fetch_worldcup_team_analysis() -> AnalysisFetch {
     AnalysisFetch { teams, errors }
 }
 
+#[allow(dead_code)]
 pub fn fetch_premier_league_team_analysis() -> AnalysisFetch {
     let mut errors = Vec::new();
     let client = match http_client() {
@@ -379,6 +380,66 @@ pub fn fetch_premier_league_team_analysis() -> AnalysisFetch {
         Err(err) => {
             errors.push(format!("premier league teams fetch failed: {err}"));
             fallback_premier_league_teams()
+        }
+    };
+
+    let results: Vec<(TeamAnalysis, Option<String>)> = with_fetch_pool(|| {
+        teams
+            .par_iter()
+            .map(|team| match fetch_team_overview(client, team.id) {
+                Ok(overview) => (
+                    TeamAnalysis {
+                        id: team.id,
+                        name: team.name.clone(),
+                        confed: Confederation::UEFA,
+                        host: false,
+                        fifa_rank: overview.fifa_rank,
+                        fifa_points: overview.fifa_points,
+                        fifa_updated: overview.fifa_updated,
+                    },
+                    None,
+                ),
+                Err(err) => (
+                    empty_club_analysis(team),
+                    Some(format!("{} fetch failed: {err}", team.name)),
+                ),
+            })
+            .collect()
+    });
+
+    let mut analysis = Vec::with_capacity(results.len());
+    for (team, err) in results {
+        if let Some(err) = err {
+            errors.push(err);
+        }
+        analysis.push(team);
+    }
+
+    AnalysisFetch {
+        teams: analysis,
+        errors,
+    }
+}
+
+#[allow(dead_code)]
+pub fn fetch_la_liga_team_analysis() -> AnalysisFetch {
+    let mut errors = Vec::new();
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(err) => {
+            errors.push(format!("analysis client build failed: {err}"));
+            return AnalysisFetch {
+                teams: Vec::new(),
+                errors,
+            };
+        }
+    };
+
+    let teams = match fetch_league_teams(&client, 87) {
+        Ok(teams) => teams,
+        Err(err) => {
+            errors.push(format!("la liga teams fetch failed: {err}"));
+            Vec::new()
         }
     };
 
@@ -519,6 +580,7 @@ struct TeamOverview {
     fifa_updated: Option<String>,
 }
 
+
 #[derive(Debug, Deserialize)]
 struct LeagueResponse {
     overview: Option<LeagueOverview>,
@@ -550,7 +612,54 @@ struct LeagueFixtureInfo {
 
 #[derive(Debug, Deserialize)]
 struct LeagueStats {
+    #[serde(default, deserialize_with = "deserialize_league_teams")]
     teams: Option<Vec<LeagueTeam>>,
+}
+
+fn deserialize_league_teams<'de, D>(deserializer: D) -> Result<Option<Vec<LeagueTeam>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(items) = value.as_array() else {
+        return Ok(None);
+    };
+
+    let mut teams = Vec::new();
+    for item in items {
+        if let Some(team) = parse_league_team(item) {
+            teams.push(team);
+            continue;
+        }
+        if let Some(team) = item.get("participant").and_then(parse_league_team) {
+            teams.push(team);
+        }
+        if let Some(top_three) = item.get("topThree").and_then(|v| v.as_array()) {
+            for top in top_three {
+                if let Some(team) = parse_league_team(top) {
+                    teams.push(team);
+                }
+            }
+        }
+    }
+
+    if teams.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(teams))
+    }
+}
+
+fn parse_league_team(value: &serde_json::Value) -> Option<LeagueTeam> {
+    let id = value
+        .get("teamId")
+        .and_then(|v| v.as_u64())
+        .or_else(|| value.get("id").and_then(|v| v.as_u64()))?;
+    let name = value.get("name").and_then(|v| v.as_str())?;
+    Some(LeagueTeam {
+        id: id as u32,
+        name: name.to_string(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -723,6 +832,8 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
             .map(|stat| PlayerStatItem {
                 title: stat.title,
                 value: value_to_string(&stat.value),
+                percentile_rank: None,
+                percentile_rank_per90: None,
             })
             .collect(),
     });
@@ -745,6 +856,8 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
             out.push(PlayerStatItem {
                 title: stat.title.clone(),
                 value: value_to_string(&stat.stat_value),
+                percentile_rank: stat.percentile_rank,
+                percentile_rank_per90: stat.percentile_rank_per90,
             });
         }
         out
@@ -762,6 +875,8 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
         top_stats.push(PlayerStatItem {
             title: stat.title,
             value: value_to_string(&stat.stat_value),
+            percentile_rank: stat.percentile_rank,
+            percentile_rank_per90: stat.percentile_rank_per90,
         });
     }
 
@@ -817,6 +932,8 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
                                 stat.stat_format.as_deref(),
                             ),
                             per90: format_per90(stat.per90, stat.stat_format.as_deref()),
+                            percentile_rank: stat.percentile_rank,
+                            percentile_rank_per90: stat.percentile_rank_per90,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -844,6 +961,8 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
                 .map(|stat| PlayerStatItem {
                     title: stat.title,
                     value: format_stat_value(&stat.stat_value, stat.stat_format.as_deref()),
+                    percentile_rank: stat.percentile_rank,
+                    percentile_rank_per90: stat.percentile_rank_per90,
                 })
                 .collect::<Vec<_>>();
             if items.is_empty() {
@@ -1419,6 +1538,10 @@ struct PlayerStatValueDetail {
     stat_format: Option<String>,
     #[serde(rename = "per90", default, deserialize_with = "float_or_none")]
     per90: Option<f64>,
+    #[serde(rename = "percentileRank", default, deserialize_with = "float_or_none")]
+    percentile_rank: Option<f64>,
+    #[serde(rename = "percentileRankPer90", default, deserialize_with = "float_or_none")]
+    percentile_rank_per90: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

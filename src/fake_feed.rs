@@ -191,6 +191,9 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             crate::state::LeagueMode::PremierLeague => {
                                 analysis_fetch::fetch_premier_league_team_analysis()
                             }
+                            crate::state::LeagueMode::LaLiga => {
+                                analysis_fetch::fetch_la_liga_team_analysis()
+                            }
                             crate::state::LeagueMode::WorldCup => {
                                 analysis_fetch::fetch_worldcup_team_analysis()
                             }
@@ -208,6 +211,9 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let analysis = match mode {
                                 crate::state::LeagueMode::PremierLeague => {
                                     analysis_fetch::fetch_premier_league_team_analysis()
+                                }
+                                crate::state::LeagueMode::LaLiga => {
+                                    analysis_fetch::fetch_la_liga_team_analysis()
                                 }
                                 crate::state::LeagueMode::WorldCup => {
                                     analysis_fetch::fetch_worldcup_team_analysis()
@@ -802,6 +808,24 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             kickoff: "2024-11-10T14:00".to_string(),
             home: "MCI".to_string(),
             away: "LIV".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-ll-1".to_string(),
+            league_id: Some(87),
+            league_name: "La Liga".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-09T20:00".to_string(),
+            home: "RMA".to_string(),
+            away: "BAR".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-ll-2".to_string(),
+            league_id: Some(87),
+            league_name: "La Liga".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-10T16:15".to_string(),
+            home: "ATM".to_string(),
+            away: "SEV".to_string(),
         },
         UpcomingMatch {
             id: "upc-wc-1".to_string(),
