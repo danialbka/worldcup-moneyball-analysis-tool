@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT};
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 const CACHE_VERSION: u32 = 1;
@@ -174,7 +174,12 @@ fn cache_path() -> Option<PathBuf> {
     if home.trim().is_empty() {
         return None;
     }
-    Some(PathBuf::from(home).join(".cache").join(CACHE_DIR).join(CACHE_FILE))
+    Some(
+        PathBuf::from(home)
+            .join(".cache")
+            .join(CACHE_DIR)
+            .join(CACHE_FILE),
+    )
 }
 
 fn prune_cache(cache: &mut HttpCacheFile) -> bool {
@@ -183,9 +188,9 @@ fn prune_cache(cache: &mut HttpCacheFile) -> bool {
     if ttl_secs > 0 {
         let now = system_time_to_secs(SystemTime::now()).unwrap_or_default();
         let before = cache.entries.len();
-        cache.entries.retain(|_, entry| {
-            now.saturating_sub(entry.fetched_at) <= ttl_secs
-        });
+        cache
+            .entries
+            .retain(|_, entry| now.saturating_sub(entry.fetched_at) <= ttl_secs);
         pruned |= cache.entries.len() != before;
     }
 
@@ -194,13 +199,7 @@ fn prune_cache(cache: &mut HttpCacheFile) -> bool {
         let mut entries: Vec<(String, u64, usize)> = cache
             .entries
             .iter()
-            .map(|(key, entry)| {
-                (
-                    key.clone(),
-                    entry.fetched_at,
-                    approx_entry_size(key, entry),
-                )
-            })
+            .map(|(key, entry)| (key.clone(), entry.fetched_at, approx_entry_size(key, entry)))
             .collect();
         let mut total_size: usize = entries.iter().map(|(_, _, size)| *size).sum();
         if total_size > max_bytes {

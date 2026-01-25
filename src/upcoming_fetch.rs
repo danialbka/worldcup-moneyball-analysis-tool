@@ -5,7 +5,8 @@ use serde_json::Value;
 use crate::http_cache::fetch_json_cached;
 use crate::http_client::http_client;
 use crate::state::{
-    Event, EventKind, LineupSide, MatchDetail, MatchLineups, PlayerSlot, StatRow, UpcomingMatch,
+    CommentaryEntry, Event, EventKind, LineupSide, MatchDetail, MatchLineups, PlayerSlot, StatRow,
+    UpcomingMatch,
 };
 
 const FOTMOB_MATCHES_URL: &str = "https://www.fotmob.com/api/data/matches";
@@ -39,7 +40,18 @@ pub fn fetch_match_details_from_fotmob(match_id: &str) -> Result<MatchDetail> {
 
     let url = format!("https://www.fotmob.com/api/data/matchDetails?matchId={match_id}");
     let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
-    parse_match_details_json(&body)
+    let root: Value = serde_json::from_str(body.trim()).context("invalid matchDetails json")?;
+    let mut detail = parse_match_details_value(&root);
+    match fetch_ltc_commentary(client, &root, match_id) {
+        Ok(commentary) => {
+            detail.commentary = commentary;
+            detail.commentary_error = None;
+        }
+        Err(err) => {
+            detail.commentary_error = Some(err.to_string());
+        }
+    }
+    Ok(detail)
 }
 
 fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
@@ -88,12 +100,18 @@ pub fn parse_match_details_json(raw: &str) -> Result<MatchDetail> {
     if trimmed.is_empty() || trimmed == "null" {
         return Ok(MatchDetail {
             events: Vec::new(),
+            commentary: Vec::new(),
+            commentary_error: None,
             lineups: None,
             stats: Vec::new(),
         });
     }
 
     let root: Value = serde_json::from_str(trimmed).context("invalid matchDetails json")?;
+    Ok(parse_match_details_value(&root))
+}
+
+fn parse_match_details_value(root: &Value) -> MatchDetail {
     let general = root.get("general").unwrap_or(&Value::Null);
     let home_name = pick_string(general, &["homeTeam", "home"]).unwrap_or_default();
     let away_name = pick_string(general, &["awayTeam", "away"]).unwrap_or_default();
@@ -110,11 +128,128 @@ pub fn parse_match_details_json(raw: &str) -> Result<MatchDetail> {
     );
     let stats = parse_stats(content.get("stats").and_then(|v| v.get("stats")));
 
-    Ok(MatchDetail {
+    MatchDetail {
         events,
+        commentary: Vec::new(),
+        commentary_error: None,
         lineups,
         stats,
-    })
+    }
+}
+
+fn fetch_ltc_commentary(client: &reqwest::blocking::Client, root: &Value, match_id: &str) -> Result<Vec<CommentaryEntry>> {
+    let content = root.get("content").unwrap_or(&Value::Null);
+    let liveticker = content.get("liveticker").unwrap_or(&Value::Null);
+    let langs = liveticker
+        .get("langs")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if langs.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let teams_value = liveticker.get("teams").and_then(|v| v.as_array()).cloned();
+    let mut teams = teams_value
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect::<Vec<_>>();
+    if teams.len() < 2 {
+        let general = root.get("general").unwrap_or(&Value::Null);
+        let home = pick_string(general, &["homeTeam", "home"]).unwrap_or_default();
+        let away = pick_string(general, &["awayTeam", "away"]).unwrap_or_default();
+        if !home.is_empty() && !away.is_empty() {
+            teams = vec![home, away];
+        }
+    }
+
+    let lang = pick_ltc_lang(langs).unwrap_or_else(|| "en".to_string());
+    let ltc_url = format!("http://data.fotmob.com/webcl/ltc/gsm/{match_id}_{lang}.json.gz");
+    let url = format!(
+        "https://www.fotmob.com/api/data/ltc?ltcUrl={}&teams={}",
+        url_encode(&ltc_url),
+        url_encode(&serde_json::to_string(&teams).unwrap_or_else(|_| "[]".to_string()))
+    );
+    let body = fetch_json_cached(client, &url, &[]).context("ltc request failed")?;
+    parse_ltc_json(&body, &teams)
+}
+
+fn pick_ltc_lang(langs: &str) -> Option<String> {
+    let list = langs
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if list.contains(&"en".to_string()) {
+        return Some("en".to_string());
+    }
+    if list.contains(&"en_gen".to_string()) {
+        return Some("en_gen".to_string());
+    }
+    list.first().cloned()
+}
+
+fn url_encode(raw: &str) -> String {
+    let mut out = String::new();
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+#[derive(Debug, Deserialize)]
+struct LtcResponse {
+    #[serde(default)]
+    events: Vec<LtcEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LtcEvent {
+    #[serde(default)]
+    text: String,
+    #[serde(rename = "teamEvent")]
+    team_event: Option<String>,
+    #[serde(default)]
+    elapsed: Option<i16>,
+    #[serde(rename = "elapsedPlus")]
+    elapsed_plus: Option<i16>,
+}
+
+fn parse_ltc_json(raw: &str, teams: &[String]) -> Result<Vec<CommentaryEntry>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(Vec::new());
+    }
+    let parsed: LtcResponse = match serde_json::from_str(trimmed) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let head = trimmed.chars().take(240).collect::<String>();
+            return Err(anyhow::anyhow!("invalid ltc json: {err}; head={head:?}"));
+        }
+    };
+    Ok(parsed
+        .events
+        .into_iter()
+        .map(|event| CommentaryEntry {
+            minute: event.elapsed.and_then(|val| u16::try_from(val).ok()),
+            minute_plus: event.elapsed_plus.and_then(|val| u16::try_from(val).ok()),
+            team: match event.team_event.as_deref() {
+                Some("home") => teams.get(0).cloned(),
+                Some("away") => teams.get(1).cloned(),
+                _ => None,
+            },
+            text: event.text,
+        })
+        .collect())
 }
 
 pub fn parse_fotmob_matches_json(raw: &str) -> Result<Vec<FotmobMatchRow>> {

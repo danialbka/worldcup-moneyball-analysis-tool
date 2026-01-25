@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::state::{player_detail_is_stub, PlayerDetail, RoleCategory, RoleRankingEntry, SquadPlayer, TeamAnalysis};
+use crate::state::{
+    PlayerDetail, RoleCategory, RoleRankingEntry, SquadPlayer, TeamAnalysis, player_detail_is_stub,
+};
 
 /// Build role rankings from cached squads + cached player details.
 /// This is fast and avoids re-fetching network data.
@@ -9,7 +11,8 @@ pub fn compute_role_rankings_from_cache(
     squads: &HashMap<u32, Vec<SquadPlayer>>,
     players: &HashMap<u32, PlayerDetail>,
 ) -> Vec<RoleRankingEntry> {
-    let team_name_map: HashMap<u32, String> = teams.iter().map(|t| (t.id, t.name.clone())).collect();
+    let team_name_map: HashMap<u32, String> =
+        teams.iter().map(|t| (t.id, t.name.clone())).collect();
     let mut features: Vec<PlayerFeatures> = Vec::new();
     let mut capacity = 0usize;
     for team in teams {
@@ -22,9 +25,13 @@ pub fn compute_role_rankings_from_cache(
     }
 
     for team in teams {
-        let Some(team_squad) = squads.get(&team.id) else { continue };
+        let Some(team_squad) = squads.get(&team.id) else {
+            continue;
+        };
         for sp in team_squad {
-            let Some(detail) = players.get(&sp.id) else { continue };
+            let Some(detail) = players.get(&sp.id) else {
+                continue;
+            };
             if player_detail_is_stub(detail) {
                 continue;
             }
@@ -111,13 +118,21 @@ fn role_category_from_text(raw: &str) -> Option<RoleCategory> {
     if s.contains("goalkeeper") || s.contains("keeper") || s == "gk" {
         return Some(RoleCategory::Goalkeeper);
     }
-    if s.contains("defender") || s.contains("back") || s.contains("centre-back") || s.contains("center-back") {
+    if s.contains("defender")
+        || s.contains("back")
+        || s.contains("centre-back")
+        || s.contains("center-back")
+    {
         return Some(RoleCategory::Defender);
     }
     if s.contains("midfield") || s.contains("midfielder") {
         return Some(RoleCategory::Midfielder);
     }
-    if s.contains("attacker") || s.contains("forward") || s.contains("striker") || s.contains("wing") {
+    if s.contains("attacker")
+        || s.contains("forward")
+        || s.contains("striker")
+        || s.contains("wing")
+    {
         return Some(RoleCategory::Attacker);
     }
     // FotMob sometimes uses short group titles like "Midfielders" etc; above handles most.
@@ -148,40 +163,178 @@ fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, f64>, Opt
     );
 
     // Rating (used as extra signal + display).
-    let rating = find_stat_value(detail, &["rating"], &[], Prefer::Per90OrTotal)
-        .or_else(|| {
-            detail
-                .season_breakdown
-                .first()
-                .and_then(|row| parse_number(&row.rating))
-        });
+    let rating = find_stat_value(detail, &["rating"], &[], Prefer::Per90OrTotal).or_else(|| {
+        detail
+            .season_breakdown
+            .first()
+            .and_then(|row| parse_number(&row.rating))
+    });
     if let Some(r) = rating {
         out.insert(CanonStat::Rating, r);
     }
 
-    insert_stat(&mut out, CanonStat::Goals, detail, &["goals"], &["goals conceded"], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Assists, detail, &["assists"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Xg, detail, &["expected goals", "xg"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Xa, detail, &["expected assists", "xa"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::ShotsOnTarget, detail, &["shots on target"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Shots, detail, &["shots"], &["shots on target"], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::KeyPasses, detail, &["key passes"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::ChancesCreated, detail, &["chances created"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Dribbles, detail, &["dribbles"], &[], Prefer::Per90OrTotal);
+    insert_stat(
+        &mut out,
+        CanonStat::Goals,
+        detail,
+        &["goals"],
+        &["goals conceded"],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Assists,
+        detail,
+        &["assists"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Xg,
+        detail,
+        &["expected goals", "xg"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Xa,
+        detail,
+        &["expected assists", "xa"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::ShotsOnTarget,
+        detail,
+        &["shots on target"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Shots,
+        detail,
+        &["shots"],
+        &["shots on target"],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::KeyPasses,
+        detail,
+        &["key passes"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::ChancesCreated,
+        detail,
+        &["chances created"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Dribbles,
+        detail,
+        &["dribbles"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
 
-    insert_stat(&mut out, CanonStat::Tackles, detail, &["tackles"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Interceptions, detail, &["interceptions"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Clearances, detail, &["clearances"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Blocks, detail, &["blocks"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::Recoveries, detail, &["recoveries"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::DuelsWon, detail, &["duels won"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::AerialsWon, detail, &["aerial duels won", "aerial won", "aerials won"], &[], Prefer::Per90OrTotal);
+    insert_stat(
+        &mut out,
+        CanonStat::Tackles,
+        detail,
+        &["tackles"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Interceptions,
+        detail,
+        &["interceptions"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Clearances,
+        detail,
+        &["clearances"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Blocks,
+        detail,
+        &["blocks"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::Recoveries,
+        detail,
+        &["recoveries"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::DuelsWon,
+        detail,
+        &["duels won"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::AerialsWon,
+        detail,
+        &["aerial duels won", "aerial won", "aerials won"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
 
     // GK-ish.
-    insert_stat(&mut out, CanonStat::Saves, detail, &["saves"], &[], Prefer::Per90OrTotal);
-    insert_stat_percent(&mut out, CanonStat::SavePct, detail, &["save%", "save %", "save percentage"], &[]);
-    insert_stat(&mut out, CanonStat::CleanSheets, detail, &["clean sheets"], &[], Prefer::Per90OrTotal);
-    insert_stat(&mut out, CanonStat::GoalsConceded, detail, &["goals conceded"], &[], Prefer::Per90OrTotal);
+    insert_stat(
+        &mut out,
+        CanonStat::Saves,
+        detail,
+        &["saves"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat_percent(
+        &mut out,
+        CanonStat::SavePct,
+        detail,
+        &["save%", "save %", "save percentage"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::CleanSheets,
+        detail,
+        &["clean sheets"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::GoalsConceded,
+        detail,
+        &["goals conceded"],
+        &[],
+        Prefer::Per90OrTotal,
+    );
 
     (out, rating)
 }
@@ -241,16 +394,8 @@ fn build_rankings_from_features(features: &[PlayerFeatures]) -> Vec<RoleRankingE
     features
         .iter()
         .map(|f| {
-            let attack_score = composite_zscore(
-                f,
-                attack_specs,
-                &dist_attack,
-            );
-            let defense_score = composite_zscore(
-                f,
-                defend_specs,
-                &dist_defend,
-            );
+            let attack_score = composite_zscore(f, attack_specs, &dist_attack);
+            let defense_score = composite_zscore(f, defend_specs, &dist_defend);
             RoleRankingEntry {
                 role: f.role,
                 player_id: f.player_id,
@@ -291,11 +436,7 @@ fn dist_for_role(
         .sum::<f64>()
         / (values.len() as f64);
     let std = var.sqrt();
-    if std <= 1e-9 {
-        None
-    } else {
-        Some((mean, std))
-    }
+    if std <= 1e-9 { None } else { Some((mean, std)) }
 }
 
 fn composite_zscore(
@@ -337,7 +478,11 @@ fn apply_participation_adjustment(f: &PlayerFeatures, base: f64) -> f64 {
     const FULL_APPS: f64 = 10.0;
     const PENALTY: f64 = 1.5; // in "z-score units"
 
-    let minutes = f.stats.get(&CanonStat::MinutesPlayed).copied().unwrap_or(0.0);
+    let minutes = f
+        .stats
+        .get(&CanonStat::MinutesPlayed)
+        .copied()
+        .unwrap_or(0.0);
     let apps = f.stats.get(&CanonStat::Appearances).copied().unwrap_or(0.0);
 
     let rel = if minutes > 0.0 {
@@ -474,15 +619,16 @@ fn iter_all_stats<'a>(
         .top_stats
         .iter()
         .map(|s| (s.title.as_str(), s.value.as_str(), None));
-    let main = detail
-        .main_league
-        .as_ref()
-        .into_iter()
-        .flat_map(|l| l.stats.iter().map(|s| (s.title.as_str(), s.value.as_str(), None)));
-    let groups = detail
-        .season_groups
-        .iter()
-        .flat_map(|g| g.items.iter().map(|s| (s.title.as_str(), s.value.as_str(), None)));
+    let main = detail.main_league.as_ref().into_iter().flat_map(|l| {
+        l.stats
+            .iter()
+            .map(|s| (s.title.as_str(), s.value.as_str(), None))
+    });
+    let groups = detail.season_groups.iter().flat_map(|g| {
+        g.items
+            .iter()
+            .map(|s| (s.title.as_str(), s.value.as_str(), None))
+    });
 
     // Prefer perf first, then the rest.
     perf.chain(all_comp).chain(top).chain(main).chain(groups)
@@ -524,10 +670,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
         return false;
     }
     for start in 0..=h.len() - n.len() {
-        if h[start]
-            .to_ascii_lowercase()
-            .eq(&n[0].to_ascii_lowercase())
-        {
+        if h[start].to_ascii_lowercase().eq(&n[0].to_ascii_lowercase()) {
             let mut matched = true;
             for idx in 1..n.len() {
                 if h[start + idx].to_ascii_lowercase() != n[idx].to_ascii_lowercase() {
@@ -542,4 +685,3 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     }
     false
 }
-

@@ -240,6 +240,7 @@ impl App {
                     self.state.player_detail_scroll = 0;
                 }
             },
+            KeyCode::Char('m') | KeyCode::Char('M') => self.dump_match_state(),
             KeyCode::Char('b') | KeyCode::Esc => {
                 self.state.screen = match self.state.screen {
                     Screen::Terminal { .. } => Screen::Pulse,
@@ -419,6 +420,134 @@ impl App {
         }
     }
 
+    fn dump_match_state(&mut self) {
+        let filtered = self.state.filtered_matches();
+        let upcoming_filtered = self.state.filtered_upcoming();
+        let pulse_rows = self.state.pulse_live_rows();
+        let active_id: Option<String> = match &self.state.screen {
+            Screen::Terminal {
+                match_id: Some(id),
+            } => Some(id.clone()),
+            _ => self.state.selected_match_id(),
+        };
+        let mut lines = Vec::new();
+        lines.push("[DUMP] Match state".to_string());
+        lines.push(format!(
+            "screen={:?} view={:?} league={:?} sort={:?} selected={}",
+            self.state.screen,
+            self.state.pulse_view,
+            self.state.league_mode,
+            self.state.sort,
+            self.state.selected
+        ));
+        lines.push(format!(
+            "matches_total={} matches_filtered={} upcoming_total={} upcoming_filtered={}",
+            self.state.matches.len(),
+            filtered.len(),
+            self.state.upcoming.len(),
+            upcoming_filtered.len()
+        ));
+        lines.push(format!("pulse_rows_total={}", pulse_rows.len()));
+        lines.push(format!(
+            "league_ids: pl={:?} ll={:?} wc={:?}",
+            self.state.league_pl_ids, self.state.league_ll_ids, self.state.league_wc_ids
+        ));
+        if let Some(id) = active_id.as_deref() {
+            let info = self
+                .state
+                .match_detail
+                .get(id)
+                .map(|d| {
+                    let err = d
+                        .commentary_error
+                        .as_deref()
+                        .unwrap_or("-");
+                    format!(
+                        "match_detail: id={id} events={} commentary={} stats={} lineups={} ticker_err={err}",
+                        d.events.len(),
+                        d.commentary.len(),
+                        d.stats.len(),
+                        d.lineups.as_ref().map(|l| l.sides.len()).unwrap_or(0),
+                    )
+                })
+                .unwrap_or_else(|| format!("match_detail: id={id} missing"));
+            lines.push(info);
+        }
+
+        let max_dump = 8usize;
+        for (idx, m) in self.state.matches.iter().take(max_dump).enumerate() {
+            let matches_mode = self.state.matches_league_mode(m);
+            lines.push(format!(
+                "match[{idx}] id={} league_id={:?} league_name={} live={} min={} score={}-{} in_mode={}",
+                m.id,
+                m.league_id,
+                m.league_name,
+                m.is_live,
+                m.minute,
+                m.score_home,
+                m.score_away,
+                matches_mode
+            ));
+        }
+        if self.state.matches.len() > max_dump {
+            lines.push(format!(
+                "match[...] ({} more not shown)",
+                self.state.matches.len().saturating_sub(max_dump)
+            ));
+        }
+
+        let max_rows = 8usize;
+        for (idx, row) in pulse_rows.iter().take(max_rows).enumerate() {
+            match row {
+                crate::state::PulseLiveRow::Match(match_idx) => {
+                    if let Some(m) = self.state.matches.get(*match_idx) {
+                        lines.push(format!(
+                            "row[{idx}] match id={} league_id={:?} league_name={} live={}",
+                            m.id, m.league_id, m.league_name, m.is_live
+                        ));
+                    } else {
+                        lines.push(format!("row[{idx}] match idx={} missing", match_idx));
+                    }
+                }
+                crate::state::PulseLiveRow::Upcoming(up_idx) => {
+                    if let Some(u) = self.state.upcoming.get(*up_idx) {
+                        lines.push(format!(
+                            "row[{idx}] upcoming id={} league_id={:?} league_name={}",
+                            u.id, u.league_id, u.league_name
+                        ));
+                    } else {
+                        lines.push(format!("row[{idx}] upcoming idx={} missing", up_idx));
+                    }
+                }
+            }
+        }
+        if pulse_rows.len() > max_rows {
+            lines.push(format!(
+                "row[...] ({} more not shown)",
+                pulse_rows.len().saturating_sub(max_rows)
+            ));
+        }
+
+        let max_upcoming = 6usize;
+        for (idx, m) in self.state.upcoming.iter().take(max_upcoming).enumerate() {
+            let matches_mode = self.state.upcoming_matches_league_mode(m);
+            lines.push(format!(
+                "upcoming[{idx}] id={} league_id={:?} league_name={} kickoff={} in_mode={}",
+                m.id, m.league_id, m.league_name, m.kickoff, matches_mode
+            ));
+        }
+        if self.state.upcoming.len() > max_upcoming {
+            lines.push(format!(
+                "upcoming[...] ({} more not shown)",
+                self.state.upcoming.len().saturating_sub(max_upcoming)
+            ));
+        }
+
+        for line in lines {
+            self.state.push_log(line);
+        }
+    }
+
     fn request_match_details(&mut self, announce: bool) {
         let Some(match_id) = self.state.selected_match_id() else {
             if announce {
@@ -457,7 +586,17 @@ impl App {
             .get(match_id)
             .copied();
         let has_cached = self.state.match_detail.contains_key(match_id);
-        if !is_live && has_cached && cache_fresh(cached_at, self.detail_cache_ttl) {
+        let has_commentary = self
+            .state
+            .match_detail
+            .get(match_id)
+            .map(|detail| !detail.commentary.is_empty())
+            .unwrap_or(false);
+        if !is_live
+            && has_cached
+            && cache_fresh(cached_at, self.detail_cache_ttl)
+            && (!announce || has_commentary)
+        {
             if announce {
                 self.state
                     .push_log("[INFO] Match details cached (skipping fetch)");
@@ -971,6 +1110,44 @@ fn main() -> io::Result<()> {
     let _ = dotenvy::from_filename(".env.local");
     let _ = dotenvy::from_filename(".env");
 
+    // Lightweight debug mode to inspect FotMob match details without launching the TUI.
+    // Example: `cargo run -- --dump-match-details 4837312`
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.get(0).map(|s| s.as_str()) == Some("--dump-match-details") {
+        let match_id = args.get(1).cloned().unwrap_or_default();
+        if match_id.trim().is_empty() {
+            eprintln!("usage: --dump-match-details <matchId>");
+            return Ok(());
+        }
+        match crate::upcoming_fetch::fetch_match_details_from_fotmob(match_id.trim()) {
+            Ok(detail) => {
+                println!(
+                    "matchId={match_id}\nevents={}\ncommentary={}\ncommentary_error={}\nstats={}\nlineups={}",
+                    detail.events.len(),
+                    detail.commentary.len(),
+                    detail.commentary_error.as_deref().unwrap_or("-"),
+                    detail.stats.len(),
+                    detail.lineups.as_ref().map(|l| l.sides.len()).unwrap_or(0)
+                );
+                if !detail.commentary.is_empty() {
+                    println!("\ncommentary_head:");
+                    for line in detail
+                        .commentary
+                        .iter()
+                        .take(5)
+                        .map(format_commentary_line)
+                    {
+                        println!("{line}");
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+            }
+        }
+        return Ok(());
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1161,15 +1338,15 @@ fn footer_text(state: &AppState) -> String {
     match state.screen {
         Screen::Pulse => match state.pulse_view {
             PulseView::Live => {
-                "1 Pulse | 2 Analysis | Enter/d Terminal | j/k/↑/↓ Move | s Sort | l League | u Upcoming | i Details | p Placeholder | ? Help | q Quit".to_string()
+                "1 Pulse | 2 Analysis | Enter/d Terminal | j/k/↑/↓ Move | s Sort | l League | u Upcoming | i Details | m Dump | p Placeholder | ? Help | q Quit".to_string()
             }
             PulseView::Upcoming => {
-                "1 Pulse | 2 Analysis | u Live | j/k/↑/↓ Scroll | l League | p Placeholder | ? Help | q Quit"
+                "1 Pulse | 2 Analysis | u Live | j/k/↑/↓ Scroll | l League | m Dump | p Placeholder | ? Help | q Quit"
                     .to_string()
             }
         },
         Screen::Terminal { .. } => {
-            "1 Pulse | 2 Analysis | Tab Focus | Enter Detail | b/Esc Back | i Details | l League | p Placeholder | ? Help | q Quit"
+            "1 Pulse | 2 Analysis | Tab Focus | Enter Detail | b/Esc Back | i Details | l League | m Dump | p Placeholder | ? Help | q Quit"
                 .to_string()
         }
         Screen::Analysis => {
@@ -2954,11 +3131,15 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
 
     render_pitch(frame, middle_chunks[0], state);
 
-    let tape = Paragraph::new(event_tape_text(state))
-        .block(terminal_block(
-            "Event Tape",
+    let (tape_title, tape_text, tape_focus) = match state.terminal_focus {
+        TerminalFocus::Commentary => ("Commentary", commentary_tape_text(state), true),
+        _ => (
+            "Ticker",
+            event_tape_text(state),
             state.terminal_focus == TerminalFocus::EventTape,
-        ));
+        ),
+    };
+    let tape = Paragraph::new(tape_text).block(terminal_block(tape_title, tape_focus));
     frame.render_widget(tape, middle_chunks[1]);
 
     let stats_text = stats_text(state);
@@ -3237,14 +3418,56 @@ fn event_tape_text(state: &AppState) -> String {
         return "No match selected".to_string();
     };
     let Some(detail) = state.match_detail.get(&match_id) else {
-        return "No events yet".to_string();
+        return "No ticker yet".to_string();
     };
+    if !detail.commentary.is_empty() {
+        let start = detail.commentary.len().saturating_sub(6);
+        return detail.commentary[start..]
+            .iter()
+            .map(format_commentary_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
     if detail.events.is_empty() {
-        return "No events yet".to_string();
+        return "No ticker yet".to_string();
     }
 
     let start = detail.events.len().saturating_sub(6);
     detail.events[start..]
+        .iter()
+        .map(|event| {
+            format!(
+                "{}' {} {} {}",
+                event.minute,
+                event_kind_label(event.kind),
+                event.team,
+                event.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ticker_full_text(state: &AppState) -> String {
+    let Some(match_id) = state.selected_match_id() else {
+        return "No match selected".to_string();
+    };
+    let Some(detail) = state.match_detail.get(&match_id) else {
+        return "No ticker yet".to_string();
+    };
+    if !detail.commentary.is_empty() {
+        return detail
+            .commentary
+            .iter()
+            .map(format_commentary_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    if detail.events.is_empty() {
+        return "No ticker yet".to_string();
+    }
+    detail
+        .events
         .iter()
         .map(|event| {
             format!(
@@ -3283,6 +3506,61 @@ fn events_full_text(state: &AppState) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn commentary_tape_text(state: &AppState) -> String {
+    let Some(match_id) = state.selected_match_id() else {
+        return "No match selected".to_string();
+    };
+    let Some(detail) = state.match_detail.get(&match_id) else {
+        return "No commentary yet".to_string();
+    };
+    if detail.commentary.is_empty() {
+        if let Some(err) = detail.commentary_error.as_deref() {
+            return format!("Ticker error: {err}");
+        }
+        return "No commentary yet".to_string();
+    }
+    let start = detail.commentary.len().saturating_sub(6);
+    detail.commentary[start..]
+        .iter()
+        .map(format_commentary_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn commentary_full_text(state: &AppState) -> String {
+    let Some(match_id) = state.selected_match_id() else {
+        return "No match selected".to_string();
+    };
+    let Some(detail) = state.match_detail.get(&match_id) else {
+        return "No commentary yet".to_string();
+    };
+    if detail.commentary.is_empty() {
+        if let Some(err) = detail.commentary_error.as_deref() {
+            return format!("Ticker error: {err}");
+        }
+        return "No commentary yet".to_string();
+    }
+    detail
+        .commentary
+        .iter()
+        .map(format_commentary_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_commentary_line(entry: &state::CommentaryEntry) -> String {
+    let time = match (entry.minute, entry.minute_plus) {
+        (Some(min), Some(plus)) if plus > 0 => format!("{min}+{plus}'"),
+        (Some(min), _) => format!("{min}'"),
+        _ => "--".to_string(),
+    };
+    if let Some(team) = entry.team.as_ref() {
+        format!("{time} {team}: {}", entry.text)
+    } else {
+        format!("{time} {}", entry.text)
+    }
 }
 
 fn stats_full_text(state: &AppState) -> String {
@@ -3400,6 +3678,23 @@ fn match_detail_overview_text(state: &AppState) -> String {
         lines.push("Match details not loaded. Press i to fetch.".to_string());
         return lines.join("\n");
     };
+
+    lines.push(String::new());
+    lines.push("Ticker:".to_string());
+    if detail.commentary.is_empty() {
+        if let Some(err) = detail.commentary_error.as_deref() {
+            lines.push(format!("Ticker error: {err}"));
+        } else {
+            lines.push("No ticker yet. Press i to refresh.".to_string());
+        }
+    } else {
+        let start = detail.commentary.len().saturating_sub(12);
+        lines.extend(
+            detail.commentary[start..]
+                .iter()
+                .map(format_commentary_line),
+        );
+    }
 
     if !detail.stats.is_empty() {
         lines.push(String::new());
@@ -3661,7 +3956,8 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
     let title = match focus {
         TerminalFocus::MatchList => "Match Details",
         TerminalFocus::Pitch => "Pitch",
-        TerminalFocus::EventTape => "Event Tape",
+        TerminalFocus::EventTape => "Ticker",
+        TerminalFocus::Commentary => "Commentary",
         TerminalFocus::Stats => "Stats",
         TerminalFocus::Lineups => "Lineups",
         TerminalFocus::Prediction => "Prediction",
@@ -3683,7 +3979,8 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
         TerminalFocus::Pitch => {
             pitch_text(state, chunks[0].width as usize, chunks[0].height as usize)
         }
-        TerminalFocus::EventTape => events_full_text(state),
+        TerminalFocus::EventTape => ticker_full_text(state),
+        TerminalFocus::Commentary => commentary_full_text(state),
         TerminalFocus::Stats => stats_full_text(state),
         TerminalFocus::Lineups => lineups_full_text(state),
         TerminalFocus::Prediction => prediction_detail_text(state),

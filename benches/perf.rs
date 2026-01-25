@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use wc26_terminal::analysis_fetch::parse_player_detail_json;
@@ -109,7 +109,9 @@ fn bench_prefetch_filtering(c: &mut Criterion) {
     let now = std::time::SystemTime::now();
     for id in 1..=500u32 {
         state.rankings_cache_players_at.insert(id, now);
-        state.rankings_cache_players.insert(id, sample_player_detail(id, "Cached"));
+        state
+            .rankings_cache_players
+            .insert(id, sample_player_detail(id, "Cached"));
     }
     let candidates: Vec<u32> = (1..=500).collect();
 

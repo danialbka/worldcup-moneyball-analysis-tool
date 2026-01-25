@@ -18,6 +18,7 @@ pub enum TerminalFocus {
     MatchList,
     Pitch,
     EventTape,
+    Commentary,
     Stats,
     Lineups,
     Prediction,
@@ -155,6 +156,8 @@ pub fn placeholder_match_detail() -> MatchDetail {
 
     MatchDetail {
         events,
+        commentary: Vec::new(),
+        commentary_error: None,
         lineups: Some(lineups),
         stats,
     }
@@ -326,9 +329,13 @@ impl AppState {
     }
 
     pub fn new() -> Self {
-        let league_pl_ids = parse_ids_env("APP_LEAGUE_PREMIER_IDS");
-        let league_ll_ids = parse_ids_env("APP_LEAGUE_LALIGA_IDS");
-        let league_wc_ids = parse_ids_env("APP_LEAGUE_WORLDCUP_IDS");
+        const DEFAULT_PREMIER_IDS: &[u32] = &[47];
+        const DEFAULT_LALIGA_IDS: &[u32] = &[87];
+        const DEFAULT_WORLDCUP_IDS: &[u32] = &[77];
+
+        let league_pl_ids = parse_ids_env_or_default("APP_LEAGUE_PREMIER_IDS", DEFAULT_PREMIER_IDS);
+        let league_ll_ids = parse_ids_env_or_default("APP_LEAGUE_LALIGA_IDS", DEFAULT_LALIGA_IDS);
+        let league_wc_ids = parse_ids_env_or_default("APP_LEAGUE_WORLDCUP_IDS", DEFAULT_WORLDCUP_IDS);
         Self {
             screen: Screen::Pulse,
             sort: SortMode::Hot,
@@ -675,6 +682,14 @@ impl AppState {
         }
     }
 
+    pub fn matches_league_mode(&self, m: &MatchSummary) -> bool {
+        self.matches_mode(m)
+    }
+
+    pub fn upcoming_matches_league_mode(&self, m: &UpcomingMatch) -> bool {
+        self.upcoming_matches_mode(m)
+    }
+
     fn matches_mode(&self, m: &MatchSummary) -> bool {
         match self.league_mode {
             LeagueMode::PremierLeague => matches_league(
@@ -748,7 +763,8 @@ impl AppState {
         self.terminal_focus = match self.terminal_focus {
             TerminalFocus::MatchList => TerminalFocus::Pitch,
             TerminalFocus::Pitch => TerminalFocus::EventTape,
-            TerminalFocus::EventTape => TerminalFocus::Stats,
+            TerminalFocus::EventTape => TerminalFocus::Commentary,
+            TerminalFocus::Commentary => TerminalFocus::Stats,
             TerminalFocus::Stats => TerminalFocus::Lineups,
             TerminalFocus::Lineups => TerminalFocus::Prediction,
             TerminalFocus::Prediction => TerminalFocus::Console,
@@ -761,7 +777,8 @@ impl AppState {
             TerminalFocus::MatchList => TerminalFocus::Console,
             TerminalFocus::Pitch => TerminalFocus::MatchList,
             TerminalFocus::EventTape => TerminalFocus::Pitch,
-            TerminalFocus::Stats => TerminalFocus::EventTape,
+            TerminalFocus::Commentary => TerminalFocus::EventTape,
+            TerminalFocus::Stats => TerminalFocus::Commentary,
             TerminalFocus::Lineups => TerminalFocus::Stats,
             TerminalFocus::Prediction => TerminalFocus::Lineups,
             TerminalFocus::Console => TerminalFocus::Prediction,
@@ -992,6 +1009,10 @@ pub struct WinProbRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchDetail {
     pub events: Vec<Event>,
+    #[serde(default)]
+    pub commentary: Vec<CommentaryEntry>,
+    #[serde(default)]
+    pub commentary_error: Option<String>,
     pub lineups: Option<MatchLineups>,
     pub stats: Vec<StatRow>,
 }
@@ -1014,6 +1035,14 @@ pub struct Event {
     pub kind: EventKind,
     pub team: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentaryEntry {
+    pub minute: Option<u16>,
+    pub minute_plus: Option<u16>,
+    pub team: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1365,6 +1394,8 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         Delta::AddEvent { id, event } => {
             let entry = state.match_detail.entry(id).or_insert_with(|| MatchDetail {
                 events: Vec::new(),
+                commentary: Vec::new(),
+                commentary_error: None,
                 lineups: None,
                 stats: Vec::new(),
             });
@@ -1542,8 +1573,17 @@ pub fn metric_label(metric: RankMetric) -> &'static str {
     }
 }
 
-fn parse_ids_env(key: &str) -> Vec<u32> {
-    env::var(key).ok().map(parse_ids).unwrap_or_default()
+fn parse_ids_env_or_default(key: &str, default_ids: &[u32]) -> Vec<u32> {
+    match env::var(key) {
+        Ok(raw) => {
+            if raw.trim().is_empty() {
+                Vec::new()
+            } else {
+                parse_ids(raw)
+            }
+        }
+        Err(_) => default_ids.to_vec(),
+    }
 }
 
 fn parse_ids(raw: String) -> Vec<u32> {
