@@ -95,7 +95,7 @@ fn bench_rankings_compute(c: &mut Criterion) {
     c.bench_function("rankings_compute", |b| {
         b.iter(|| {
             let rows = compute_role_rankings_from_cache(
-                black_box(&[team.clone()]),
+                black_box(std::slice::from_ref(&team)),
                 black_box(&squads),
                 black_box(&player_details),
             );
@@ -120,7 +120,7 @@ fn bench_prefetch_filtering(c: &mut Criterion) {
             let mut ids: Vec<u32> = candidates
                 .iter()
                 .copied()
-                .filter(|id| state.rankings_cache_players_at.get(id).is_none())
+                .filter(|id| !state.rankings_cache_players_at.contains_key(id))
                 .collect();
             ids.sort_unstable();
             ids.dedup();

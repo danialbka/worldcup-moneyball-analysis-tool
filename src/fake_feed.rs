@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,10 +19,7 @@ use crate::upcoming_fetch::{self, FotmobMatchRow};
 pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
     thread::spawn(move || {
         let mut rng = rand::thread_rng();
-        let lineups = seed_lineups()
-            .into_iter()
-            .map(|(id, lineup)| (id, lineup))
-            .collect::<HashMap<_, _>>();
+        let lineups = seed_lineups().into_iter().collect::<HashMap<_, _>>();
 
         let upcoming_source = env::var("UPCOMING_SOURCE")
             .unwrap_or_else(|_| "fotmob".to_string())
@@ -240,10 +237,10 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 match analysis_fetch::fetch_team_squad(team.id) {
                                     Ok(squad) => {
                                         total.fetch_add(squad.players.len(), Ordering::SeqCst);
-                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
+                                        let current_val =
+                                            current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::CacheSquad {
                                             team_id: team.id,
-                                            team_name: squad.team_name,
                                             players: squad.players.clone(),
                                         });
                                         let _ = tx.send(Delta::RankCacheProgress {
@@ -267,13 +264,10 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                                 {
                                                     Ok(detail) => {
                                                         let _ = tx_players
-                                                            .send(Delta::CachePlayerDetail(
-                                                                detail,
-                                                            ));
+                                                            .send(Delta::CachePlayerDetail(detail));
                                                     }
                                                     Err(err) => {
-                                                        let mut guard =
-                                                            errors_ref.lock().unwrap();
+                                                        let mut guard = errors_ref.lock().unwrap();
                                                         guard.push(format!(
                                                             "player detail {} ({}): {err}",
                                                             player.name, player.id
@@ -281,18 +275,15 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                                     }
                                                 }
                                                 let current_val =
-                                                    current_ref.fetch_add(1, Ordering::SeqCst)
-                                                        + 1;
-                                                let _ = tx_players.send(
-                                                    Delta::RankCacheProgress {
-                                                        current: current_val,
-                                                        total: total_ref.load(Ordering::SeqCst),
-                                                        message: format!(
-                                                            "Player: {} ({})",
-                                                            player.name, team.name
-                                                        ),
-                                                    },
-                                                );
+                                                    current_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                                                let _ = tx_players.send(Delta::RankCacheProgress {
+                                                    current: current_val,
+                                                    total: total_ref.load(Ordering::SeqCst),
+                                                    message: format!(
+                                                        "Player: {} ({})",
+                                                        player.name, team.name
+                                                    ),
+                                                });
                                             });
                                         });
                                     }
@@ -302,7 +293,8 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                             "squad {} ({}): {err}",
                                             team.name, team.id
                                         ));
-                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
+                                        let current_val =
+                                            current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::RankCacheProgress {
                                             current: current_val,
                                             total: total.load(Ordering::SeqCst),
@@ -317,7 +309,6 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                         });
                     }
                     ProviderCommand::WarmRankCacheMissing {
-                        mode: _,
                         team_ids,
                         player_ids,
                     } => {
@@ -346,10 +337,10 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 match analysis_fetch::fetch_team_squad(team_id) {
                                     Ok(squad) => {
                                         total.fetch_add(squad.players.len(), Ordering::SeqCst);
-                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
+                                        let current_val =
+                                            current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::CacheSquad {
                                             team_id,
-                                            team_name: squad.team_name,
                                             players: squad.players.clone(),
                                         });
                                         let _ = tx.send(Delta::RankCacheProgress {
@@ -372,13 +363,10 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                                 {
                                                     Ok(detail) => {
                                                         let _ = tx_players
-                                                            .send(Delta::CachePlayerDetail(
-                                                                detail,
-                                                            ));
+                                                            .send(Delta::CachePlayerDetail(detail));
                                                     }
                                                     Err(err) => {
-                                                        let mut guard =
-                                                            errors_ref.lock().unwrap();
+                                                        let mut guard = errors_ref.lock().unwrap();
                                                         guard.push(format!(
                                                             "player detail {} ({}): {err}",
                                                             player.name, player.id
@@ -386,25 +374,23 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                                     }
                                                 }
                                                 let current_val =
-                                                    current_ref.fetch_add(1, Ordering::SeqCst)
-                                                        + 1;
-                                                let _ = tx_players.send(
-                                                    Delta::RankCacheProgress {
-                                                        current: current_val,
-                                                        total: total_ref.load(Ordering::SeqCst),
-                                                        message: format!(
-                                                            "Player: {} ({team_id})",
-                                                            player.name
-                                                        ),
-                                                    },
-                                                );
+                                                    current_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                                                let _ = tx_players.send(Delta::RankCacheProgress {
+                                                    current: current_val,
+                                                    total: total_ref.load(Ordering::SeqCst),
+                                                    message: format!(
+                                                        "Player: {} ({team_id})",
+                                                        player.name
+                                                    ),
+                                                });
                                             });
                                         });
                                     }
                                     Err(err) => {
                                         let mut guard = errors.lock().unwrap();
                                         guard.push(format!("squad {team_id}: {err}"));
-                                        let current_val = current.fetch_add(1, Ordering::SeqCst) + 1;
+                                        let current_val =
+                                            current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::RankCacheProgress {
                                             current: current_val,
                                             total: total.load(Ordering::SeqCst),
@@ -427,14 +413,12 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                     });
                                     match analysis_fetch::fetch_player_detail(*player_id) {
                                         Ok(detail) => {
-                                            let _ = tx_players
-                                                .send(Delta::CachePlayerDetail(detail));
+                                            let _ =
+                                                tx_players.send(Delta::CachePlayerDetail(detail));
                                         }
                                         Err(err) => {
                                             let mut guard = errors_ref.lock().unwrap();
-                                            guard.push(format!(
-                                                "player detail {player_id}: {err}"
-                                            ));
+                                            guard.push(format!("player detail {player_id}: {err}"));
                                         }
                                     }
                                     let current_val =
@@ -479,9 +463,8 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let _ = tx.send(Delta::SetPlayerDetail(detail));
                         }
                         Err(err) => {
-                            let _ = tx.send(Delta::Log(format!(
-                                "[WARN] Player fetch failed: {err}"
-                            )));
+                            let _ =
+                                tx.send(Delta::Log(format!("[WARN] Player fetch failed: {err}")));
                             let _ = tx.send(Delta::SetPlayerDetail(crate::state::PlayerDetail {
                                 id: player_id,
                                 name: player_name,
@@ -555,20 +538,19 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let mut last_current = 0usize;
                             let mut last_total = 0usize;
 
-                            let report =
-                                crate::analysis_export::export_analysis_with_progress(
-                                    path.as_ref(),
-                                    mode,
-                                    |progress| {
-                                        last_current = progress.current;
-                                        last_total = progress.total;
-                                        let _ = progress_tx.send(Delta::ExportProgress {
-                                            current: progress.current,
-                                            total: progress.total,
-                                            message: progress.message,
-                                        });
-                                    },
-                                );
+                            let report = crate::analysis_export::export_analysis_with_progress(
+                                path.as_ref(),
+                                mode,
+                                |progress| {
+                                    last_current = progress.current;
+                                    last_total = progress.total;
+                                    let _ = progress_tx.send(Delta::ExportProgress {
+                                        current: progress.current,
+                                        total: progress.total,
+                                        message: progress.message,
+                                    });
+                                },
+                            );
 
                             match report {
                                 Ok(report) => {
@@ -656,34 +638,34 @@ fn merge_fotmob_matches(
             ModelQuality::Basic
         };
 
-        if let Some(prev) = &prev {
-            if row.home_score != prev.score_home || row.away_score != prev.score_away {
-                let scoring_team = if row.home_score > prev.score_home {
-                    row.home.clone()
-                } else {
-                    row.away.clone()
-                };
-                let event = Event {
-                    minute,
-                    kind: EventKind::Goal,
-                    team: scoring_team.clone(),
-                    description: "Goal".to_string(),
-                };
-                let _ = tx.send(Delta::AddEvent {
-                    id: row.id.clone(),
-                    event,
-                });
-                let _ = tx.send(Delta::Log(format!(
-                    "[ALERT] Goal: {} {}-{} {}",
-                    scoring_team, row.home_score, row.away_score, row.away
-                )));
-                win = seed_win_prob(row.home_score, row.away_score, is_live);
-                win.quality = if is_live {
-                    ModelQuality::Event
-                } else {
-                    ModelQuality::Basic
-                };
-            }
+        if let Some(prev) = &prev
+            && (row.home_score != prev.score_home || row.away_score != prev.score_away)
+        {
+            let scoring_team = if row.home_score > prev.score_home {
+                row.home.clone()
+            } else {
+                row.away.clone()
+            };
+            let event = Event {
+                minute,
+                kind: EventKind::Goal,
+                team: scoring_team.clone(),
+                description: "Goal".to_string(),
+            };
+            let _ = tx.send(Delta::AddEvent {
+                id: row.id.clone(),
+                event,
+            });
+            let _ = tx.send(Delta::Log(format!(
+                "[ALERT] Goal: {} {}-{} {}",
+                scoring_team, row.home_score, row.away_score, row.away
+            )));
+            win = seed_win_prob(row.home_score, row.away_score, is_live);
+            win.quality = if is_live {
+                ModelQuality::Event
+            } else {
+                ModelQuality::Basic
+            };
         }
 
         output.push(MatchSummary {

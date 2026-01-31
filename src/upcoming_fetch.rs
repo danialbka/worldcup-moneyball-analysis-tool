@@ -137,7 +137,11 @@ fn parse_match_details_value(root: &Value) -> MatchDetail {
     }
 }
 
-fn fetch_ltc_commentary(client: &reqwest::blocking::Client, root: &Value, match_id: &str) -> Result<Vec<CommentaryEntry>> {
+fn fetch_ltc_commentary(
+    client: &reqwest::blocking::Client,
+    root: &Value,
+    match_id: &str,
+) -> Result<Vec<CommentaryEntry>> {
     let content = root.get("content").unwrap_or(&Value::Null);
     let liveticker = content.get("liveticker").unwrap_or(&Value::Null);
     let langs = liveticker
@@ -193,13 +197,9 @@ fn url_encode(raw: &str) -> String {
     let mut out = String::new();
     for b in raw.bytes() {
         match b {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -243,7 +243,7 @@ fn parse_ltc_json(raw: &str, teams: &[String]) -> Result<Vec<CommentaryEntry>> {
             minute: event.elapsed.and_then(|val| u16::try_from(val).ok()),
             minute_plus: event.elapsed_plus.and_then(|val| u16::try_from(val).ok()),
             team: match event.team_event.as_deref() {
-                Some("home") => teams.get(0).cloned(),
+                Some("home") => teams.first().cloned(),
                 Some("away") => teams.get(1).cloned(),
                 _ => None,
             },
@@ -385,15 +385,15 @@ fn parse_lineups(value: Option<&Value>) -> Option<MatchLineups> {
     let lineup = value?.as_object()?;
     let mut sides = Vec::new();
 
-    if let Some(home) = lineup.get("homeTeam") {
-        if let Some(side) = parse_lineup_side(home) {
-            sides.push(side);
-        }
+    if let Some(home) = lineup.get("homeTeam")
+        && let Some(side) = parse_lineup_side(home)
+    {
+        sides.push(side);
     }
-    if let Some(away) = lineup.get("awayTeam") {
-        if let Some(side) = parse_lineup_side(away) {
-            sides.push(side);
-        }
+    if let Some(away) = lineup.get("awayTeam")
+        && let Some(side) = parse_lineup_side(away)
+    {
+        sides.push(side);
     }
 
     if sides.is_empty() {
@@ -495,9 +495,7 @@ fn parse_events(value: Option<&Value>, home: &str, away: &str) -> Vec<Event> {
 }
 
 fn parse_event_kind(event_type: Option<&str>) -> Option<EventKind> {
-    let Some(event_type) = event_type else {
-        return None;
-    };
+    let event_type = event_type?;
     let lowered = event_type.to_lowercase();
     if lowered.contains("goal") {
         Some(EventKind::Goal)
@@ -572,10 +570,10 @@ fn abbreviate_team(name: &str) -> String {
 
 fn pick_string(value: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
-        if let Some(v) = value.get(*key) {
-            if let Some(name) = as_string(v) {
-                return Some(name);
-            }
+        if let Some(v) = value.get(*key)
+            && let Some(name) = as_string(v)
+        {
+            return Some(name);
         }
     }
     None
@@ -587,10 +585,10 @@ fn pick_u32(value: &Value, keys: &[&str]) -> Option<u32> {
             if let Some(num) = v.as_u64() {
                 return Some(num as u32);
             }
-            if let Some(s) = v.as_str() {
-                if let Ok(num) = s.parse::<u32>() {
-                    return Some(num);
-                }
+            if let Some(s) = v.as_str()
+                && let Ok(num) = s.parse::<u32>()
+            {
+                return Some(num);
             }
         }
     }
@@ -608,10 +606,10 @@ fn as_string(value: &Value) -> Option<String> {
             if let Some(Value::String(name)) = map.get("shortName") {
                 return Some(name.trim().to_string());
             }
-            if let Some(Value::Object(team)) = map.get("team") {
-                if let Some(Value::String(name)) = team.get("name") {
-                    return Some(name.trim().to_string());
-                }
+            if let Some(Value::Object(team)) = map.get("team")
+                && let Some(Value::String(name)) = team.get("name")
+            {
+                return Some(name.trim().to_string());
             }
             None
         }

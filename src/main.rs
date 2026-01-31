@@ -3,7 +3,7 @@ use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
 };
@@ -17,19 +17,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
 
-mod analysis_export;
-mod analysis_fetch;
-mod analysis_rankings;
-mod fake_feed;
-mod http_cache;
-mod http_client;
-mod persist;
-mod state;
-mod upcoming_fetch;
+use wc26_terminal::{analysis_rankings, fake_feed, http_cache, persist, upcoming_fetch};
 
-use crate::state::{
-    AppState, LeagueMode, PLAYER_DETAIL_SECTIONS, PlayerDetail, PlayerStatItem, PulseView,
-    RoleCategory, Screen, PLACEHOLDER_MATCH_ID, TerminalFocus, apply_delta, confed_label,
+use wc26_terminal::state::{
+    self, AppState, LeagueMode, PLACEHOLDER_MATCH_ID, PLAYER_DETAIL_SECTIONS, PlayerDetail,
+    PlayerStatItem, PulseView, RoleCategory, Screen, TerminalFocus, apply_delta, confed_label,
     league_label, metric_label, placeholder_match_detail, placeholder_match_summary, role_label,
 };
 
@@ -118,7 +110,7 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         if self.state.export.active {
             if self.state.export.done {
-                self.state.export = crate::state::ExportState::new();
+                self.state.export = state::ExportState::new();
             }
             return;
         }
@@ -162,7 +154,7 @@ impl App {
                     }
                 }
                 Screen::Analysis => {
-                    if self.state.analysis_tab == crate::state::AnalysisTab::Teams {
+                    if self.state.analysis_tab == state::AnalysisTab::Teams {
                         let team = self.state.selected_analysis().cloned();
                         if let Some(team) = team {
                             self.state.screen = Screen::Squad;
@@ -177,10 +169,10 @@ impl App {
                         let entry = {
                             let mut rows = self.state.rankings_filtered();
                             match self.state.rankings_metric {
-                                crate::state::RankMetric::Attacking => {
+                                state::RankMetric::Attacking => {
                                     rows.sort_by(|a, b| b.attack_score.total_cmp(&a.attack_score))
                                 }
-                                crate::state::RankMetric::Defending => {
+                                state::RankMetric::Defending => {
                                     rows.sort_by(|a, b| b.defense_score.total_cmp(&a.defense_score))
                                 }
                             }
@@ -198,13 +190,20 @@ impl App {
                             self.state.player_last_id = Some(entry.player_id);
                             self.state.player_last_name = Some(entry.player_name.clone());
 
-                            if let Some(cached) =
-                                self.state.rankings_cache_players.get(&entry.player_id).cloned()
+                            if let Some(cached) = self
+                                .state
+                                .rankings_cache_players
+                                .get(&entry.player_id)
+                                .cloned()
                             {
                                 self.state.player_detail = Some(cached);
                                 self.state.player_loading = false;
                             } else if !self.state.player_loading {
-                                self.request_player_detail(entry.player_id, entry.player_name.clone(), true);
+                                self.request_player_detail(
+                                    entry.player_id,
+                                    entry.player_name.clone(),
+                                    true,
+                                );
                             }
                         }
                     }
@@ -253,8 +252,8 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => {
                 if matches!(self.state.screen, Screen::Analysis) {
                     match self.state.analysis_tab {
-                        crate::state::AnalysisTab::Teams => self.state.select_analysis_next(),
-                        crate::state::AnalysisTab::RoleRankings => self.state.select_rankings_next(),
+                        state::AnalysisTab::Teams => self.state.select_analysis_next(),
+                        state::AnalysisTab::RoleRankings => self.state.select_rankings_next(),
                     }
                 } else if matches!(self.state.screen, Screen::Squad) {
                     self.state.select_squad_next();
@@ -263,10 +262,13 @@ impl App {
                         .state
                         .player_detail
                         .as_ref()
-                    .map(|detail| {
-                        player_detail_section_max_scroll(detail, self.state.player_detail_section)
-                    })
-                    .unwrap_or(0);
+                        .map(|detail| {
+                            player_detail_section_max_scroll(
+                                detail,
+                                self.state.player_detail_section,
+                            )
+                        })
+                        .unwrap_or(0);
                     self.state.scroll_player_detail_down(max_scroll);
                 } else {
                     self.state.select_next();
@@ -275,8 +277,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 if matches!(self.state.screen, Screen::Analysis) {
                     match self.state.analysis_tab {
-                        crate::state::AnalysisTab::Teams => self.state.select_analysis_prev(),
-                        crate::state::AnalysisTab::RoleRankings => self.state.select_rankings_prev(),
+                        state::AnalysisTab::Teams => self.state.select_analysis_prev(),
+                        state::AnalysisTab::RoleRankings => self.state.select_rankings_prev(),
                     }
                 } else if matches!(self.state.screen, Screen::Squad) {
                     self.state.select_squad_prev();
@@ -288,7 +290,7 @@ impl App {
             }
             KeyCode::Char('s') => {
                 if matches!(self.state.screen, Screen::Analysis)
-                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                    && self.state.analysis_tab == state::AnalysisTab::RoleRankings
                 {
                     self.state.cycle_rankings_metric();
                 } else {
@@ -297,14 +299,14 @@ impl App {
             }
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 // Persist current league cache before switching away.
-                crate::persist::save_from_state(&self.state);
+                persist::save_from_state(&self.state);
                 self.state.cycle_league_mode();
                 self.detail_dist_cache = None;
                 if self.auto_warm_mode != AutoWarmMode::Off {
                     self.auto_warm_pending = true;
                 }
                 // Load cache for the newly selected league.
-                crate::persist::load_into_state(&mut self.state);
+                persist::load_into_state(&mut self.state);
                 self.request_upcoming(true);
                 if matches!(self.state.screen, Screen::Analysis) {
                     self.request_analysis(true);
@@ -320,7 +322,7 @@ impl App {
             KeyCode::Tab => {
                 if matches!(self.state.screen, Screen::Analysis) {
                     self.state.cycle_analysis_tab();
-                    if self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings {
+                    if self.state.analysis_tab == state::AnalysisTab::RoleRankings {
                         self.request_rankings_cache_warm_missing(true);
                         self.recompute_rankings_from_cache();
                     }
@@ -339,14 +341,14 @@ impl App {
             }
             KeyCode::Left => {
                 if matches!(self.state.screen, Screen::Analysis)
-                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                    && self.state.analysis_tab == state::AnalysisTab::RoleRankings
                 {
                     self.state.cycle_rankings_role_prev();
                 }
             }
             KeyCode::Right => {
                 if matches!(self.state.screen, Screen::Analysis)
-                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                    && self.state.analysis_tab == state::AnalysisTab::RoleRankings
                 {
                     self.state.cycle_rankings_role_next();
                 }
@@ -354,8 +356,8 @@ impl App {
             KeyCode::Char('r') => {
                 if matches!(self.state.screen, Screen::Analysis) {
                     match self.state.analysis_tab {
-                        crate::state::AnalysisTab::Teams => self.request_analysis(true),
-                        crate::state::AnalysisTab::RoleRankings => {
+                        state::AnalysisTab::Teams => self.request_analysis(true),
+                        state::AnalysisTab::RoleRankings => {
                             // Incremental: fetch only missing squads/players.
                             self.request_rankings_cache_warm_missing(true);
                             self.recompute_rankings_from_cache();
@@ -370,20 +372,20 @@ impl App {
                             .unwrap_or_else(|| "Team".to_string());
                         self.request_squad(team_id, team_name, true);
                     }
-                } else if matches!(self.state.screen, Screen::PlayerDetail) {
-                    if let (Some(player_id), Some(player_name)) = (
+                } else if matches!(self.state.screen, Screen::PlayerDetail)
+                    && let (Some(player_id), Some(player_name)) = (
                         self.state.player_last_id,
                         self.state.player_last_name.clone(),
-                    ) {
-                        self.detail_dist_cache = None;
-                        self.request_player_detail(player_id, player_name, true);
-                    }
+                    )
+                {
+                    self.detail_dist_cache = None;
+                    self.request_player_detail(player_id, player_name, true);
                 }
             }
             KeyCode::Char('p') | KeyCode::Char('P') => self.toggle_placeholder_match(),
             KeyCode::Char('R') => {
                 if matches!(self.state.screen, Screen::Analysis)
-                    && self.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+                    && self.state.analysis_tab == state::AnalysisTab::RoleRankings
                 {
                     // Full refresh for latest data.
                     self.clear_rankings_cache();
@@ -400,13 +402,13 @@ impl App {
                             .unwrap_or_else(|| "Team".to_string());
                         self.request_squad(team_id, team_name, true);
                     }
-                } else if matches!(self.state.screen, Screen::PlayerDetail) {
-                    if let (Some(player_id), Some(player_name)) = (
+                } else if matches!(self.state.screen, Screen::PlayerDetail)
+                    && let (Some(player_id), Some(player_name)) = (
                         self.state.player_last_id,
                         self.state.player_last_name.clone(),
-                    ) {
-                        self.request_player_detail(player_id, player_name, true);
-                    }
+                    )
+                {
+                    self.request_player_detail(player_id, player_name, true);
                 }
             }
             KeyCode::Char('i') | KeyCode::Char('I') => self.request_match_details(true),
@@ -425,9 +427,7 @@ impl App {
         let upcoming_filtered = self.state.filtered_upcoming();
         let pulse_rows = self.state.pulse_live_rows();
         let active_id: Option<String> = match &self.state.screen {
-            Screen::Terminal {
-                match_id: Some(id),
-            } => Some(id.clone()),
+            Screen::Terminal { match_id: Some(id) } => Some(id.clone()),
             _ => self.state.selected_match_id(),
         };
         let mut lines = Vec::new();
@@ -499,7 +499,7 @@ impl App {
         let max_rows = 8usize;
         for (idx, row) in pulse_rows.iter().take(max_rows).enumerate() {
             match row {
-                crate::state::PulseLiveRow::Match(match_idx) => {
+                state::PulseLiveRow::Match(match_idx) => {
                     if let Some(m) = self.state.matches.get(*match_idx) {
                         lines.push(format!(
                             "row[{idx}] match id={} league_id={:?} league_name={} live={}",
@@ -509,7 +509,7 @@ impl App {
                         lines.push(format!("row[{idx}] match idx={} missing", match_idx));
                     }
                 }
-                crate::state::PulseLiveRow::Upcoming(up_idx) => {
+                state::PulseLiveRow::Upcoming(up_idx) => {
                     if let Some(u) = self.state.upcoming.get(*up_idx) {
                         lines.push(format!(
                             "row[{idx}] upcoming id={} league_id={:?} league_name={}",
@@ -560,10 +560,9 @@ impl App {
 
     fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
         if match_id == PLACEHOLDER_MATCH_ID && self.state.placeholder_match_enabled {
-            self.state.match_detail.insert(
-                PLACEHOLDER_MATCH_ID.to_string(),
-                placeholder_match_detail(),
-            );
+            self.state
+                .match_detail
+                .insert(PLACEHOLDER_MATCH_ID.to_string(), placeholder_match_detail());
             self.state
                 .match_detail_cached_at
                 .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
@@ -580,11 +579,7 @@ impl App {
             .find(|m| m.id == match_id)
             .map(|m| m.is_live)
             .unwrap_or(false);
-        let cached_at = self
-            .state
-            .match_detail_cached_at
-            .get(match_id)
-            .copied();
+        let cached_at = self.state.match_detail_cached_at.get(match_id).copied();
         let has_cached = self.state.match_detail.contains_key(match_id);
         let has_commentary = self
             .state
@@ -633,7 +628,8 @@ impl App {
     fn request_upcoming(&mut self, announce: bool) {
         if cache_fresh(self.state.upcoming_cached_at, self.upcoming_cache_ttl) {
             if announce {
-                self.state.push_log("[INFO] Upcoming cached (skipping fetch)");
+                self.state
+                    .push_log("[INFO] Upcoming cached (skipping fetch)");
             }
             self.last_upcoming_refresh = Instant::now();
             return;
@@ -664,7 +660,10 @@ impl App {
             return;
         };
         let mode = self.state.league_mode;
-        if tx.send(state::ProviderCommand::FetchAnalysis { mode }).is_err() {
+        if tx
+            .send(state::ProviderCommand::FetchAnalysis { mode })
+            .is_err()
+        {
             if announce {
                 self.state.push_log("[WARN] Analysis request failed");
             }
@@ -682,15 +681,19 @@ impl App {
     fn request_rankings_cache_warm_full(&mut self, announce: bool) {
         let Some(tx) = &self.cmd_tx else {
             if announce {
-                self.state.push_log("[INFO] Rankings cache warm unavailable");
+                self.state
+                    .push_log("[INFO] Rankings cache warm unavailable");
             }
             return;
         };
         let mode = self.state.league_mode;
-        if tx.send(state::ProviderCommand::WarmRankCacheFull { mode }).is_err()
+        if tx
+            .send(state::ProviderCommand::WarmRankCacheFull { mode })
+            .is_err()
         {
             if announce {
-                self.state.push_log("[WARN] Rankings cache warm request failed");
+                self.state
+                    .push_log("[WARN] Rankings cache warm request failed");
             }
         } else {
             if announce {
@@ -706,7 +709,8 @@ impl App {
     fn request_rankings_cache_warm_missing(&mut self, announce: bool) {
         let Some(tx) = &self.cmd_tx else {
             if announce {
-                self.state.push_log("[INFO] Rankings cache warm unavailable");
+                self.state
+                    .push_log("[INFO] Rankings cache warm unavailable");
             }
             return;
         };
@@ -718,7 +722,8 @@ impl App {
         }
         if self.state.analysis.is_empty() {
             if announce {
-                self.state.push_log("[INFO] No teams loaded yet (fetch Analysis first)");
+                self.state
+                    .push_log("[INFO] No teams loaded yet (fetch Analysis first)");
             }
             return;
         }
@@ -742,7 +747,7 @@ impl App {
                     .state
                     .rankings_cache_players
                     .get(&p.id)
-                    .map(|d| crate::state::player_detail_is_stub(d))
+                    .map(state::player_detail_is_stub)
                     .unwrap_or(true);
                 if missing {
                     player_ids.push(p.id);
@@ -769,21 +774,21 @@ impl App {
             ));
         }
 
-        let mode = self.state.league_mode;
         if tx
             .send(state::ProviderCommand::WarmRankCacheMissing {
-                mode,
                 team_ids,
                 player_ids,
             })
             .is_err()
         {
             if announce {
-                self.state.push_log("[WARN] Rankings missing-cache request failed");
+                self.state
+                    .push_log("[WARN] Rankings missing-cache request failed");
             }
         } else {
             if announce {
-                self.state.push_log("[INFO] Rankings missing-cache request sent");
+                self.state
+                    .push_log("[INFO] Rankings missing-cache request sent");
             }
             self.state.rankings_loading = true;
             self.state.rankings_progress_current = 0;
@@ -809,7 +814,14 @@ impl App {
     }
 
     fn recompute_rankings_from_cache(&mut self) {
-        let rows = crate::analysis_rankings::compute_role_rankings_from_cache(
+        // Preserve current selection by player ID before recomputing
+        let prev_player_id = self
+            .state
+            .rankings_filtered()
+            .get(self.state.rankings_selected)
+            .map(|entry| entry.player_id);
+
+        let rows = analysis_rankings::compute_role_rankings_from_cache(
             &self.state.analysis,
             &self.state.rankings_cache_squads,
             &self.state.rankings_cache_players,
@@ -818,11 +830,32 @@ impl App {
             self.state.rankings_progress_message =
                 "No cached player data yet (warming cache...)".to_string();
         } else {
-            self.state.rankings_progress_message = format!("Rankings ready (cached: {})", rows.len());
+            self.state.rankings_progress_message =
+                format!("Rankings ready (cached: {})", rows.len());
             self.state.rankings_fetched_at = Some(SystemTime::now());
         }
         self.state.rankings = rows;
-        self.state.rankings_selected = 0;
+
+        // Restore selection to same player if still present, otherwise clamp
+        if let Some(player_id) = prev_player_id {
+            let filtered = self.state.rankings_filtered();
+            if let Some(new_pos) = filtered
+                .iter()
+                .position(|entry| entry.player_id == player_id)
+            {
+                self.state.rankings_selected = new_pos;
+            } else {
+                let total = filtered.len();
+                self.state.rankings_selected = if total == 0 {
+                    0
+                } else {
+                    total.saturating_sub(1)
+                };
+            }
+        } else {
+            self.state.rankings_selected = 0;
+        }
+
         self.state.rankings_dirty = false;
     }
 
@@ -884,18 +917,13 @@ impl App {
         self.state.player_last_id = Some(player_id);
         self.state.player_last_name = Some(player_name.clone());
         let mut cache_hit = false;
-        if let Some(cached) = self
-            .state
-            .rankings_cache_players
-            .get(&player_id)
-            .cloned()
-        {
+        if let Some(cached) = self.state.rankings_cache_players.get(&player_id).cloned() {
             let cached_at = self
                 .state
                 .rankings_cache_players_at
                 .get(&player_id)
                 .copied();
-            let is_stub = crate::state::player_detail_is_stub(&cached);
+            let is_stub = state::player_detail_is_stub(&cached);
             self.state.player_detail = Some(cached);
             self.state.player_loading = false;
             cache_hit = true;
@@ -946,9 +974,7 @@ impl App {
             .filter(|id| {
                 let cached = self.state.rankings_cache_players.get(id);
                 let cached_at = self.state.rankings_cache_players_at.get(id).copied();
-                let is_stub = cached
-                    .map(|detail| crate::state::player_detail_is_stub(detail))
-                    .unwrap_or(true);
+                let is_stub = cached.map(state::player_detail_is_stub).unwrap_or(true);
                 !cache_fresh(cached_at, self.player_cache_ttl) || is_stub
             })
             .collect();
@@ -1056,10 +1082,9 @@ impl App {
         let summary = placeholder_match_summary(self.state.league_mode);
         self.state.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
         self.state.matches.push(summary);
-        self.state.match_detail.insert(
-            PLACEHOLDER_MATCH_ID.to_string(),
-            placeholder_match_detail(),
-        );
+        self.state
+            .match_detail
+            .insert(PLACEHOLDER_MATCH_ID.to_string(), placeholder_match_detail());
         self.state
             .match_detail_cached_at
             .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
@@ -1075,7 +1100,9 @@ impl App {
     fn disable_placeholder_match(&mut self) {
         self.state.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
         self.state.match_detail.remove(PLACEHOLDER_MATCH_ID);
-        self.state.match_detail_cached_at.remove(PLACEHOLDER_MATCH_ID);
+        self.state
+            .match_detail_cached_at
+            .remove(PLACEHOLDER_MATCH_ID);
         self.state.win_prob_history.remove(PLACEHOLDER_MATCH_ID);
         self.state.placeholder_match_enabled = false;
         self.state.sort_matches();
@@ -1113,13 +1140,13 @@ fn main() -> io::Result<()> {
     // Lightweight debug mode to inspect FotMob match details without launching the TUI.
     // Example: `cargo run -- --dump-match-details 4837312`
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.get(0).map(|s| s.as_str()) == Some("--dump-match-details") {
+    if args.first().map(|s| s.as_str()) == Some("--dump-match-details") {
         let match_id = args.get(1).cloned().unwrap_or_default();
         if match_id.trim().is_empty() {
             eprintln!("usage: --dump-match-details <matchId>");
             return Ok(());
         }
-        match crate::upcoming_fetch::fetch_match_details_from_fotmob(match_id.trim()) {
+        match upcoming_fetch::fetch_match_details_from_fotmob(match_id.trim()) {
             Ok(detail) => {
                 println!(
                     "matchId={match_id}\nevents={}\ncommentary={}\ncommentary_error={}\nstats={}\nlineups={}",
@@ -1131,12 +1158,7 @@ fn main() -> io::Result<()> {
                 );
                 if !detail.commentary.is_empty() {
                     println!("\ncommentary_head:");
-                    for line in detail
-                        .commentary
-                        .iter()
-                        .take(5)
-                        .map(format_commentary_line)
-                    {
+                    for line in detail.commentary.iter().take(5).map(format_commentary_line) {
                         println!("{line}");
                     }
                 }
@@ -1160,7 +1182,7 @@ fn main() -> io::Result<()> {
 
     let mut app = App::new(Some(cmd_tx));
     // Load cached rankings/analysis (if any) for current league.
-    crate::persist::load_into_state(&mut app.state);
+    persist::load_into_state(&mut app.state);
     // Keep upcoming fixtures available even while browsing Live.
     app.request_upcoming(false);
     let res = run_app(&mut terminal, &mut app, rx);
@@ -1174,8 +1196,8 @@ fn main() -> io::Result<()> {
     terminal.show_cursor()?;
 
     // Persist cache on exit.
-    crate::persist::save_from_state(&app.state);
-    crate::http_cache::flush_http_cache();
+    persist::save_from_state(&app.state);
+    http_cache::flush_http_cache();
 
     if let Err(err) = res {
         eprintln!("error: {err}");
@@ -1199,7 +1221,7 @@ fn run_app<B: Backend>(
             app.prefetch_players(ids);
         }
         if matches!(app.state.screen, Screen::Analysis)
-            && app.state.analysis_tab == crate::state::AnalysisTab::RoleRankings
+            && app.state.analysis_tab == state::AnalysisTab::RoleRankings
             && app.state.rankings_dirty
         {
             app.recompute_rankings_from_cache();
@@ -1215,12 +1237,11 @@ fn run_app<B: Backend>(
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::ZERO);
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key);
-                }
-            }
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.on_key(key);
         }
 
         if last_tick.elapsed() >= tick_rate {
@@ -1287,14 +1308,12 @@ fn header_text(state: &AppState) -> String {
                 "READY"
             };
             let tab = match state.analysis_tab {
-                crate::state::AnalysisTab::Teams => "TEAMS",
-                crate::state::AnalysisTab::RoleRankings => "RANKINGS",
+                state::AnalysisTab::Teams => "TEAMS",
+                state::AnalysisTab::RoleRankings => "RANKINGS",
             };
             let fetched = match state.analysis_tab {
-                crate::state::AnalysisTab::Teams => format_fetched_at(state.analysis_fetched_at),
-                crate::state::AnalysisTab::RoleRankings => {
-                    format_fetched_at(state.rankings_fetched_at)
-                }
+                state::AnalysisTab::Teams => format_fetched_at(state.analysis_fetched_at),
+                state::AnalysisTab::RoleRankings => format_fetched_at(state.rankings_fetched_at),
             };
             format!(
                 "WC26 ANALYSIS | {} | Tab: {} | Teams: {} | FIFA: {} | Fetched: {} | {}",
@@ -1330,7 +1349,11 @@ fn header_text(state: &AppState) -> String {
 
 fn format_fetched_at(fetched_at: Option<SystemTime>) -> String {
     fetched_at
-        .map(|stamp| DateTime::<Local>::from(stamp).format("%Y-%m-%d %H:%M").to_string())
+        .map(|stamp| {
+            DateTime::<Local>::from(stamp)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -1351,11 +1374,11 @@ fn footer_text(state: &AppState) -> String {
         }
         Screen::Analysis => {
             match state.analysis_tab {
-                crate::state::AnalysisTab::Teams => {
+                state::AnalysisTab::Teams => {
                     "1 Pulse | b/Esc Back | j/k/↑/↓ Move | Enter Squad | Tab Rankings | r Refresh | ? Help | q Quit"
                         .to_string()
                 }
-                crate::state::AnalysisTab::RoleRankings => {
+                state::AnalysisTab::RoleRankings => {
                     "1 Pulse | b/Esc Back | j/k/↑/↓ Move | ←/→ Role | s Metric | Tab Teams | r Missing | R Full | ? Help | q Quit"
                         .to_string()
                 }
@@ -1423,7 +1446,7 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
             .split(row_area);
 
         match rows[idx] {
-            crate::state::PulseLiveRow::Match(match_idx) => {
+            state::PulseLiveRow::Match(match_idx) => {
                 let Some(m) = state.matches.get(match_idx) else {
                     continue;
                 };
@@ -1494,7 +1517,7 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                     render_cell_text(frame, cols[7], &conf, row_style);
                 }
             }
-            crate::state::PulseLiveRow::Upcoming(upcoming_idx) => {
+            state::PulseLiveRow::Upcoming(upcoming_idx) => {
                 let Some(u) = state.upcoming.get(upcoming_idx) else {
                     continue;
                 };
@@ -1687,8 +1710,8 @@ fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
 
 fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState) {
     match state.analysis_tab {
-        crate::state::AnalysisTab::Teams => render_analysis_teams(frame, area, state),
-        crate::state::AnalysisTab::RoleRankings => render_analysis_rankings(frame, area, state),
+        state::AnalysisTab::Teams => render_analysis_teams(frame, area, state),
+        state::AnalysisTab::RoleRankings => render_analysis_rankings(frame, area, state),
     }
 }
 
@@ -1816,13 +1839,13 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let mut rows: Vec<&crate::state::RoleRankingEntry> = state.rankings_filtered();
+    let mut rows: Vec<&state::RoleRankingEntry> = state.rankings_filtered();
 
     match state.rankings_metric {
-        crate::state::RankMetric::Attacking => {
+        state::RankMetric::Attacking => {
             rows.sort_by(|a, b| b.attack_score.total_cmp(&a.attack_score))
         }
-        crate::state::RankMetric::Defending => {
+        state::RankMetric::Defending => {
             rows.sort_by(|a, b| b.defense_score.total_cmp(&a.defense_score))
         }
     }
@@ -1852,8 +1875,8 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         let entry = rows[idx];
         let rank = idx + 1;
         let score = match state.rankings_metric {
-            crate::state::RankMetric::Attacking => entry.attack_score,
-            crate::state::RankMetric::Defending => entry.defense_score,
+            state::RankMetric::Attacking => entry.attack_score,
+            state::RankMetric::Defending => entry.defense_score,
         };
         let score_text = if score.is_finite() {
             format!("{score:>7.2}")
@@ -2085,18 +2108,23 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     let recent_lines = text_line_count(&recent_text);
 
     let info_text = Text::from(info_text);
-    let league_text = player_league_stats_text_styled(detail, &dist);
-    let top_text = player_top_stats_text_styled(detail, &dist);
+    let league_text = player_league_stats_text_styled(detail, dist);
+    let top_text = player_top_stats_text_styled(detail, dist);
     let traits_text = Text::from(traits_text);
-    let other_text = player_season_performance_text_styled(detail, &dist);
-    let season_text = player_season_breakdown_text_styled(detail, &dist);
+    let other_text = player_season_performance_text_styled(detail, dist);
+    let season_text = player_season_breakdown_text_styled(detail, dist);
     let career_text = Text::from(career_text);
     let trophies_text = Text::from(trophies_text);
-    let recent_text = player_recent_matches_text_styled(detail, &dist);
+    let recent_text = player_recent_matches_text_styled(detail, dist);
 
     if state.player_detail_expanded {
         let (title, body, lines, scroll) = match state.player_detail_section {
-            0 => ("Player Info", info_text.clone(), info_lines, state.player_detail_section_scrolls[0]),
+            0 => (
+                "Player Info",
+                info_text.clone(),
+                info_lines,
+                state.player_detail_section_scrolls[0],
+            ),
             1 => (
                 "All Competitions",
                 league_text.clone(),
@@ -2278,25 +2306,26 @@ fn player_detail_has_stats(detail: &PlayerDetail) -> bool {
 }
 
 fn player_detail_text(detail: &PlayerDetail) -> String {
-    let mut lines = Vec::new();
-    lines.push(player_info_text(detail));
-    lines.push(String::new());
-    lines.push(player_league_stats_text(detail));
-    lines.push(String::new());
-    lines.push(player_top_stats_text(detail));
-    lines.push(String::new());
-    lines.push(player_traits_text(detail));
-    lines.push(String::new());
-    lines.push(player_season_performance_text(detail));
-    lines.push(String::new());
-    lines.push(player_season_breakdown_text(detail));
-    lines.push(String::new());
-    lines.push(player_career_text(detail));
-    lines.push(String::new());
-    lines.push(player_trophies_text(detail));
-    lines.push(String::new());
-    lines.push(player_recent_matches_text(detail));
-    lines.join("\n")
+    vec![
+        player_info_text(detail),
+        String::new(),
+        player_league_stats_text(detail),
+        String::new(),
+        player_top_stats_text(detail),
+        String::new(),
+        player_traits_text(detail),
+        String::new(),
+        player_season_performance_text(detail),
+        String::new(),
+        player_season_breakdown_text(detail),
+        String::new(),
+        player_career_text(detail),
+        String::new(),
+        player_trophies_text(detail),
+        String::new(),
+        player_recent_matches_text(detail),
+    ]
+    .join("\n")
 }
 
 struct StatDistributions {
@@ -2607,15 +2636,15 @@ fn player_league_stats_text(detail: &PlayerDetail) -> String {
         return lines.join("\n");
     }
 
-    if let Some(league) = detail.main_league.as_ref() {
-        if !league.stats.is_empty() {
-            let mut lines = Vec::new();
-            lines.push(format!("{} ({})", league.league_name, league.season));
-            for stat in league.stats.iter().take(8) {
-                lines.push(format!("{}: {}", stat.title, stat.value));
-            }
-            return lines.join("\n");
+    if let Some(league) = detail.main_league.as_ref()
+        && !league.stats.is_empty()
+    {
+        let mut lines = Vec::new();
+        lines.push(format!("{} ({})", league.league_name, league.season));
+        for stat in league.stats.iter().take(8) {
+            lines.push(format!("{}: {}", stat.title, stat.value));
         }
+        return lines.join("\n");
     }
 
     "No league stats available".to_string()
@@ -2629,9 +2658,7 @@ fn player_league_stats_text_styled(
     let mut lines: Vec<Line> = Vec::new();
     if !detail.all_competitions.is_empty() {
         let season_label = detail.all_competitions_season.as_deref().unwrap_or("-");
-        lines.push(Line::from(format!(
-            "All competitions ({season_label})"
-        )));
+        lines.push(Line::from(format!("All competitions ({season_label})")));
         for stat in detail.all_competitions.iter().take(8) {
             let value = stat.value.clone();
             let style = style_from_percentile(stat.percentile_rank_per90)
@@ -2645,24 +2672,27 @@ fn player_league_stats_text_styled(
             ]));
         }
     }
-    if let Some(league) = detail.main_league.as_ref() {
-        if !league.stats.is_empty() {
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            lines.push(Line::from(format!("{} ({})", league.league_name, league.season)));
-            for stat in league.stats.iter().take(8) {
-                let value = stat.value.clone();
-                let style = style_from_percentile(stat.percentile_rank_per90)
-                    .or_else(|| style_from_percentile(stat.percentile_rank))
-                    .unwrap_or_else(|| {
-                        style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
-                    });
-                lines.push(Line::from(vec![
-                    Span::raw(format!("  {}: ", stat.title)),
-                    Span::styled(value, style),
-                ]));
-            }
+    if let Some(league) = detail.main_league.as_ref()
+        && !league.stats.is_empty()
+    {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(format!(
+            "{} ({})",
+            league.league_name, league.season
+        )));
+        for stat in league.stats.iter().take(8) {
+            let value = stat.value.clone();
+            let style = style_from_percentile(stat.percentile_rank_per90)
+                .or_else(|| style_from_percentile(stat.percentile_rank))
+                .unwrap_or_else(|| {
+                    style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
+                });
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", stat.title)),
+                Span::styled(value, style),
+            ]));
         }
     }
     if lines.is_empty() {
@@ -2683,10 +2713,7 @@ fn player_top_stats_text(detail: &PlayerDetail) -> String {
     lines.join("\n")
 }
 
-fn player_top_stats_text_styled(
-    detail: &PlayerDetail,
-    dist: &StatDistributions,
-) -> Text<'static> {
+fn player_top_stats_text_styled(detail: &PlayerDetail, dist: &StatDistributions) -> Text<'static> {
     if detail.top_stats.is_empty() {
         return Text::from("No all-competitions top stats".to_string());
     }
@@ -2696,9 +2723,7 @@ fn player_top_stats_text_styled(
         let value = stat.value.clone();
         let style = style_from_percentile(stat.percentile_rank_per90)
             .or_else(|| style_from_percentile(stat.percentile_rank))
-            .unwrap_or_else(|| {
-                style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
-            });
+            .unwrap_or_else(|| style_for_stat(dist, role, &stat.title, parse_stat_value(&value)));
         lines.push(Line::from(vec![
             Span::raw(format!("{}: ", stat.title)),
             Span::styled(value, style),
@@ -2738,7 +2763,7 @@ fn format_with_commas(raw: &str) -> String {
     for (idx, ch) in trimmed.chars().enumerate() {
         out.push(ch);
         let remaining = len - idx - 1;
-        if remaining > 0 && remaining % 3 == 0 {
+        if remaining > 0 && remaining.is_multiple_of(3) {
             out.push(',');
         }
     }
@@ -2918,11 +2943,8 @@ fn player_recent_matches_text_styled(
     for m in detail.recent_matches.iter().take(10) {
         let date = shorten_date(&m.date);
         let rating = m.rating.as_deref().unwrap_or("-");
-        let rating_style = style_for_rating(
-            dist,
-            role,
-            m.rating.as_deref().and_then(parse_stat_value),
-        );
+        let rating_style =
+            style_for_rating(dist, role, m.rating.as_deref().and_then(parse_stat_value));
         lines.push(Line::from(vec![
             Span::raw(format!(
                 "{date} vs {} | {} | G {} A {} | R ",
@@ -3078,7 +3100,11 @@ fn visible_range(selected: usize, total: usize, visible: usize) -> (usize, usize
 fn terminal_block(title: &str, focused: bool) -> Block<'_> {
     let mut block = Block::default().title(title).borders(Borders::ALL);
     if focused {
-        block = block.border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        block = block.border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
     }
     block
 }
@@ -3118,15 +3144,14 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(columns[2]);
 
     let match_list = match_list_text(state);
-    let left_match = Paragraph::new(match_list)
-        .block(terminal_block(
-            "Match List",
-            state.terminal_focus == TerminalFocus::MatchList,
-        ));
+    let left_match = Paragraph::new(match_list).block(terminal_block(
+        "Match List",
+        state.terminal_focus == TerminalFocus::MatchList,
+    ));
     frame.render_widget(left_match, left_chunks[0]);
 
-    let standings = Paragraph::new("Standings placeholder")
-        .block(terminal_block("Group Mini", false));
+    let standings =
+        Paragraph::new("Standings placeholder").block(terminal_block("Group Mini", false));
     frame.render_widget(standings, left_chunks[1]);
 
     render_pitch(frame, middle_chunks[0], state);
@@ -3152,18 +3177,16 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
     render_lineups(frame, right_chunks[1], state);
 
     let preds_text = prediction_text(state);
-    let preds = Paragraph::new(preds_text)
-        .block(terminal_block(
-            "Prediction",
-            state.terminal_focus == TerminalFocus::Prediction,
-        ));
+    let preds = Paragraph::new(preds_text).block(terminal_block(
+        "Prediction",
+        state.terminal_focus == TerminalFocus::Prediction,
+    ));
     frame.render_widget(preds, right_chunks[2]);
 
-    let console = Paragraph::new(console_text(state))
-        .block(terminal_block(
-            "Console",
-            state.terminal_focus == TerminalFocus::Console,
-        ));
+    let console = Paragraph::new(console_text(state)).block(terminal_block(
+        "Console",
+        state.terminal_focus == TerminalFocus::Console,
+    ));
     frame.render_widget(console, rows[1]);
 }
 
@@ -3175,9 +3198,7 @@ fn match_list_text(state: &AppState) -> String {
 
     let selected_id = state.selected_match_id();
     let active_id = match &state.screen {
-        Screen::Terminal {
-            match_id: Some(id),
-        } => Some(id.as_str()),
+        Screen::Terminal { match_id: Some(id) } => Some(id.as_str()),
         _ => selected_id.as_deref(),
     };
 
@@ -3250,7 +3271,7 @@ fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let mut sides = lineups.sides.clone();
     sides.sort_by(|a, b| a.team_abbr.cmp(&b.team_abbr));
-    let left = sides.get(0);
+    let left = sides.first();
     let right = sides.get(1);
 
     let cols = Layout::default()
@@ -3291,9 +3312,8 @@ fn pitch_text(state: &AppState, width: usize, height: usize) -> String {
 
     let home = &lineups.sides[0];
     let away = &lineups.sides[1];
-    let mut lines = Vec::new();
-    lines.extend(pitch_team_lines("AWAY", away, width));
-    let sep = "-".repeat(width.min(24).max(4));
+    let sep = "-".repeat(width.clamp(4, 24));
+    let mut lines = pitch_team_lines("AWAY", away, width);
     lines.push(center_line(&sep, width));
     lines.extend(pitch_team_lines("HOME", home, width));
 
@@ -3303,7 +3323,7 @@ fn pitch_text(state: &AppState, width: usize, height: usize) -> String {
     lines.join("\n")
 }
 
-fn pitch_team_lines(label: &str, side: &crate::state::LineupSide, width: usize) -> Vec<String> {
+fn pitch_team_lines(label: &str, side: &state::LineupSide, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(crop_line(
         &format!("{label} {} ({})", side.team_abbr, side.formation),
@@ -3313,7 +3333,7 @@ fn pitch_team_lines(label: &str, side: &crate::state::LineupSide, width: usize) 
     lines
 }
 
-fn pitch_pos_lines(players: &[crate::state::PlayerSlot], width: usize) -> Vec<String> {
+fn pitch_pos_lines(players: &[state::PlayerSlot], width: usize) -> Vec<String> {
     let mut gk = Vec::new();
     let mut df = Vec::new();
     let mut mf = Vec::new();
@@ -3331,11 +3351,12 @@ fn pitch_pos_lines(players: &[crate::state::PlayerSlot], width: usize) -> Vec<St
         }
     }
 
-    let mut lines = Vec::new();
-    lines.push(crop_line(&format_pos_line("GK", &gk), width));
-    lines.push(crop_line(&format_pos_line("DF", &df), width));
-    lines.push(crop_line(&format_pos_line("MF", &mf), width));
-    lines.push(crop_line(&format_pos_line("FW", &fw), width));
+    let mut lines = vec![
+        crop_line(&format_pos_line("GK", &gk), width),
+        crop_line(&format_pos_line("DF", &df), width),
+        crop_line(&format_pos_line("MF", &mf), width),
+        crop_line(&format_pos_line("FW", &fw), width),
+    ];
     if !other.is_empty() {
         lines.push(crop_line(&format_pos_line("OT", &other), width));
     }
@@ -3405,7 +3426,7 @@ fn format_player(player: &state::PlayerSlot) -> String {
         .number
         .map(|n| n.to_string())
         .unwrap_or_else(|| "--".to_string());
-    let pos = player.pos.clone().unwrap_or_else(|| "".to_string());
+    let pos = player.pos.clone().unwrap_or_default();
     if pos.is_empty() {
         format!("{num} {}", player.name)
     } else {
@@ -3465,32 +3486,6 @@ fn ticker_full_text(state: &AppState) -> String {
     }
     if detail.events.is_empty() {
         return "No ticker yet".to_string();
-    }
-    detail
-        .events
-        .iter()
-        .map(|event| {
-            format!(
-                "{}' {} {} {}",
-                event.minute,
-                event_kind_label(event.kind),
-                event.team,
-                event.description
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn events_full_text(state: &AppState) -> String {
-    let Some(match_id) = state.selected_match_id() else {
-        return "No match selected".to_string();
-    };
-    let Some(detail) = state.match_detail.get(&match_id) else {
-        return "No events yet".to_string();
-    };
-    if detail.events.is_empty() {
-        return "No events yet".to_string();
     }
     detail
         .events
@@ -3614,30 +3609,30 @@ fn prediction_detail_text(state: &AppState) -> String {
     };
 
     let mut lines = vec![
-        format!("Home win: {:.1}%", m.win.p_home),
+        format!("{}: {:.1}%", m.home, m.win.p_home),
         format!("Draw: {:.1}%", m.win.p_draw),
-        format!("Away win: {:.1}%", m.win.p_away),
+        format!("{}: {:.1}%", m.away, m.win.p_away),
         format!("Delta home: {:+.1}", m.win.delta_home),
         format!("Model: {}", quality_label(m.win.quality)),
         format!("Confidence: {}", m.win.confidence),
     ];
 
-    if let Some(history) = state.win_prob_history.get(&m.id) {
-        if !history.is_empty() {
-            let start = history.len().saturating_sub(10);
-            let slice = &history[start..];
-            let points = slice
-                .iter()
-                .map(|val| format!("{:.0}", val))
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(String::new());
-            lines.push(format!(
-                "Home win history (last {}): {}",
-                slice.len(),
-                points
-            ));
-        }
+    if let Some(history) = state.win_prob_history.get(&m.id)
+        && !history.is_empty()
+    {
+        let start = history.len().saturating_sub(10);
+        let slice = &history[start..];
+        let points = slice
+            .iter()
+            .map(|val| format!("{:.0}", val))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(String::new());
+        lines.push(format!(
+            "Home win history (last {}): {}",
+            slice.len(),
+            points
+        ));
     }
 
     lines.join("\n")
@@ -3721,18 +3716,18 @@ fn match_detail_overview_text(state: &AppState) -> String {
         }));
     }
 
-    if let Some(lineups) = &detail.lineups {
-        if !lineups.sides.is_empty() {
-            lines.push(String::new());
-            lines.push("Lineups:".to_string());
-            let mut sides = lineups.sides.clone();
-            sides.sort_by(|a, b| a.team_abbr.cmp(&b.team_abbr));
-            for (idx, side) in sides.iter().enumerate() {
-                if idx > 0 {
-                    lines.push(String::new());
-                }
-                lines.extend(lineup_text(side).lines().map(|line| line.to_string()));
+    if let Some(lineups) = &detail.lineups
+        && !lineups.sides.is_empty()
+    {
+        lines.push(String::new());
+        lines.push("Lineups:".to_string());
+        let mut sides = lineups.sides.clone();
+        sides.sort_by(|a, b| a.team_abbr.cmp(&b.team_abbr));
+        for (idx, side) in sides.iter().enumerate() {
+            if idx > 0 {
+                lines.push(String::new());
             }
+            lines.extend(lineup_text(side).lines().map(|line| line.to_string()));
         }
     }
 
@@ -3811,7 +3806,7 @@ fn format_countdown(raw: &str, now: DateTime<Utc>) -> String {
     let Some(dt) = parse_kickoff(cleaned) else {
         return "TBD".to_string();
     };
-    let kickoff = DateTime::<Utc>::from_utc(dt, Utc);
+    let kickoff = Utc.from_utc_datetime(&dt);
     let delta = kickoff.signed_duration_since(now);
     let total_secs = delta.num_seconds();
     if total_secs <= 0 {
@@ -3841,7 +3836,7 @@ fn format_countdown_short(raw: &str, now: DateTime<Utc>) -> String {
     let Some(dt) = parse_kickoff(cleaned) else {
         return "TBD".to_string();
     };
-    let kickoff = DateTime::<Utc>::from_utc(dt, Utc);
+    let kickoff = Utc.from_utc_datetime(&dt);
     let delta = kickoff.signed_duration_since(now);
     let total_secs = delta.num_seconds();
     if total_secs <= 0 {
@@ -4014,7 +4009,7 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
     text.lines()
         .map(|line| {
             let len = line.chars().count();
-            let chunks = (len + width - 1) / width;
+            let chunks = len.div_ceil(width);
             chunks.max(1)
         })
         .sum()

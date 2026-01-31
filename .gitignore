@@ -1,2 +1,8 @@
 /target
 .env.local
+*.xlsx
+*.zip
+Screenshot*.png
+CACHING_REPORT.md
+bug_reports/*.png
+bug_reports/matches_dump_*.txt

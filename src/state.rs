@@ -252,6 +252,7 @@ pub enum LeagueMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum Confederation {
     AFC,
     CAF,
@@ -323,6 +324,12 @@ pub struct AppState {
     pub terminal_detail_scroll: u16,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn maybe_clear_export(&mut self, now: std::time::Instant) {
         self.export.clear_if_done_for(now, 8);
@@ -335,7 +342,8 @@ impl AppState {
 
         let league_pl_ids = parse_ids_env_or_default("APP_LEAGUE_PREMIER_IDS", DEFAULT_PREMIER_IDS);
         let league_ll_ids = parse_ids_env_or_default("APP_LEAGUE_LALIGA_IDS", DEFAULT_LALIGA_IDS);
-        let league_wc_ids = parse_ids_env_or_default("APP_LEAGUE_WORLDCUP_IDS", DEFAULT_WORLDCUP_IDS);
+        let league_wc_ids =
+            parse_ids_env_or_default("APP_LEAGUE_WORLDCUP_IDS", DEFAULT_WORLDCUP_IDS);
         Self {
             screen: Screen::Pulse,
             sort: SortMode::Hot,
@@ -404,9 +412,7 @@ impl AppState {
 
     pub fn selected_match(&self) -> Option<&MatchSummary> {
         match &self.screen {
-            Screen::Terminal {
-                match_id: Some(id),
-            } => self.matches.iter().find(|m| &m.id == id),
+            Screen::Terminal { match_id: Some(id) } => self.matches.iter().find(|m| &m.id == id),
             Screen::Pulse => {
                 if self.pulse_view != PulseView::Live {
                     return None;
@@ -656,8 +662,16 @@ impl AppState {
             .map(|(idx, _)| idx)
             .collect();
         upcoming_indices.sort_by(|a, b| {
-            let ka = self.upcoming.get(*a).map(|u| u.kickoff.as_str()).unwrap_or("");
-            let kb = self.upcoming.get(*b).map(|u| u.kickoff.as_str()).unwrap_or("");
+            let ka = self
+                .upcoming
+                .get(*a)
+                .map(|u| u.kickoff.as_str())
+                .unwrap_or("");
+            let kb = self
+                .upcoming
+                .get(*b)
+                .map(|u| u.kickoff.as_str())
+                .unwrap_or("");
             ka.cmp(kb)
         });
         for idx in upcoming_indices {
@@ -907,10 +921,9 @@ impl AppState {
         if let Some(scroll) = self
             .player_detail_section_scrolls
             .get_mut(self.player_detail_section)
+            && *scroll < max_scroll
         {
-            if *scroll < max_scroll {
-                *scroll = (*scroll + 1).min(max_scroll);
-            }
+            *scroll = (*scroll + 1).min(max_scroll);
         }
     }
 
@@ -921,10 +934,9 @@ impl AppState {
         if let Some(scroll) = self
             .player_detail_section_scrolls
             .get_mut(self.player_detail_section)
+            && *scroll > 0
         {
-            if *scroll > 0 {
-                *scroll = scroll.saturating_sub(1);
-            }
+            *scroll = scroll.saturating_sub(1);
         }
     }
 
@@ -953,6 +965,12 @@ pub struct ExportState {
     pub message: String,
     pub error_count: usize,
     pub last_updated: Option<std::time::Instant>,
+}
+
+impl Default for ExportState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExportState {
@@ -1260,7 +1278,6 @@ pub enum Delta {
     SetAnalysis(Vec<TeamAnalysis>),
     CacheSquad {
         team_id: u32,
-        team_name: String,
         players: Vec<SquadPlayer>,
     },
     CachePlayerDetail(PlayerDetail),
@@ -1306,19 +1323,35 @@ pub enum Delta {
 
 #[derive(Debug, Clone)]
 pub enum ProviderCommand {
-    FetchMatchDetails { fixture_id: String },
+    FetchMatchDetails {
+        fixture_id: String,
+    },
     FetchUpcoming,
-    FetchAnalysis { mode: LeagueMode },
-    FetchSquad { team_id: u32, team_name: String },
-    FetchPlayer { player_id: u32, player_name: String },
-    PrefetchPlayers { player_ids: Vec<u32> },
-    WarmRankCacheFull { mode: LeagueMode },
-    WarmRankCacheMissing {
+    FetchAnalysis {
         mode: LeagueMode,
+    },
+    FetchSquad {
+        team_id: u32,
+        team_name: String,
+    },
+    FetchPlayer {
+        player_id: u32,
+        player_name: String,
+    },
+    PrefetchPlayers {
+        player_ids: Vec<u32>,
+    },
+    WarmRankCacheFull {
+        mode: LeagueMode,
+    },
+    WarmRankCacheMissing {
         team_ids: Vec<u32>,
         player_ids: Vec<u32>,
     },
-    ExportAnalysis { path: String, mode: LeagueMode },
+    ExportAnalysis {
+        path: String,
+        mode: LeagueMode,
+    },
 }
 
 pub fn apply_delta(state: &mut AppState, delta: Delta) {
@@ -1354,14 +1387,13 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.matches = matches;
             state.sort_matches_with_selected_id(selected_id);
             if preserve_index {
-                state.selected = preserved_selected.min(state.pulse_live_rows().len().saturating_sub(1));
+                state.selected =
+                    preserved_selected.min(state.pulse_live_rows().len().saturating_sub(1));
             }
         }
         Delta::SetMatchDetails { id, detail } => {
             state.match_detail.insert(id.clone(), detail);
-            state
-                .match_detail_cached_at
-                .insert(id, SystemTime::now());
+            state.match_detail_cached_at.insert(id, SystemTime::now());
         }
         Delta::UpsertMatch(mut summary) => {
             let match_id = summary.id.clone();
@@ -1373,10 +1405,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 summary.win.delta_home = 0.0;
                 state.matches.push(summary);
             }
-            let entry = state
-                .win_prob_history
-                .entry(match_id)
-                .or_insert_with(Vec::new);
+            let entry = state.win_prob_history.entry(match_id).or_default();
             entry.push(home_prob);
             if entry.len() > 40 {
                 let keep = entry.split_off(entry.len() - 40);
@@ -1408,11 +1437,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.analysis_loading = false;
             state.analysis_selected = 0;
         }
-        Delta::CacheSquad {
-            team_id,
-            team_name: _,
-            players,
-        } => {
+        Delta::CacheSquad { team_id, players } => {
             if !players.is_empty() {
                 state.rankings_cache_squads.insert(team_id, players);
                 state
@@ -1444,11 +1469,10 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         }
         Delta::RankCacheFinished { errors } => {
             state.rankings_loading = false;
-            state.rankings_progress_current = state.rankings_progress_total.max(state.rankings_progress_current);
-            state.rankings_progress_message = format!(
-                "Cache warm done ({} errors)",
-                errors.len()
-            );
+            state.rankings_progress_current = state
+                .rankings_progress_total
+                .max(state.rankings_progress_current);
+            state.rankings_progress_message = format!("Cache warm done ({} errors)", errors.len());
             for err in errors {
                 state.push_log(format!("[WARN] Rankings cache: {err}"));
             }
@@ -1466,8 +1490,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             if state.squad.is_empty() {
                 state.squad_prefetch_pending = None;
             } else {
-                state.squad_prefetch_pending =
-                    Some(state.squad.iter().map(|p| p.id).collect());
+                state.squad_prefetch_pending = Some(state.squad.iter().map(|p| p.id).collect());
             }
             // Also cache for rankings so we don't refetch later.
             if !state.squad.is_empty() {
@@ -1495,15 +1518,15 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             }
             state.player_loading = false;
             // Cache for rankings reuse.
-            if let Some(detail) = state.player_detail.clone() {
-                if !player_detail_is_stub(&detail) {
-                    let detail_id = detail.id;
-                    state.rankings_cache_players.insert(detail_id, detail);
-                    state
-                        .rankings_cache_players_at
-                        .insert(detail_id, SystemTime::now());
-                    state.rankings_dirty = true;
-                }
+            if let Some(detail) = state.player_detail.clone()
+                && !player_detail_is_stub(&detail)
+            {
+                let detail_id = detail.id;
+                state.rankings_cache_players.insert(detail_id, detail);
+                state
+                    .rankings_cache_players_at
+                    .insert(detail_id, SystemTime::now());
+                state.rankings_dirty = true;
             }
         }
         Delta::ExportStarted { path, total } => {
@@ -1587,16 +1610,16 @@ fn parse_ids_env_or_default(key: &str, default_ids: &[u32]) -> Vec<u32> {
 }
 
 fn parse_ids(raw: String) -> Vec<u32> {
-    raw.split(|c| c == ',' || c == ';' || c == ' ')
+    raw.split([',', ';', ' '])
         .filter_map(|part| part.trim().parse::<u32>().ok())
         .collect()
 }
 
 fn matches_league(m: &MatchSummary, ids: &[u32], keywords: &[&str]) -> bool {
-    if let Some(id) = m.league_id {
-        if !ids.is_empty() {
-            return ids.contains(&id);
-        }
+    if let Some(id) = m.league_id
+        && !ids.is_empty()
+    {
+        return ids.contains(&id);
     }
     if !m.league_name.is_empty() {
         let name = m.league_name.to_lowercase();
@@ -1606,10 +1629,10 @@ fn matches_league(m: &MatchSummary, ids: &[u32], keywords: &[&str]) -> bool {
 }
 
 fn matches_league_upcoming(m: &UpcomingMatch, ids: &[u32], keywords: &[&str]) -> bool {
-    if let Some(id) = m.league_id {
-        if !ids.is_empty() {
-            return ids.contains(&id);
-        }
+    if let Some(id) = m.league_id
+        && !ids.is_empty()
+    {
+        return ids.contains(&id);
     }
     if !m.league_name.is_empty() {
         let name = m.league_name.to_lowercase();
@@ -1637,7 +1660,7 @@ pub fn confed_label(confed: Confederation) -> &'static str {
     }
 }
 
-pub(crate) fn player_detail_is_stub(detail: &PlayerDetail) -> bool {
+pub fn player_detail_is_stub(detail: &PlayerDetail) -> bool {
     detail.team.is_none()
         && detail.position.is_none()
         && detail.age.is_none()

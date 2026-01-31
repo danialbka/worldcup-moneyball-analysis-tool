@@ -165,10 +165,10 @@ fn save_cache_file(cache: &HttpCacheFile) -> Result<()> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    if let Ok(base) = env::var("XDG_CACHE_HOME") {
-        if !base.trim().is_empty() {
-            return Some(PathBuf::from(base).join(CACHE_DIR).join(CACHE_FILE));
-        }
+    if let Ok(base) = env::var("XDG_CACHE_HOME")
+        && !base.trim().is_empty()
+    {
+        return Some(PathBuf::from(base).join(CACHE_DIR).join(CACHE_FILE));
     }
     let home = env::var("HOME").ok()?;
     if home.trim().is_empty() {

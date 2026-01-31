@@ -560,10 +560,10 @@ fn find_stat_value(
         {
             continue;
         }
-        if let Some(per90) = per90 {
-            if let Some(v) = parse_number(per90) {
-                return Some(v);
-            }
+        if let Some(per90) = per90
+            && let Some(v) = parse_number(per90)
+        {
+            return Some(v);
         }
         if let Some(v) = parse_number(total) {
             return Some(v);
@@ -586,10 +586,10 @@ fn find_stat_percent(detail: &PlayerDetail, needles: &[&str], excludes: &[&str])
         {
             continue;
         }
-        if let Some(per90) = per90 {
-            if let Some(v) = parse_percent(per90) {
-                return Some(v);
-            }
+        if let Some(per90) = per90
+            && let Some(v) = parse_percent(per90)
+        {
+            return Some(v);
         }
         if let Some(v) = parse_percent(total) {
             return Some(v);
@@ -673,7 +673,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
         if h[start].to_ascii_lowercase().eq(&n[0].to_ascii_lowercase()) {
             let mut matched = true;
             for idx in 1..n.len() {
-                if h[start + idx].to_ascii_lowercase() != n[idx].to_ascii_lowercase() {
+                if !h[start + idx].eq_ignore_ascii_case(&n[idx]) {
                     matched = false;
                     break;
                 }

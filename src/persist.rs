@@ -82,9 +82,7 @@ pub fn load_into_state(state: &mut AppState) {
     state.rankings_dirty = state.rankings.is_empty();
 
     state.combined_player_cache.clear();
-    state
-        .combined_player_cache
-        .extend(league.players.clone().into_iter());
+    state.combined_player_cache.extend(league.players.clone());
     if matches!(
         state.league_mode,
         LeagueMode::PremierLeague | LeagueMode::LaLiga
@@ -95,9 +93,7 @@ pub fn load_into_state(state: &mut AppState) {
             LeagueMode::WorldCup => "",
         };
         if let Some(other) = cache.leagues.get(other_key) {
-            state
-                .combined_player_cache
-                .extend(other.players.clone().into_iter());
+            state.combined_player_cache.extend(other.players.clone());
         }
     }
 
@@ -171,10 +167,10 @@ fn load_cache_file(path: &Path) -> Option<CacheFile> {
 
 fn cache_path() -> Option<PathBuf> {
     // Prefer XDG cache.
-    if let Ok(base) = std::env::var("XDG_CACHE_HOME") {
-        if !base.trim().is_empty() {
-            return Some(PathBuf::from(base).join(CACHE_DIR).join(CACHE_FILE));
-        }
+    if let Ok(base) = std::env::var("XDG_CACHE_HOME")
+        && !base.trim().is_empty()
+    {
+        return Some(PathBuf::from(base).join(CACHE_DIR).join(CACHE_FILE));
     }
     // Fallback to ~/.cache on linux-like systems.
     let home = std::env::var("HOME").ok()?;

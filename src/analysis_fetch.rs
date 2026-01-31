@@ -375,7 +375,7 @@ pub fn fetch_premier_league_team_analysis() -> AnalysisFetch {
         }
     };
 
-    let teams = match fetch_league_teams(&client, 47) {
+    let teams = match fetch_league_teams(client, 47) {
         Ok(teams) => teams,
         Err(err) => {
             errors.push(format!("premier league teams fetch failed: {err}"));
@@ -435,7 +435,7 @@ pub fn fetch_la_liga_team_analysis() -> AnalysisFetch {
         }
     };
 
-    let teams = match fetch_league_teams(&client, 87) {
+    let teams = match fetch_league_teams(client, 87) {
         Ok(teams) => teams,
         Err(err) => {
             errors.push(format!("la liga teams fetch failed: {err}"));
@@ -579,7 +579,6 @@ struct TeamOverview {
     fifa_points: Option<u32>,
     fifa_updated: Option<String>,
 }
-
 
 #[derive(Debug, Deserialize)]
 struct LeagueResponse {
@@ -732,29 +731,23 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
     let mut last_err = None;
     let mut parsed: Option<PlayerDetail> = None;
     for attempt in 0..3 {
-        let resp = fetch_json_cached(
-            client,
-            &url,
-            &[("Accept-Language", "en-GB,en;q=0.9")],
-        );
+        let resp = fetch_json_cached(client, &url, &[("Accept-Language", "en-GB,en;q=0.9")]);
 
         match resp {
-            Ok(body) => {
-                match parse_player_detail_json(&body) {
-                    Ok(data) => {
-                        parsed = Some(data);
-                        break;
-                    }
-                    Err(err) => {
-                        last_err = Some(err);
-                        if attempt < 2 {
-                            std::thread::sleep(Duration::from_millis(300));
-                            continue;
-                        }
-                        break;
-                    }
+            Ok(body) => match parse_player_detail_json(&body) {
+                Ok(data) => {
+                    parsed = Some(data);
+                    break;
                 }
-            }
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    break;
+                }
+            },
             Err(err) => {
                 last_err = Some(anyhow::anyhow!("request failed: {err}"));
                 if attempt < 2 {
@@ -766,8 +759,8 @@ pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
         }
     }
 
-    let parsed = parsed
-        .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("player fetch failed")))?;
+    let parsed =
+        parsed.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("player fetch failed")))?;
     Ok(parsed)
 }
 
@@ -927,10 +920,7 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
                         .iter()
                         .map(|stat| PlayerSeasonPerformanceItem {
                             title: stat.title.clone(),
-                            total: format_stat_value(
-                                &stat.stat_value,
-                                stat.stat_format.as_deref(),
-                            ),
+                            total: format_stat_value(&stat.stat_value, stat.stat_format.as_deref()),
                             per90: format_per90(stat.per90, stat.stat_format.as_deref()),
                             percentile_rank: stat.percentile_rank,
                             percentile_rank_per90: stat.percentile_rank_per90,
@@ -1276,10 +1266,7 @@ where
     T: Send,
 {
     let threads = fetch_parallelism();
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-    {
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
         Ok(pool) => pool.install(action),
         Err(_) => action(),
     }
@@ -1540,7 +1527,11 @@ struct PlayerStatValueDetail {
     per90: Option<f64>,
     #[serde(rename = "percentileRank", default, deserialize_with = "float_or_none")]
     percentile_rank: Option<f64>,
-    #[serde(rename = "percentileRankPer90", default, deserialize_with = "float_or_none")]
+    #[serde(
+        rename = "percentileRankPer90",
+        default,
+        deserialize_with = "float_or_none"
+    )]
     percentile_rank_per90: Option<f64>,
 }
 
