@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT};
+use reqwest::header::{
+    CACHE_CONTROL, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT,
+};
 use serde::{Deserialize, Serialize};
 
 const CACHE_VERSION: u32 = 1;
@@ -32,6 +34,8 @@ struct CacheEntry {
     etag: Option<String>,
     last_modified: Option<String>,
     fetched_at: u64,
+    #[serde(default)]
+    max_age_secs: Option<u64>,
 }
 
 struct CacheState {
@@ -51,6 +55,15 @@ pub fn fetch_json_cached(
         state.cache.entries.get(url).cloned()
     };
 
+    if let Some(entry) = cached_entry.as_ref() {
+        if let Some(max_age) = entry.max_age_secs {
+            let now = system_time_to_secs(SystemTime::now()).unwrap_or_default();
+            if now.saturating_sub(entry.fetched_at) < max_age {
+                return Ok(entry.body.clone());
+            }
+        }
+    }
+
     let mut req = client.get(url).header(USER_AGENT, "Mozilla/5.0");
     for (name, value) in extra_headers {
         req = req.header(*name, *value);
@@ -69,8 +82,25 @@ pub fn fetch_json_cached(
     let headers = resp.headers().clone();
     if status == StatusCode::NOT_MODIFIED {
         if let Some(entry) = cached_entry {
-            refresh_cache_entry(url, entry.clone());
-            return Ok(entry.body);
+            let mut updated = entry.clone();
+            updated.fetched_at = system_time_to_secs(SystemTime::now()).unwrap_or_default();
+            updated.etag = headers
+                .get(ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string())
+                .or(updated.etag);
+            updated.last_modified = headers
+                .get(LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string())
+                .or(updated.last_modified);
+            updated.max_age_secs = headers
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_cache_control_max_age)
+                .or(updated.max_age_secs);
+            refresh_cache_entry(url, updated.clone());
+            return Ok(updated.body);
         }
         return Err(anyhow::anyhow!("received 304 without cache body"));
     }
@@ -88,15 +118,41 @@ pub fn fetch_json_cached(
         .get(LAST_MODIFIED)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
+    let max_age_secs = headers
+        .get(CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_cache_control_max_age);
 
     let entry = CacheEntry {
         body: body.clone(),
         etag,
         last_modified,
         fetched_at: system_time_to_secs(SystemTime::now()).unwrap_or_default(),
+        max_age_secs,
     };
     refresh_cache_entry(url, entry);
     Ok(body)
+}
+
+fn parse_cache_control_max_age(raw: &str) -> Option<u64> {
+    let normalized = raw.to_ascii_lowercase();
+    if normalized.contains("no-store") || normalized.contains("no-cache") {
+        return Some(0);
+    }
+    for part in normalized.split(',') {
+        let part = part.trim();
+        if let Some(val) = part.strip_prefix("s-maxage=") {
+            if let Ok(parsed) = val.trim().parse::<u64>() {
+                return Some(parsed);
+            }
+        }
+        if let Some(val) = part.strip_prefix("max-age=") {
+            if let Ok(parsed) = val.trim().parse::<u64>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
 }
 
 fn refresh_cache_entry(key: &str, entry: CacheEntry) {
@@ -276,4 +332,25 @@ fn cache_flush_secs() -> u64 {
 
 fn system_time_to_secs(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cache_control_max_age;
+
+    #[test]
+    fn parses_cache_control_max_age() {
+        assert_eq!(parse_cache_control_max_age("max-age=40"), Some(40));
+        assert_eq!(parse_cache_control_max_age("public, max-age=40"), Some(40));
+        assert_eq!(
+            parse_cache_control_max_age("public, s-maxage=12, max-age=40"),
+            Some(12)
+        );
+        assert_eq!(parse_cache_control_max_age("no-cache"), Some(0));
+        assert_eq!(
+            parse_cache_control_max_age("no-store, max-age=999"),
+            Some(0)
+        );
+        assert_eq!(parse_cache_control_max_age("public"), None);
+    }
 }

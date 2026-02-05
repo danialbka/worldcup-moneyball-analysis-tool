@@ -35,12 +35,19 @@ struct App {
     upcoming_cache_ttl: Duration,
     detail_refresh: Duration,
     last_detail_refresh: HashMap<String, Instant>,
+    detail_request_throttle: Duration,
+    hover_prefetch_delay: Duration,
+    hover_selected_match_id: Option<String>,
+    hover_selected_since: Instant,
+    hover_prefetched_match_id: Option<String>,
     detail_cache_ttl: Duration,
     squad_cache_ttl: Duration,
     player_cache_ttl: Duration,
     prefetch_players_limit: usize,
     auto_warm_mode: AutoWarmMode,
     auto_warm_pending: bool,
+    analysis_request_throttle: Duration,
+    last_analysis_request: HashMap<LeagueMode, Instant>,
     detail_dist_cache: Option<DetailDistCache>,
 }
 
@@ -68,11 +75,21 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(60)
             .max(30);
+        let detail_request_throttle = std::env::var("DETAILS_THROTTLE_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(5)
+            .max(1);
         let detail_cache_ttl = std::env::var("DETAILS_CACHE_SECS")
             .ok()
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(3600)
             .max(30);
+        let hover_prefetch_delay_ms = std::env::var("PREFETCH_MATCH_DETAILS_MS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(450)
+            .max(0);
         let squad_cache_ttl = std::env::var("SQUAD_CACHE_SECS")
             .ok()
             .and_then(|val| val.parse::<u64>().ok())
@@ -88,6 +105,11 @@ impl App {
             .and_then(|val| val.parse::<usize>().ok())
             .unwrap_or(10)
             .clamp(0, 40);
+        let analysis_request_throttle = std::env::var("ANALYSIS_THROTTLE_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(10)
+            .max(1);
         let auto_warm_mode = parse_auto_warm_mode();
         Self {
             state: AppState::new(),
@@ -98,14 +120,54 @@ impl App {
             upcoming_cache_ttl: Duration::from_secs(upcoming_cache_ttl),
             detail_refresh: Duration::from_secs(detail_refresh),
             last_detail_refresh: HashMap::new(),
+            detail_request_throttle: Duration::from_secs(detail_request_throttle),
+            hover_prefetch_delay: Duration::from_millis(hover_prefetch_delay_ms),
+            hover_selected_match_id: None,
+            hover_selected_since: Instant::now(),
+            hover_prefetched_match_id: None,
             detail_cache_ttl: Duration::from_secs(detail_cache_ttl),
             squad_cache_ttl: Duration::from_secs(squad_cache_ttl),
             player_cache_ttl: Duration::from_secs(player_cache_ttl),
             prefetch_players_limit,
             auto_warm_pending: auto_warm_mode != AutoWarmMode::Off,
             auto_warm_mode,
+            analysis_request_throttle: Duration::from_secs(analysis_request_throttle),
+            last_analysis_request: HashMap::new(),
             detail_dist_cache: None,
         }
+    }
+
+    fn maybe_hover_prefetch_match_details(&mut self) {
+        if self.hover_prefetch_delay.is_zero() {
+            return;
+        }
+        if !matches!(self.state.screen, Screen::Pulse) || self.state.pulse_view != PulseView::Live {
+            self.hover_selected_match_id = None;
+            self.hover_prefetched_match_id = None;
+            return;
+        }
+
+        let selected = self.state.selected_match_id();
+        if selected != self.hover_selected_match_id {
+            self.hover_selected_match_id = selected.clone();
+            self.hover_selected_since = Instant::now();
+            if self.hover_prefetched_match_id != selected {
+                self.hover_prefetched_match_id = None;
+            }
+        }
+        let Some(match_id) = selected else {
+            return;
+        };
+        if self.hover_prefetched_match_id.as_deref() == Some(match_id.as_str()) {
+            return;
+        }
+        if self.hover_selected_since.elapsed() < self.hover_prefetch_delay {
+            return;
+        }
+
+        // Quietly warm details while the user hovers. UI updates when the provider responds.
+        self.request_match_details_for(&match_id, false);
+        self.hover_prefetched_match_id = Some(match_id);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -488,6 +550,10 @@ impl App {
             "league_ids: pl={:?} ll={:?} wc={:?}",
             self.state.league_pl_ids, self.state.league_ll_ids, self.state.league_wc_ids
         ));
+        lines.push(format!(
+            "league_ids_extra: bl={:?} cl={:?}",
+            self.state.league_bl_ids, self.state.league_cl_ids
+        ));
         if let Some(id) = active_id.as_deref() {
             let info = self
                 .state
@@ -608,6 +674,17 @@ impl App {
             }
             return;
         }
+        if let Some(last) = self.last_detail_refresh.get(match_id) {
+            if last.elapsed() < self.detail_request_throttle {
+                if announce {
+                    self.state.push_log(format!(
+                        "[INFO] Match details throttled ({}s)",
+                        self.detail_request_throttle.as_secs()
+                    ));
+                }
+                return;
+            }
+        }
         let is_live = self
             .state
             .matches
@@ -662,7 +739,9 @@ impl App {
     }
 
     fn request_upcoming(&mut self, announce: bool) {
-        if cache_fresh(self.state.upcoming_cached_at, self.upcoming_cache_ttl) {
+        if !self.state.upcoming.is_empty()
+            && cache_fresh(self.state.upcoming_cached_at, self.upcoming_cache_ttl)
+        {
             if announce {
                 self.state
                     .push_log("[INFO] Upcoming cached (skipping fetch)");
@@ -695,7 +774,24 @@ impl App {
             }
             return;
         };
+        if self.state.analysis_loading {
+            if announce {
+                self.state.push_log("[INFO] Analysis already loading");
+            }
+            return;
+        }
         let mode = self.state.league_mode;
+        if let Some(last) = self.last_analysis_request.get(&mode) {
+            if last.elapsed() < self.analysis_request_throttle {
+                if announce {
+                    self.state.push_log(format!(
+                        "[INFO] Analysis throttled ({}s)",
+                        self.analysis_request_throttle.as_secs()
+                    ));
+                }
+                return;
+            }
+        }
         if tx
             .send(state::ProviderCommand::FetchAnalysis { mode })
             .is_err()
@@ -707,6 +803,7 @@ impl App {
             if announce {
                 self.state.push_log("[INFO] Analysis request sent");
             }
+            self.last_analysis_request.insert(mode, Instant::now());
             self.state.analysis_loading = true;
             if self.auto_warm_mode != AutoWarmMode::Off {
                 self.auto_warm_pending = true;
@@ -1248,12 +1345,16 @@ fn run_app<B: Backend>(
     app: &mut App,
     rx: mpsc::Receiver<state::Delta>,
 ) -> io::Result<()> {
-    let tick_rate = Duration::from_millis(250);
-    let mut last_tick = Instant::now();
+    let poll_rate = Duration::from_millis(250);
+    let heartbeat_rate = Duration::from_secs(1);
+    let mut last_draw = Instant::now() - heartbeat_rate;
+    let mut needs_redraw = true;
 
     loop {
+        let mut changed = false;
         while let Ok(delta) = rx.try_recv() {
             apply_delta(&mut app.state, delta);
+            changed = true;
         }
         if let Some(ids) = app.state.squad_prefetch_pending.take() {
             app.prefetch_players(ids);
@@ -1263,27 +1364,38 @@ fn run_app<B: Backend>(
             && app.state.rankings_dirty
         {
             app.recompute_rankings_from_cache();
+            changed = true;
         }
+        let export_before = (
+            app.state.export.active,
+            app.state.export.done,
+            app.state.export.path.clone(),
+        );
         app.state.maybe_clear_export(Instant::now());
+        if export_before.0 != app.state.export.active
+            || export_before.1 != app.state.export.done
+            || export_before.2 != app.state.export.path
+        {
+            changed = true;
+        }
 
         app.maybe_refresh_upcoming();
         app.maybe_refresh_match_details();
         app.maybe_auto_warm_rankings();
+        app.maybe_hover_prefetch_match_details();
 
-        terminal.draw(|f| ui(f, app))?;
+        if needs_redraw || changed || last_draw.elapsed() >= heartbeat_rate {
+            terminal.draw(|f| ui(f, app))?;
+            last_draw = Instant::now();
+            needs_redraw = false;
+        }
 
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or(Duration::ZERO);
-        if event::poll(timeout)?
+        if event::poll(poll_rate)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
             app.on_key(key);
-        }
-
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = Instant::now();
+            needs_redraw = true;
         }
 
         if app.should_quit {

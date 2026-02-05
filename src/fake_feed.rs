@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,17 @@ use crate::upcoming_fetch::{self, FotmobMatchRow};
 pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
     thread::spawn(move || {
         let mut rng = rand::thread_rng();
-        let lineups = seed_lineups().into_iter().collect::<HashMap<_, _>>();
+        let lineups = Arc::new(seed_lineups().into_iter().collect::<HashMap<_, _>>());
+        let pool = build_fetch_pool();
+        let inflight_max = env::var("DETAILS_INFLIGHT_MAX")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 64);
+        let inflight_match_details: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+
+        let allowed_league_ids = allowed_league_ids();
 
         let upcoming_source = env::var("UPCOMING_SOURCE")
             .unwrap_or_else(|_| "fotmob".to_string())
@@ -28,7 +39,12 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
         let upcoming_window_days = env::var("UPCOMING_WINDOW_DAYS")
             .ok()
             .and_then(|val| val.parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(7)
+            .clamp(1, 14);
+        let upcoming_expand_days = env::var("UPCOMING_EXPAND_DAYS")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or(7)
             .clamp(1, 14);
         let upcoming_interval = Duration::from_secs(
             env::var("UPCOMING_POLL_SECS")
@@ -122,30 +138,60 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     ProviderCommand::FetchMatchDetails { fixture_id } => {
-                        match upcoming_fetch::fetch_match_details_from_fotmob(&fixture_id) {
-                            Ok(detail) => {
-                                let _ = tx.send(Delta::SetMatchDetails {
-                                    id: fixture_id,
-                                    detail,
-                                });
+                        {
+                            let mut inflight = inflight_match_details
+                                .lock()
+                                .expect("inflight match details lock poisoned");
+                            if inflight.contains(&fixture_id) {
+                                continue;
                             }
-                            Err(err) => {
-                                let _ = tx
-                                    .send(Delta::Log(format!("[WARN] Match details error: {err}")));
-                                if let Some(lineups) = lineups.get(&fixture_id) {
-                                    let detail = MatchDetail {
-                                        events: Vec::new(),
-                                        commentary: Vec::new(),
-                                        commentary_error: None,
-                                        lineups: Some(lineups.clone()),
-                                        stats: Vec::new(),
-                                    };
+                            if inflight.len() >= inflight_max {
+                                continue;
+                            }
+                            inflight.insert(fixture_id.clone());
+                        }
+
+                        let tx = tx.clone();
+                        let lineups = lineups.clone();
+                        let inflight_match_details = inflight_match_details.clone();
+                        let fixture_id = fixture_id.clone();
+                        let job = move || {
+                            match upcoming_fetch::fetch_match_details_from_fotmob(&fixture_id) {
+                                Ok(detail) => {
                                     let _ = tx.send(Delta::SetMatchDetails {
-                                        id: fixture_id,
+                                        id: fixture_id.clone(),
                                         detail,
                                     });
                                 }
+                                Err(err) => {
+                                    let _ = tx.send(Delta::Log(format!(
+                                        "[WARN] Match details error: {err}"
+                                    )));
+                                    if let Some(lineups) = lineups.get(&fixture_id) {
+                                        let detail = MatchDetail {
+                                            events: Vec::new(),
+                                            commentary: Vec::new(),
+                                            commentary_error: None,
+                                            lineups: Some(lineups.clone()),
+                                            stats: Vec::new(),
+                                        };
+                                        let _ = tx.send(Delta::SetMatchDetails {
+                                            id: fixture_id.clone(),
+                                            detail,
+                                        });
+                                    }
+                                }
                             }
+                            let mut inflight = inflight_match_details
+                                .lock()
+                                .expect("inflight match details lock poisoned");
+                            inflight.remove(&fixture_id);
+                        };
+
+                        if let Some(pool) = pool.as_ref() {
+                            pool.spawn(job);
+                        } else {
+                            std::thread::spawn(job);
                         }
                     }
                     ProviderCommand::FetchUpcoming => {
@@ -162,6 +208,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             match fetch_upcoming_window(
                                 upcoming_date.as_deref(),
                                 upcoming_window_days,
+                                &allowed_league_ids,
                             ) {
                                 Ok(items) if !items.is_empty() => {
                                     let _ = tx.send(Delta::SetUpcoming(items));
@@ -169,8 +216,27 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 }
                                 Ok(_) => {
                                     let _ = tx.send(Delta::Log(
-                                        "[WARN] FotMob matchday returned no items".to_string(),
+                                        "[WARN] FotMob matchday returned no items for configured leagues"
+                                            .to_string(),
                                     ));
+                                    if upcoming_expand_days > upcoming_window_days {
+                                        match fetch_upcoming_window(
+                                            upcoming_date.as_deref(),
+                                            upcoming_expand_days,
+                                            &allowed_league_ids,
+                                        ) {
+                                            Ok(items) if !items.is_empty() => {
+                                                let _ = tx.send(Delta::SetUpcoming(items));
+                                                fetched = true;
+                                            }
+                                            Ok(_) => {}
+                                            Err(err) => {
+                                                let _ = tx.send(Delta::Log(format!(
+                                                    "[WARN] FotMob expanded upcoming error: {err}"
+                                                )));
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(err) => {
                                     let _ = tx.send(Delta::Log(format!(
@@ -723,6 +789,7 @@ fn normalize_fotmob_date(raw: &str) -> String {
 fn fetch_upcoming_window(
     base_date: Option<&str>,
     days: usize,
+    allowed_league_ids: &HashSet<u32>,
 ) -> anyhow::Result<Vec<UpcomingMatch>> {
     let mut all = Vec::new();
     let mut seen: HashMap<String, bool> = HashMap::new();
@@ -732,6 +799,12 @@ fn fetch_upcoming_window(
         match upcoming_fetch::fetch_upcoming_from_fotmob(Some(&date)) {
             Ok(items) => {
                 for item in items {
+                    if let Some(id) = item.league_id
+                        && !allowed_league_ids.is_empty()
+                        && !allowed_league_ids.contains(&id)
+                    {
+                        continue;
+                    }
                     if seen.insert(item.id.clone(), true).is_none() {
                         all.push(item);
                     }
@@ -744,6 +817,37 @@ fn fetch_upcoming_window(
     }
 
     Ok(all)
+}
+
+fn allowed_league_ids() -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    extend_ids_env_or_default(&mut ids, "APP_LEAGUE_PREMIER_IDS", &[47]);
+    extend_ids_env_or_default(&mut ids, "APP_LEAGUE_LALIGA_IDS", &[87]);
+    extend_ids_env_or_default(&mut ids, "APP_LEAGUE_BUNDESLIGA_IDS", &[54]);
+    extend_ids_env_or_default(&mut ids, "APP_LEAGUE_CHAMPIONS_LEAGUE_IDS", &[42]);
+    extend_ids_env_or_default(&mut ids, "APP_LEAGUE_WORLDCUP_IDS", &[77]);
+    ids
+}
+
+fn extend_ids_env_or_default(out: &mut HashSet<u32>, key: &str, defaults: &[u32]) {
+    match env::var(key) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            for part in trimmed.split([',', ';', ' ']) {
+                if let Ok(id) = part.trim().parse::<u32>() {
+                    out.insert(id);
+                }
+            }
+        }
+        Err(_) => {
+            for id in defaults {
+                out.insert(*id);
+            }
+        }
+    }
 }
 
 fn upcoming_dates(base_date: Option<&str>, days: usize) -> Vec<String> {
@@ -822,6 +926,42 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             kickoff: "2024-11-10T16:15".to_string(),
             home: "ATM".to_string(),
             away: "SEV".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-bl-1".to_string(),
+            league_id: Some(54),
+            league_name: "Bundesliga".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-09T15:30".to_string(),
+            home: "BAY".to_string(),
+            away: "DOR".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-bl-2".to_string(),
+            league_id: Some(54),
+            league_name: "Bundesliga".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-10T17:30".to_string(),
+            home: "RBL".to_string(),
+            away: "LEV".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-cl-1".to_string(),
+            league_id: Some(42),
+            league_name: "Champions League".to_string(),
+            round: "Round of 16".to_string(),
+            kickoff: "2025-03-04T20:00".to_string(),
+            home: "RMA".to_string(),
+            away: "MCI".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-cl-2".to_string(),
+            league_id: Some(42),
+            league_name: "Champions League".to_string(),
+            round: "Round of 16".to_string(),
+            kickoff: "2025-03-05T20:00".to_string(),
+            home: "BAR".to_string(),
+            away: "BAY".to_string(),
         },
         UpcomingMatch {
             id: "upc-wc-1".to_string(),

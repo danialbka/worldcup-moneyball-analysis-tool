@@ -246,7 +246,7 @@ pub enum PulseView {
     Upcoming,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LeagueMode {
     PremierLeague,
     LaLiga,
@@ -1476,9 +1476,8 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         Delta::SetUpcoming(fixtures) => {
             state.upcoming = fixtures;
             state.upcoming_cached_at = Some(SystemTime::now());
-            if state.pulse_view == PulseView::Upcoming {
-                state.upcoming_scroll = 0;
-            }
+            // Always reset scroll so new data is immediately visible when the user visits Upcoming.
+            state.upcoming_scroll = 0;
         }
         Delta::AddEvent { id, event } => {
             let entry = state.match_detail.entry(id).or_insert_with(|| MatchDetail {
