@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -127,6 +128,35 @@ impl App {
                 KeyCode::Down | KeyCode::Right => {
                     self.state.terminal_detail_scroll =
                         self.state.terminal_detail_scroll.saturating_add(1);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.state.screen == Screen::Analysis
+            && self.state.analysis_tab == state::AnalysisTab::RoleRankings
+            && self.state.rankings_search_active
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.rankings_search_active = false;
+                    self.state.rankings_search.clear();
+                    self.state.rankings_selected = 0;
+                }
+                KeyCode::Enter => {
+                    self.state.rankings_search_active = false;
+                    self.state.clamp_rankings_selection();
+                }
+                KeyCode::Backspace => {
+                    self.state.rankings_search.pop();
+                    self.state.clamp_rankings_selection();
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        self.state.rankings_search.push(c);
+                        self.state.clamp_rankings_selection();
+                    }
                 }
                 _ => {}
             }
@@ -311,6 +341,12 @@ impl App {
                 if matches!(self.state.screen, Screen::Analysis) {
                     self.request_analysis(true);
                 }
+            }
+            KeyCode::Char('/') | KeyCode::Char('f') | KeyCode::Char('F')
+                if self.state.screen == Screen::Analysis
+                    && self.state.analysis_tab == state::AnalysisTab::RoleRankings =>
+            {
+                self.state.rankings_search_active = true;
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 let to_upcoming = self.state.pulse_view == PulseView::Live;
@@ -999,6 +1035,8 @@ impl App {
         let (mode, prefix) = match self.state.league_mode {
             LeagueMode::PremierLeague => (LeagueMode::PremierLeague, "premier_league"),
             LeagueMode::LaLiga => (LeagueMode::LaLiga, "laliga"),
+            LeagueMode::Bundesliga => (LeagueMode::Bundesliga, "bundesliga"),
+            LeagueMode::ChampionsLeague => (LeagueMode::ChampionsLeague, "champions_league"),
             LeagueMode::WorldCup => (LeagueMode::WorldCup, "worldcup"),
         };
         let path = format!("{prefix}_analysis_{stamp}.xlsx");
@@ -1798,7 +1836,11 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
         .split(area);
 
     let role = role_label(state.rankings_role);
@@ -1823,7 +1865,18 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
     let header_style = Style::default().add_modifier(Modifier::BOLD);
     frame.render_widget(Paragraph::new(header).style(header_style), sections[0]);
 
-    let list_area = sections[1];
+    let search_label = format!("Search [/]: {}", state.rankings_search);
+    let search_style = if state.rankings_search_active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(search_label).style(search_style),
+        sections[1],
+    );
+
+    let list_area = sections[2];
     if list_area.height == 0 {
         return;
     }
@@ -1852,6 +1905,16 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let visible = list_area.height as usize;
     let total = rows.len();
+    if total == 0 {
+        let message = if state.rankings_search.trim().is_empty() {
+            "No role ranking data yet (press r to warm cache)"
+        } else {
+            "No players match the current search"
+        };
+        let empty = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, list_area);
+        return;
+    }
     let (start, end) = visible_range(state.rankings_selected, total, visible);
 
     for (i, idx) in (start..end).enumerate() {
@@ -4047,6 +4110,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "",
         "Analysis/Squad:",
         "  Enter        Open squad / player detail",
+        "  / or f       Search rankings",
         "",
         "Player detail:",
         "  j/k or ↑/↓   Scroll",

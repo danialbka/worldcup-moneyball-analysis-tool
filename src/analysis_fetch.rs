@@ -481,6 +481,126 @@ pub fn fetch_la_liga_team_analysis() -> AnalysisFetch {
     }
 }
 
+#[allow(dead_code)]
+pub fn fetch_bundesliga_team_analysis() -> AnalysisFetch {
+    let mut errors = Vec::new();
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(err) => {
+            errors.push(format!("analysis client build failed: {err}"));
+            return AnalysisFetch {
+                teams: Vec::new(),
+                errors,
+            };
+        }
+    };
+
+    let teams = match fetch_league_teams(client, 54) {
+        Ok(teams) => teams,
+        Err(err) => {
+            errors.push(format!("bundesliga teams fetch failed: {err}"));
+            Vec::new()
+        }
+    };
+
+    let results: Vec<(TeamAnalysis, Option<String>)> = with_fetch_pool(|| {
+        teams
+            .par_iter()
+            .map(|team| match fetch_team_overview(client, team.id) {
+                Ok(overview) => (
+                    TeamAnalysis {
+                        id: team.id,
+                        name: team.name.clone(),
+                        confed: Confederation::UEFA,
+                        host: false,
+                        fifa_rank: overview.fifa_rank,
+                        fifa_points: overview.fifa_points,
+                        fifa_updated: overview.fifa_updated,
+                    },
+                    None,
+                ),
+                Err(err) => (
+                    empty_club_analysis(team),
+                    Some(format!("{} fetch failed: {err}", team.name)),
+                ),
+            })
+            .collect()
+    });
+
+    let mut analysis = Vec::with_capacity(results.len());
+    for (team, err) in results {
+        if let Some(err) = err {
+            errors.push(err);
+        }
+        analysis.push(team);
+    }
+
+    AnalysisFetch {
+        teams: analysis,
+        errors,
+    }
+}
+
+#[allow(dead_code)]
+pub fn fetch_champions_league_team_analysis() -> AnalysisFetch {
+    let mut errors = Vec::new();
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(err) => {
+            errors.push(format!("analysis client build failed: {err}"));
+            return AnalysisFetch {
+                teams: Vec::new(),
+                errors,
+            };
+        }
+    };
+
+    let teams = match fetch_league_teams(client, 42) {
+        Ok(teams) => teams,
+        Err(err) => {
+            errors.push(format!("champions league teams fetch failed: {err}"));
+            Vec::new()
+        }
+    };
+
+    let results: Vec<(TeamAnalysis, Option<String>)> = with_fetch_pool(|| {
+        teams
+            .par_iter()
+            .map(|team| match fetch_team_overview(client, team.id) {
+                Ok(overview) => (
+                    TeamAnalysis {
+                        id: team.id,
+                        name: team.name.clone(),
+                        confed: Confederation::UEFA,
+                        host: false,
+                        fifa_rank: overview.fifa_rank,
+                        fifa_points: overview.fifa_points,
+                        fifa_updated: overview.fifa_updated,
+                    },
+                    None,
+                ),
+                Err(err) => (
+                    empty_club_analysis(team),
+                    Some(format!("{} fetch failed: {err}", team.name)),
+                ),
+            })
+            .collect()
+    });
+
+    let mut analysis = Vec::with_capacity(results.len());
+    for (team, err) in results {
+        if let Some(err) = err {
+            errors.push(err);
+        }
+        analysis.push(team);
+    }
+
+    AnalysisFetch {
+        teams: analysis,
+        errors,
+    }
+}
+
 fn empty_analysis(nation: &NationInfo) -> TeamAnalysis {
     TeamAnalysis {
         id: nation.team_id,

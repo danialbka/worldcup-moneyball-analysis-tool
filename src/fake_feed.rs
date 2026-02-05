@@ -193,6 +193,12 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             crate::state::LeagueMode::LaLiga => {
                                 analysis_fetch::fetch_la_liga_team_analysis()
                             }
+                            crate::state::LeagueMode::Bundesliga => {
+                                analysis_fetch::fetch_bundesliga_team_analysis()
+                            }
+                            crate::state::LeagueMode::ChampionsLeague => {
+                                analysis_fetch::fetch_champions_league_team_analysis()
+                            }
                             crate::state::LeagueMode::WorldCup => {
                                 analysis_fetch::fetch_worldcup_team_analysis()
                             }
@@ -213,6 +219,12 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 }
                                 crate::state::LeagueMode::LaLiga => {
                                     analysis_fetch::fetch_la_liga_team_analysis()
+                                }
+                                crate::state::LeagueMode::Bundesliga => {
+                                    analysis_fetch::fetch_bundesliga_team_analysis()
+                                }
+                                crate::state::LeagueMode::ChampionsLeague => {
+                                    analysis_fetch::fetch_champions_league_team_analysis()
                                 }
                                 crate::state::LeagueMode::WorldCup => {
                                     analysis_fetch::fetch_worldcup_team_analysis()

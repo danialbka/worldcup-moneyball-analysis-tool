@@ -33,6 +33,8 @@ pub fn placeholder_match_summary(mode: LeagueMode) -> MatchSummary {
     let league_name = match mode {
         LeagueMode::PremierLeague => "Premier League",
         LeagueMode::LaLiga => "La Liga",
+        LeagueMode::Bundesliga => "Bundesliga",
+        LeagueMode::ChampionsLeague => "Champions League",
         LeagueMode::WorldCup => "World Cup",
     };
     MatchSummary {
@@ -248,6 +250,8 @@ pub enum PulseView {
 pub enum LeagueMode {
     PremierLeague,
     LaLiga,
+    Bundesliga,
+    ChampionsLeague,
     WorldCup,
 }
 
@@ -271,6 +275,8 @@ pub struct AppState {
     pub selected: usize,
     pub league_pl_ids: Vec<u32>,
     pub league_ll_ids: Vec<u32>,
+    pub league_bl_ids: Vec<u32>,
+    pub league_cl_ids: Vec<u32>,
     pub league_wc_ids: Vec<u32>,
     pub matches: Vec<MatchSummary>,
     pub upcoming: Vec<UpcomingMatch>,
@@ -291,6 +297,8 @@ pub struct AppState {
     pub rankings_selected: usize,
     pub rankings_role: RoleCategory,
     pub rankings_metric: RankMetric,
+    pub rankings_search: String,
+    pub rankings_search_active: bool,
     pub rankings_progress_current: usize,
     pub rankings_progress_total: usize,
     pub rankings_progress_message: String,
@@ -338,10 +346,18 @@ impl AppState {
     pub fn new() -> Self {
         const DEFAULT_PREMIER_IDS: &[u32] = &[47];
         const DEFAULT_LALIGA_IDS: &[u32] = &[87];
+        const DEFAULT_BUNDESLIGA_IDS: &[u32] = &[54];
+        const DEFAULT_CHAMPIONS_LEAGUE_IDS: &[u32] = &[42];
         const DEFAULT_WORLDCUP_IDS: &[u32] = &[77];
 
         let league_pl_ids = parse_ids_env_or_default("APP_LEAGUE_PREMIER_IDS", DEFAULT_PREMIER_IDS);
         let league_ll_ids = parse_ids_env_or_default("APP_LEAGUE_LALIGA_IDS", DEFAULT_LALIGA_IDS);
+        let league_bl_ids =
+            parse_ids_env_or_default("APP_LEAGUE_BUNDESLIGA_IDS", DEFAULT_BUNDESLIGA_IDS);
+        let league_cl_ids = parse_ids_env_or_default(
+            "APP_LEAGUE_CHAMPIONS_LEAGUE_IDS",
+            DEFAULT_CHAMPIONS_LEAGUE_IDS,
+        );
         let league_wc_ids =
             parse_ids_env_or_default("APP_LEAGUE_WORLDCUP_IDS", DEFAULT_WORLDCUP_IDS);
         Self {
@@ -352,6 +368,8 @@ impl AppState {
             selected: 0,
             league_pl_ids,
             league_ll_ids,
+            league_bl_ids,
+            league_cl_ids,
             league_wc_ids,
             matches: Vec::new(),
             upcoming: Vec::new(),
@@ -372,6 +390,8 @@ impl AppState {
             rankings_selected: 0,
             rankings_role: RoleCategory::Attacker,
             rankings_metric: RankMetric::Attacking,
+            rankings_search: String::new(),
+            rankings_search_active: false,
             rankings_progress_current: 0,
             rankings_progress_total: 0,
             rankings_progress_message: String::new(),
@@ -435,7 +455,9 @@ impl AppState {
     pub fn cycle_league_mode(&mut self) {
         self.league_mode = match self.league_mode {
             LeagueMode::PremierLeague => LeagueMode::LaLiga,
-            LeagueMode::LaLiga => LeagueMode::WorldCup,
+            LeagueMode::LaLiga => LeagueMode::Bundesliga,
+            LeagueMode::Bundesliga => LeagueMode::ChampionsLeague,
+            LeagueMode::ChampionsLeague => LeagueMode::WorldCup,
             LeagueMode::WorldCup => LeagueMode::PremierLeague,
         };
         self.selected = 0;
@@ -452,6 +474,8 @@ impl AppState {
         self.rankings_selected = 0;
         self.rankings_role = RoleCategory::Attacker;
         self.rankings_metric = RankMetric::Attacking;
+        self.rankings_search.clear();
+        self.rankings_search_active = false;
         self.rankings_progress_current = 0;
         self.rankings_progress_total = 0;
         self.rankings_progress_message.clear();
@@ -716,6 +740,14 @@ impl AppState {
                 &self.league_ll_ids,
                 &["la liga", "laliga", "primera division"],
             ),
+            LeagueMode::Bundesliga => {
+                matches_league(m, &self.league_bl_ids, &["bundesliga", "1. bundesliga"])
+            }
+            LeagueMode::ChampionsLeague => matches_league(
+                m,
+                &self.league_cl_ids,
+                &["champions league", "uefa champions league", "ucl"],
+            ),
             LeagueMode::WorldCup => {
                 matches_league(m, &self.league_wc_ids, &["world cup", "worldcup"])
             }
@@ -733,6 +765,14 @@ impl AppState {
                 m,
                 &self.league_ll_ids,
                 &["la liga", "laliga", "primera division"],
+            ),
+            LeagueMode::Bundesliga => {
+                matches_league_upcoming(m, &self.league_bl_ids, &["bundesliga", "1. bundesliga"])
+            }
+            LeagueMode::ChampionsLeague => matches_league_upcoming(
+                m,
+                &self.league_cl_ids,
+                &["champions league", "uefa champions league", "ucl"],
             ),
             LeagueMode::WorldCup => {
                 matches_league_upcoming(m, &self.league_wc_ids, &["world cup", "worldcup"])
@@ -771,6 +811,7 @@ impl AppState {
         };
         self.analysis_selected = 0;
         self.rankings_selected = 0;
+        self.rankings_search_active = false;
     }
 
     pub fn cycle_terminal_focus_next(&mut self) {
@@ -831,6 +872,8 @@ impl AppState {
         let league_team_ids: std::collections::HashSet<u32> =
             self.analysis.iter().map(|t| t.id).collect();
         let filter_by_team = !league_team_ids.is_empty();
+        let query = self.rankings_search.trim().to_lowercase();
+        let has_query = !query.is_empty();
         self.rankings
             .iter()
             .filter(|row| row.role == self.rankings_role)
@@ -841,7 +884,24 @@ impl AppState {
                     true
                 }
             })
+            .filter(|row| {
+                if !has_query {
+                    return true;
+                }
+                row.player_name.to_lowercase().contains(&query)
+                    || row.team_name.to_lowercase().contains(&query)
+                    || row.club.to_lowercase().contains(&query)
+            })
             .collect()
+    }
+
+    pub fn clamp_rankings_selection(&mut self) {
+        let total = self.rankings_filtered().len();
+        if total == 0 {
+            self.rankings_selected = 0;
+        } else if self.rankings_selected >= total {
+            self.rankings_selected = total.saturating_sub(1);
+        }
     }
 
     pub fn select_rankings_next(&mut self) {
@@ -1645,6 +1705,8 @@ pub fn league_label(mode: LeagueMode) -> &'static str {
     match mode {
         LeagueMode::PremierLeague => "Premier League",
         LeagueMode::LaLiga => "La Liga",
+        LeagueMode::Bundesliga => "Bundesliga",
+        LeagueMode::ChampionsLeague => "Champions League",
         LeagueMode::WorldCup => "World Cup",
     }
 }

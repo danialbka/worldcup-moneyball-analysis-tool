@@ -36,6 +36,8 @@ pub fn export_analysis_with_progress(
     let analysis = match mode {
         LeagueMode::PremierLeague => analysis_fetch::fetch_premier_league_team_analysis(),
         LeagueMode::LaLiga => analysis_fetch::fetch_la_liga_team_analysis(),
+        LeagueMode::Bundesliga => analysis_fetch::fetch_bundesliga_team_analysis(),
+        LeagueMode::ChampionsLeague => analysis_fetch::fetch_champions_league_team_analysis(),
         LeagueMode::WorldCup => analysis_fetch::fetch_worldcup_team_analysis(),
     };
     let mut errors = analysis.errors;

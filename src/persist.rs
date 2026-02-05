@@ -85,15 +85,18 @@ pub fn load_into_state(state: &mut AppState) {
     state.combined_player_cache.extend(league.players.clone());
     if matches!(
         state.league_mode,
-        LeagueMode::PremierLeague | LeagueMode::LaLiga
+        LeagueMode::PremierLeague
+            | LeagueMode::LaLiga
+            | LeagueMode::Bundesliga
+            | LeagueMode::ChampionsLeague
     ) {
-        let other_key = match state.league_mode {
-            LeagueMode::PremierLeague => "laliga",
-            LeagueMode::LaLiga => "premier_league",
-            LeagueMode::WorldCup => "",
-        };
-        if let Some(other) = cache.leagues.get(other_key) {
-            state.combined_player_cache.extend(other.players.clone());
+        for other_key in ["premier_league", "laliga", "bundesliga", "champions_league"] {
+            if other_key == league_key(state.league_mode) {
+                continue;
+            }
+            if let Some(other) = cache.leagues.get(other_key) {
+                state.combined_player_cache.extend(other.players.clone());
+            }
         }
     }
 
@@ -197,6 +200,8 @@ fn league_key(mode: LeagueMode) -> &'static str {
     match mode {
         LeagueMode::PremierLeague => "premier_league",
         LeagueMode::LaLiga => "laliga",
+        LeagueMode::Bundesliga => "bundesliga",
+        LeagueMode::ChampionsLeague => "champions_league",
         LeagueMode::WorldCup => "worldcup",
     }
 }
