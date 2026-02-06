@@ -907,8 +907,10 @@ impl App {
             ));
         }
 
+        let mode = self.state.league_mode;
         if tx
             .send(state::ProviderCommand::WarmRankCacheMissing {
+                mode,
                 team_ids,
                 player_ids,
             })
@@ -1133,6 +1135,8 @@ impl App {
             LeagueMode::PremierLeague => (LeagueMode::PremierLeague, "premier_league"),
             LeagueMode::LaLiga => (LeagueMode::LaLiga, "laliga"),
             LeagueMode::Bundesliga => (LeagueMode::Bundesliga, "bundesliga"),
+            LeagueMode::SerieA => (LeagueMode::SerieA, "serie_a"),
+            LeagueMode::Ligue1 => (LeagueMode::Ligue1, "ligue1"),
             LeagueMode::ChampionsLeague => (LeagueMode::ChampionsLeague, "champions_league"),
             LeagueMode::WorldCup => (LeagueMode::WorldCup, "worldcup"),
         };

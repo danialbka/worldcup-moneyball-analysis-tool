@@ -264,6 +264,12 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             crate::state::LeagueMode::Bundesliga => {
                                 analysis_fetch::fetch_bundesliga_team_analysis()
                             }
+                            crate::state::LeagueMode::SerieA => {
+                                analysis_fetch::fetch_serie_a_team_analysis()
+                            }
+                            crate::state::LeagueMode::Ligue1 => {
+                                analysis_fetch::fetch_ligue1_team_analysis()
+                            }
                             crate::state::LeagueMode::ChampionsLeague => {
                                 analysis_fetch::fetch_champions_league_team_analysis()
                             }
@@ -274,7 +280,10 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                         for err in result.errors {
                             let _ = tx.send(Delta::Log(format!("[WARN] Analysis fetch: {err}")));
                         }
-                        let _ = tx.send(Delta::SetAnalysis(result.teams));
+                        let _ = tx.send(Delta::SetAnalysis {
+                            mode,
+                            teams: result.teams,
+                        });
                     }
                     ProviderCommand::WarmRankCacheFull { mode } => {
                         let tx = tx.clone();
@@ -291,6 +300,12 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                 crate::state::LeagueMode::Bundesliga => {
                                     analysis_fetch::fetch_bundesliga_team_analysis()
                                 }
+                                crate::state::LeagueMode::SerieA => {
+                                    analysis_fetch::fetch_serie_a_team_analysis()
+                                }
+                                crate::state::LeagueMode::Ligue1 => {
+                                    analysis_fetch::fetch_ligue1_team_analysis()
+                                }
                                 crate::state::LeagueMode::ChampionsLeague => {
                                     analysis_fetch::fetch_champions_league_team_analysis()
                                 }
@@ -303,6 +318,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let current = AtomicUsize::new(0);
                             let pool = build_fetch_pool();
                             let _ = tx.send(Delta::RankCacheProgress {
+                                mode,
                                 current: 0,
                                 total: total.load(Ordering::SeqCst),
                                 message: "Loaded teams".to_string(),
@@ -310,6 +326,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
 
                             for team in analysis.teams {
                                 let _ = tx.send(Delta::RankCacheProgress {
+                                    mode,
                                     current: current.load(Ordering::SeqCst),
                                     total: total.load(Ordering::SeqCst),
                                     message: format!("Fetching squad: {}", team.name),
@@ -324,6 +341,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                             players: squad.players.clone(),
                                         });
                                         let _ = tx.send(Delta::RankCacheProgress {
+                                            mode,
                                             current: current_val,
                                             total: total.load(Ordering::SeqCst),
                                             message: format!(
@@ -357,6 +375,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                                 let current_val =
                                                     current_ref.fetch_add(1, Ordering::SeqCst) + 1;
                                                 let _ = tx_players.send(Delta::RankCacheProgress {
+                                                    mode,
                                                     current: current_val,
                                                     total: total_ref.load(Ordering::SeqCst),
                                                     message: format!(
@@ -376,6 +395,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                         let current_val =
                                             current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::RankCacheProgress {
+                                            mode,
                                             current: current_val,
                                             total: total.load(Ordering::SeqCst),
                                             message: format!("Squad failed: {}", team.name),
@@ -385,10 +405,11 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             }
 
                             let errors = errors.into_inner().unwrap_or_default();
-                            let _ = tx.send(Delta::RankCacheFinished { errors });
+                            let _ = tx.send(Delta::RankCacheFinished { mode, errors });
                         });
                     }
                     ProviderCommand::WarmRankCacheMissing {
+                        mode,
                         team_ids,
                         player_ids,
                     } => {
@@ -399,10 +420,14 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             let current = AtomicUsize::new(0);
                             let pool = build_fetch_pool();
                             if total.load(Ordering::SeqCst) == 0 {
-                                let _ = tx.send(Delta::RankCacheFinished { errors: Vec::new() });
+                                let _ = tx.send(Delta::RankCacheFinished {
+                                    mode,
+                                    errors: Vec::new(),
+                                });
                                 return;
                             }
                             let _ = tx.send(Delta::RankCacheProgress {
+                                mode,
                                 current: 0,
                                 total: total.load(Ordering::SeqCst),
                                 message: "Warming missing cache".to_string(),
@@ -410,6 +435,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
 
                             for team_id in team_ids {
                                 let _ = tx.send(Delta::RankCacheProgress {
+                                    mode,
                                     current: current.load(Ordering::SeqCst),
                                     total: total.load(Ordering::SeqCst),
                                     message: format!("Fetching squad: {team_id}"),
@@ -424,6 +450,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                             players: squad.players.clone(),
                                         });
                                         let _ = tx.send(Delta::RankCacheProgress {
+                                            mode,
                                             current: current_val,
                                             total: total.load(Ordering::SeqCst),
                                             message: format!(
@@ -456,6 +483,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                                 let current_val =
                                                     current_ref.fetch_add(1, Ordering::SeqCst) + 1;
                                                 let _ = tx_players.send(Delta::RankCacheProgress {
+                                                    mode,
                                                     current: current_val,
                                                     total: total_ref.load(Ordering::SeqCst),
                                                     message: format!(
@@ -472,6 +500,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                         let current_val =
                                             current.fetch_add(1, Ordering::SeqCst) + 1;
                                         let _ = tx.send(Delta::RankCacheProgress {
+                                            mode,
                                             current: current_val,
                                             total: total.load(Ordering::SeqCst),
                                             message: format!("Squad failed: {team_id}"),
@@ -487,6 +516,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             with_fetch_pool(&pool, || {
                                 player_ids.par_iter().for_each(|player_id| {
                                     let _ = tx_players.send(Delta::RankCacheProgress {
+                                        mode,
                                         current: current_ref.load(Ordering::SeqCst),
                                         total: total_ref.load(Ordering::SeqCst),
                                         message: format!("Fetching player: {player_id}"),
@@ -504,6 +534,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                     let current_val =
                                         current_ref.fetch_add(1, Ordering::SeqCst) + 1;
                                     let _ = tx_players.send(Delta::RankCacheProgress {
+                                        mode,
                                         current: current_val,
                                         total: total_ref.load(Ordering::SeqCst),
                                         message: format!("Player cached: {player_id}"),
@@ -512,7 +543,7 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                             });
 
                             let errors = errors.into_inner().unwrap_or_default();
-                            let _ = tx.send(Delta::RankCacheFinished { errors });
+                            let _ = tx.send(Delta::RankCacheFinished { mode, errors });
                         });
                     }
                     ProviderCommand::FetchSquad { team_id, team_name } => {
@@ -826,6 +857,8 @@ fn allowed_league_ids() -> HashSet<u32> {
     extend_ids_env_or_default(&mut ids, "APP_LEAGUE_PREMIER_IDS", &[47]);
     extend_ids_env_or_default(&mut ids, "APP_LEAGUE_LALIGA_IDS", &[87]);
     extend_ids_env_or_default(&mut ids, "APP_LEAGUE_BUNDESLIGA_IDS", &[54]);
+    extend_ids_env_or_default(&mut ids, "APP_LEAGUE_SERIE_A_IDS", &[55]);
+    extend_ids_env_or_default(&mut ids, "APP_LEAGUE_LIGUE1_IDS", &[53]);
     extend_ids_env_or_default(&mut ids, "APP_LEAGUE_CHAMPIONS_LEAGUE_IDS", &[42]);
     extend_ids_env_or_default(&mut ids, "APP_LEAGUE_WORLDCUP_IDS", &[77]);
     ids
@@ -946,6 +979,42 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             kickoff: "2024-11-10T17:30".to_string(),
             home: "RBL".to_string(),
             away: "LEV".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-sa-1".to_string(),
+            league_id: Some(55),
+            league_name: "Serie A".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-09T18:00".to_string(),
+            home: "JUV".to_string(),
+            away: "INT".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-sa-2".to_string(),
+            league_id: Some(55),
+            league_name: "Serie A".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-10T20:45".to_string(),
+            home: "ACM".to_string(),
+            away: "NAP".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-l1-1".to_string(),
+            league_id: Some(53),
+            league_name: "Ligue 1".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-09T21:00".to_string(),
+            home: "PSG".to_string(),
+            away: "MAR".to_string(),
+        },
+        UpcomingMatch {
+            id: "upc-l1-2".to_string(),
+            league_id: Some(53),
+            league_name: "Ligue 1".to_string(),
+            round: "Matchday 12".to_string(),
+            kickoff: "2024-11-10T15:00".to_string(),
+            home: "LYO".to_string(),
+            away: "MON".to_string(),
         },
         UpcomingMatch {
             id: "upc-cl-1".to_string(),

@@ -88,9 +88,18 @@ pub fn load_into_state(state: &mut AppState) {
         LeagueMode::PremierLeague
             | LeagueMode::LaLiga
             | LeagueMode::Bundesliga
+            | LeagueMode::SerieA
+            | LeagueMode::Ligue1
             | LeagueMode::ChampionsLeague
     ) {
-        for other_key in ["premier_league", "laliga", "bundesliga", "champions_league"] {
+        for other_key in [
+            "premier_league",
+            "laliga",
+            "bundesliga",
+            "serie_a",
+            "ligue1",
+            "champions_league",
+        ] {
             if other_key == league_key(state.league_mode) {
                 continue;
             }
@@ -201,6 +210,8 @@ fn league_key(mode: LeagueMode) -> &'static str {
         LeagueMode::PremierLeague => "premier_league",
         LeagueMode::LaLiga => "laliga",
         LeagueMode::Bundesliga => "bundesliga",
+        LeagueMode::SerieA => "serie_a",
+        LeagueMode::Ligue1 => "ligue1",
         LeagueMode::ChampionsLeague => "champions_league",
         LeagueMode::WorldCup => "worldcup",
     }

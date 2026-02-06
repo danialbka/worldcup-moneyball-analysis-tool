@@ -37,6 +37,8 @@ pub fn export_analysis_with_progress(
         LeagueMode::PremierLeague => analysis_fetch::fetch_premier_league_team_analysis(),
         LeagueMode::LaLiga => analysis_fetch::fetch_la_liga_team_analysis(),
         LeagueMode::Bundesliga => analysis_fetch::fetch_bundesliga_team_analysis(),
+        LeagueMode::SerieA => analysis_fetch::fetch_serie_a_team_analysis(),
+        LeagueMode::Ligue1 => analysis_fetch::fetch_ligue1_team_analysis(),
         LeagueMode::ChampionsLeague => analysis_fetch::fetch_champions_league_team_analysis(),
         LeagueMode::WorldCup => analysis_fetch::fetch_worldcup_team_analysis(),
     };

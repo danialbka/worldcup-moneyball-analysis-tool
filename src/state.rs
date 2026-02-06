@@ -36,6 +36,8 @@ pub fn placeholder_match_summary(mode: LeagueMode) -> MatchSummary {
         LeagueMode::PremierLeague => "Premier League",
         LeagueMode::LaLiga => "La Liga",
         LeagueMode::Bundesliga => "Bundesliga",
+        LeagueMode::SerieA => "Serie A",
+        LeagueMode::Ligue1 => "Ligue 1",
         LeagueMode::ChampionsLeague => "Champions League",
         LeagueMode::WorldCup => "World Cup",
     };
@@ -256,6 +258,8 @@ pub enum LeagueMode {
     PremierLeague,
     LaLiga,
     Bundesliga,
+    SerieA,
+    Ligue1,
     ChampionsLeague,
     WorldCup,
 }
@@ -281,6 +285,8 @@ pub struct AppState {
     pub league_pl_ids: Vec<u32>,
     pub league_ll_ids: Vec<u32>,
     pub league_bl_ids: Vec<u32>,
+    pub league_sa_ids: Vec<u32>,
+    pub league_l1_ids: Vec<u32>,
     pub league_cl_ids: Vec<u32>,
     pub league_wc_ids: Vec<u32>,
     pub matches: Vec<MatchSummary>,
@@ -352,6 +358,8 @@ impl AppState {
         const DEFAULT_PREMIER_IDS: &[u32] = &[47];
         const DEFAULT_LALIGA_IDS: &[u32] = &[87];
         const DEFAULT_BUNDESLIGA_IDS: &[u32] = &[54];
+        const DEFAULT_SERIE_A_IDS: &[u32] = &[55];
+        const DEFAULT_LIGUE1_IDS: &[u32] = &[53];
         const DEFAULT_CHAMPIONS_LEAGUE_IDS: &[u32] = &[42];
         const DEFAULT_WORLDCUP_IDS: &[u32] = &[77];
 
@@ -359,6 +367,8 @@ impl AppState {
         let league_ll_ids = parse_ids_env_or_default("APP_LEAGUE_LALIGA_IDS", DEFAULT_LALIGA_IDS);
         let league_bl_ids =
             parse_ids_env_or_default("APP_LEAGUE_BUNDESLIGA_IDS", DEFAULT_BUNDESLIGA_IDS);
+        let league_sa_ids = parse_ids_env_or_default("APP_LEAGUE_SERIE_A_IDS", DEFAULT_SERIE_A_IDS);
+        let league_l1_ids = parse_ids_env_or_default("APP_LEAGUE_LIGUE1_IDS", DEFAULT_LIGUE1_IDS);
         let league_cl_ids = parse_ids_env_or_default(
             "APP_LEAGUE_CHAMPIONS_LEAGUE_IDS",
             DEFAULT_CHAMPIONS_LEAGUE_IDS,
@@ -374,6 +384,8 @@ impl AppState {
             league_pl_ids,
             league_ll_ids,
             league_bl_ids,
+            league_sa_ids,
+            league_l1_ids,
             league_cl_ids,
             league_wc_ids,
             matches: Vec::new(),
@@ -461,7 +473,9 @@ impl AppState {
         self.league_mode = match self.league_mode {
             LeagueMode::PremierLeague => LeagueMode::LaLiga,
             LeagueMode::LaLiga => LeagueMode::Bundesliga,
-            LeagueMode::Bundesliga => LeagueMode::ChampionsLeague,
+            LeagueMode::Bundesliga => LeagueMode::SerieA,
+            LeagueMode::SerieA => LeagueMode::Ligue1,
+            LeagueMode::Ligue1 => LeagueMode::ChampionsLeague,
             LeagueMode::ChampionsLeague => LeagueMode::WorldCup,
             LeagueMode::WorldCup => LeagueMode::PremierLeague,
         };
@@ -748,6 +762,8 @@ impl AppState {
             LeagueMode::Bundesliga => {
                 matches_league(m, &self.league_bl_ids, &["bundesliga", "1. bundesliga"])
             }
+            LeagueMode::SerieA => matches_league(m, &self.league_sa_ids, &["serie a", "seria a"]),
+            LeagueMode::Ligue1 => matches_league(m, &self.league_l1_ids, &["ligue 1", "ligue1"]),
             LeagueMode::ChampionsLeague => matches_league(
                 m,
                 &self.league_cl_ids,
@@ -773,6 +789,12 @@ impl AppState {
             ),
             LeagueMode::Bundesliga => {
                 matches_league_upcoming(m, &self.league_bl_ids, &["bundesliga", "1. bundesliga"])
+            }
+            LeagueMode::SerieA => {
+                matches_league_upcoming(m, &self.league_sa_ids, &["serie a", "seria a"])
+            }
+            LeagueMode::Ligue1 => {
+                matches_league_upcoming(m, &self.league_l1_ids, &["ligue 1", "ligue1"])
             }
             LeagueMode::ChampionsLeague => matches_league_upcoming(
                 m,
@@ -1346,18 +1368,23 @@ pub enum Delta {
         id: String,
         event: Event,
     },
-    SetAnalysis(Vec<TeamAnalysis>),
+    SetAnalysis {
+        mode: LeagueMode,
+        teams: Vec<TeamAnalysis>,
+    },
     CacheSquad {
         team_id: u32,
         players: Vec<SquadPlayer>,
     },
     CachePlayerDetail(PlayerDetail),
     RankCacheProgress {
+        mode: LeagueMode,
         current: usize,
         total: usize,
         message: String,
     },
     RankCacheFinished {
+        mode: LeagueMode,
         errors: Vec<String>,
     },
     SetSquad {
@@ -1416,6 +1443,7 @@ pub enum ProviderCommand {
         mode: LeagueMode,
     },
     WarmRankCacheMissing {
+        mode: LeagueMode,
         team_ids: Vec<u32>,
         player_ids: Vec<u32>,
     },
@@ -1538,10 +1566,14 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             });
             entry.events.push(event);
         }
-        Delta::SetAnalysis(items) => {
-            state.analysis_updated = items.iter().find_map(|t| t.fifa_updated.clone());
+        Delta::SetAnalysis { mode, teams } => {
+            if mode != state.league_mode {
+                // Stale response from a previously selected league – discard.
+                return;
+            }
+            state.analysis_updated = teams.iter().find_map(|t| t.fifa_updated.clone());
             state.analysis_fetched_at = Some(SystemTime::now());
-            state.analysis = items;
+            state.analysis = teams;
             state.analysis_loading = false;
             state.analysis_selected = 0;
         }
@@ -1566,16 +1598,23 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.rankings_dirty = true;
         }
         Delta::RankCacheProgress {
+            mode,
             current,
             total,
             message,
         } => {
+            if mode != state.league_mode {
+                return;
+            }
             state.rankings_loading = true;
             state.rankings_progress_current = current;
             state.rankings_progress_total = total;
             state.rankings_progress_message = message;
         }
-        Delta::RankCacheFinished { errors } => {
+        Delta::RankCacheFinished { mode, errors } => {
+            if mode != state.league_mode {
+                return;
+            }
             state.rankings_loading = false;
             state.rankings_progress_current = state
                 .rankings_progress_total
@@ -1754,6 +1793,8 @@ pub fn league_label(mode: LeagueMode) -> &'static str {
         LeagueMode::PremierLeague => "Premier League",
         LeagueMode::LaLiga => "La Liga",
         LeagueMode::Bundesliga => "Bundesliga",
+        LeagueMode::SerieA => "Serie A",
+        LeagueMode::Ligue1 => "Ligue 1",
         LeagueMode::ChampionsLeague => "Champions League",
         LeagueMode::WorldCup => "World Cup",
     }
