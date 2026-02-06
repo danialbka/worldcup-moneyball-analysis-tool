@@ -1403,7 +1403,10 @@ fn run_app<B: Backend>(
 
 fn ui(frame: &mut Frame, app: &mut App) {
     // Force black background across the entire frame.
-    frame.render_widget(Block::default().style(Style::default().bg(Color::Black)), frame.size());
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        frame.size(),
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1414,7 +1417,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.size());
 
-    let header = Paragraph::new(header_styled(&app.state));
+    let header = Paragraph::new(header_styled(&app.state)).style(Style::default().bg(Color::Black));
     frame.render_widget(header, chunks[0]);
 
     match app.state.screen {
@@ -1425,8 +1428,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Screen::PlayerDetail => render_player_detail(frame, chunks[1], app),
     }
 
-    let footer =
-        Paragraph::new(footer_styled(&app.state)).block(Block::default().borders(Borders::TOP));
+    let footer = Paragraph::new(footer_styled(&app.state))
+        .style(Style::default().bg(Color::Black))
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .style(Style::default().bg(Color::Black)),
+        );
     frame.render_widget(footer, chunks[2]);
 
     if app.state.export.active {
@@ -1441,38 +1449,42 @@ fn ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn header_styled(state: &AppState) -> Line<'static> {
-    let sep = Span::styled(" | ", Style::default().fg(Color::DarkGray));
+    let sep = Span::styled(" | ", on_black(Style::default().fg(Color::DarkGray)));
 
     match state.screen {
         Screen::Pulse => Line::from(vec![
             Span::styled(
                 "WC26 PULSE",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                on_black(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ),
             sep.clone(),
             Span::styled(
                 league_label(state.league_mode).to_string(),
-                Style::default().fg(Color::Yellow),
+                on_black(Style::default().fg(Color::Yellow)),
             ),
             sep.clone(),
             Span::styled(
                 pulse_view_label(state.pulse_view).to_string(),
-                Style::default().fg(Color::Magenta),
+                on_black(Style::default().fg(Color::Magenta)),
             ),
             sep.clone(),
-            Span::styled("Sort: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Sort: ", on_black(Style::default().fg(Color::DarkGray))),
             Span::styled(
                 sort_label(state.sort).to_string(),
-                Style::default().fg(Color::Green),
+                on_black(Style::default().fg(Color::Green)),
             ),
         ]),
         Screen::Terminal { .. } => Line::from(Span::styled(
             "WC26 TERMINAL",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            on_black(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )),
         Screen::Analysis => {
             let updated = state.analysis_updated.as_deref().unwrap_or("-");
@@ -1497,35 +1509,43 @@ fn header_styled(state: &AppState) -> Line<'static> {
             Line::from(vec![
                 Span::styled(
                     "WC26 ANALYSIS",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    on_black(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ),
                 sep.clone(),
                 Span::styled(
                     league_label(state.league_mode).to_string(),
-                    Style::default().fg(Color::Yellow),
+                    on_black(Style::default().fg(Color::Yellow)),
                 ),
                 sep.clone(),
-                Span::styled("Tab: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(tab.to_string(), Style::default().fg(Color::Magenta)),
+                Span::styled("Tab: ", on_black(Style::default().fg(Color::DarkGray))),
+                Span::styled(
+                    tab.to_string(),
+                    on_black(Style::default().fg(Color::Magenta)),
+                ),
                 sep.clone(),
                 Span::styled(
                     format!("Teams: {}", state.analysis.len()),
-                    Style::default().fg(Color::White),
+                    on_black(Style::default().fg(Color::White)),
                 ),
                 sep.clone(),
                 Span::styled(
                     format!("FIFA: {updated}"),
-                    Style::default().fg(Color::White),
+                    on_black(Style::default().fg(Color::White)),
                 ),
                 sep.clone(),
                 Span::styled(
                     format!("Fetched: {fetched}"),
-                    Style::default().fg(Color::DarkGray),
+                    on_black(Style::default().fg(Color::DarkGray)),
                 ),
                 sep.clone(),
-                Span::styled(status_label.to_string(), Style::default().fg(status_color)),
+                Span::styled(
+                    status_label.to_string(),
+                    on_black(Style::default().fg(status_color)),
+                ),
             ])
         }
         Screen::Squad => {
@@ -1543,26 +1563,36 @@ fn header_styled(state: &AppState) -> Line<'static> {
             Line::from(vec![
                 Span::styled(
                     "WC26 SQUAD",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    on_black(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ),
                 sep.clone(),
-                Span::styled(format!("Team: {team}"), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("Team: {team}"),
+                    on_black(Style::default().fg(Color::Yellow)),
+                ),
                 sep.clone(),
                 Span::styled(
                     format!("Players: {}", state.squad.len()),
-                    Style::default().fg(Color::White),
+                    on_black(Style::default().fg(Color::White)),
                 ),
                 sep.clone(),
-                Span::styled(status_label.to_string(), Style::default().fg(status_color)),
+                Span::styled(
+                    status_label.to_string(),
+                    on_black(Style::default().fg(status_color)),
+                ),
             ])
         }
         Screen::PlayerDetail => Line::from(Span::styled(
             "WC26 PLAYER",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            on_black(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )),
     }
 }
@@ -1658,17 +1688,22 @@ fn footer_styled(state: &AppState) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     for (i, (key, desc)) in bindings.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                " │ ",
+                on_black(Style::default().fg(Color::DarkGray)),
+            ));
         }
         spans.push(Span::styled(
             key.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            on_black(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ));
         spans.push(Span::styled(
             format!(" {desc}"),
-            Style::default().fg(Color::Gray),
+            on_black(Style::default().fg(Color::Gray)),
         ));
     }
     Line::from(spans)
@@ -1693,22 +1728,28 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     let list_area = sections[1];
     let rows = state.pulse_live_rows();
     if rows.is_empty() {
-        let empty = Paragraph::new("No matches for this league").style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let empty = Paragraph::new(Text::styled(
+            "No matches for this league",
+            on_black(empty_style),
+        ))
+        .style(Style::default().bg(Color::Black));
         frame.render_widget(empty, list_area);
         return;
     }
 
     const ROW_HEIGHT: u16 = 3;
     if list_area.height < ROW_HEIGHT {
-        let empty = Paragraph::new("Pulse list needs more height").style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let empty = Paragraph::new(Text::styled(
+            "Pulse list needs more height",
+            on_black(empty_style),
+        ))
+        .style(Style::default().bg(Color::Black));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -1905,11 +1946,14 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
     let list_area = sections[1];
     let upcoming = state.filtered_upcoming();
     if upcoming.is_empty() {
-        let empty = Paragraph::new("No upcoming matches for this league").style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let empty = Paragraph::new(Text::styled(
+            "No upcoming matches for this league",
+            on_black(empty_style),
+        ))
+        .style(Style::default().bg(Color::Black));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2083,11 +2127,11 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             "No analysis data yet"
         };
-        let empty = Paragraph::new(message).style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
+            .style(Style::default().bg(Color::Black));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2182,29 +2226,35 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let role = role_label(state.rankings_role);
     let metric = metric_label(state.rankings_metric);
-    let sep = Span::styled(" | ", Style::default().fg(Color::DarkGray));
+    let sep = Span::styled(" | ", on_black(Style::default().fg(Color::DarkGray)));
     let mut header_spans = vec![
         Span::styled(
             "Role Rankings",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            on_black(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ),
         sep.clone(),
-        Span::styled("Role: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Role: ", on_black(Style::default().fg(Color::DarkGray))),
         Span::styled(
             role.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            on_black(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ),
         sep.clone(),
-        Span::styled("Metric: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Metric: ", on_black(Style::default().fg(Color::DarkGray))),
         Span::styled(
             metric.to_string(),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+            on_black(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ),
     ];
     if state.rankings_loading {
@@ -2223,7 +2273,7 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             header_spans.push(Span::styled(
                 state.rankings_progress_message.clone(),
-                Style::default().fg(progress_color),
+                on_black(Style::default().fg(progress_color)),
             ));
         }
     }
@@ -2233,27 +2283,32 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled(
                 "Search [/]: ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                on_black(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ),
             Span::styled(
                 state.rankings_search.clone(),
-                Style::default().fg(Color::Yellow),
+                on_black(Style::default().fg(Color::Yellow)),
             ),
-            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::styled("▌", on_black(Style::default().fg(Color::Yellow))),
         ])
     } else if state.rankings_search.is_empty() {
         Line::from(Span::styled(
             "Search [/]",
-            Style::default().fg(Color::DarkGray),
+            on_black(Style::default().fg(Color::DarkGray)),
         ))
     } else {
         Line::from(vec![
-            Span::styled("Search [/]: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Search [/]: ",
+                on_black(Style::default().fg(Color::DarkGray)),
+            ),
             Span::styled(
                 state.rankings_search.clone(),
-                Style::default().fg(Color::Gray),
+                on_black(Style::default().fg(Color::Gray)),
             ),
         ])
     };
@@ -2270,11 +2325,11 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             "No role ranking data yet (press r to warm cache)"
         };
-        let empty = Paragraph::new(message).style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
+            .style(Style::default().bg(Color::Black));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2298,11 +2353,11 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             "No players match the current search"
         };
-        let empty = Paragraph::new(message).style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
+            .style(Style::default().bg(Color::Black));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2398,11 +2453,11 @@ fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             "No squad data yet"
         };
-        let empty = Paragraph::new(message).style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
+            .style(Style::default().bg(Color::Black));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2517,21 +2572,24 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     if state.player_loading {
-        let text = Paragraph::new("Loading player details...").style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let text = Paragraph::new(Text::styled(
+            "Loading player details...",
+            on_black(empty_style),
+        ))
+        .style(Style::default().bg(Color::Black));
         frame.render_widget(text, inner);
         return;
     }
 
     let Some(detail) = state.player_detail.as_ref() else {
-        let text = Paragraph::new("No player data yet").style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        );
+        let empty_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let text = Paragraph::new(Text::styled("No player data yet", on_black(empty_style)))
+            .style(Style::default().bg(Color::Black));
         frame.render_widget(text, inner);
         return;
     };
@@ -3559,6 +3617,19 @@ fn player_detail_section_max_scroll(detail: &PlayerDetail, section: usize) -> u1
     };
     text_line_count(&lines).saturating_sub(1)
 }
+
+fn on_black(mut style: Style) -> Style {
+    // Ratatui widgets often overwrite the entire cell style.
+    // If a widget style doesn't specify a bg, that cell's bg becomes "reset",
+    // which can show up as white in light-themed terminals (especially on loading/empty screens).
+    // Force a black background unless a caller explicitly chose another bg.
+    match style.bg {
+        None | Some(Color::Reset) => style.bg = Some(Color::Black),
+        _ => {}
+    }
+    style
+}
+
 fn render_cell_text(frame: &mut Frame, area: Rect, text: &str, style: Style) {
     let text_area = Rect {
         x: area.x,
@@ -3566,7 +3637,7 @@ fn render_cell_text(frame: &mut Frame, area: Rect, text: &str, style: Style) {
         width: area.width,
         height: 1,
     };
-    let paragraph = Paragraph::new(text).style(style);
+    let paragraph = Paragraph::new(text).style(on_black(style));
     frame.render_widget(paragraph, text_area);
 }
 
@@ -3581,7 +3652,7 @@ fn render_vseparator(frame: &mut Frame, area: Rect, style: Style) {
         }
         text.push('│');
     }
-    let paragraph = Paragraph::new(text).style(style);
+    let paragraph = Paragraph::new(text).style(on_black(style));
     frame.render_widget(paragraph, area);
 }
 
@@ -3627,21 +3698,26 @@ fn terminal_block(title: &str, focused: bool) -> Block<'_> {
         Block::default()
             .title(Span::styled(
                 title,
+                on_black(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ))
+            .borders(Borders::ALL)
+            .border_style(on_black(
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ))
-            .borders(Borders::ALL)
-            .border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
     } else {
         Block::default()
-            .title(Span::styled(title, Style::default().fg(Color::DarkGray)))
+            .title(Span::styled(
+                title,
+                on_black(Style::default().fg(Color::DarkGray)),
+            ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(60, 60, 80)))
+            .border_style(on_black(Style::default().fg(Color::Rgb(60, 60, 80))))
     }
 }
 
