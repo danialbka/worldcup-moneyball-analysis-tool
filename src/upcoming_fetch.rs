@@ -20,6 +20,8 @@ pub struct FotmobMatchRow {
     pub away: String,
     pub home_score: u8,
     pub away_score: u8,
+    pub utc_time: String,
+    pub minute: Option<u16>,
     pub started: bool,
     pub finished: bool,
     pub cancelled: bool,
@@ -324,6 +326,11 @@ fn build_matches_from_response(data: FotmobResponse) -> Vec<FotmobMatchRow> {
             let away = fixture.away.short_name.unwrap_or(fixture.away.name);
             let home_score = fixture.home.score.unwrap_or(0);
             let away_score = fixture.away.score.unwrap_or(0);
+            let utc_time = fixture.status.utc_time.clone();
+            let minute = live_minute_from_status(&fixture.status);
+            let started = fixture.status.started
+                || fixture.status.ongoing
+                || fixture.status.live_time.is_some();
 
             matches.push(FotmobMatchRow {
                 id: fixture.id.to_string(),
@@ -333,7 +340,9 @@ fn build_matches_from_response(data: FotmobResponse) -> Vec<FotmobMatchRow> {
                 away,
                 home_score,
                 away_score,
-                started: fixture.status.started,
+                utc_time,
+                minute,
+                started,
                 finished: fixture.status.finished,
                 cancelled: fixture.status.cancelled,
             });
@@ -362,6 +371,49 @@ struct FotmobStatus {
     cancelled: bool,
     #[serde(default)]
     finished: bool,
+    #[serde(default)]
+    ongoing: bool,
+    #[serde(rename = "liveTime")]
+    live_time: Option<FotmobLiveTime>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct FotmobLiveTime {
+    #[serde(default)]
+    short: Option<String>,
+    #[serde(default)]
+    long: Option<String>,
+    #[serde(rename = "basePeriod")]
+    #[serde(default)]
+    base_period: Option<u16>,
+}
+
+fn live_minute_from_status(status: &FotmobStatus) -> Option<u16> {
+    let lt = status.live_time.as_ref()?;
+    if let Some(short) = lt.short.as_deref() {
+        if short.trim().eq_ignore_ascii_case("HT") {
+            return Some(lt.base_period.unwrap_or(45));
+        }
+    }
+    if let Some(long) = lt.long.as_deref() {
+        let s = long.trim();
+        if s.eq_ignore_ascii_case("half-time") || s.eq_ignore_ascii_case("half time") {
+            return Some(lt.base_period.unwrap_or(45));
+        }
+        if let Some((mm, ss)) = s.split_once(':') {
+            if let (Ok(m), Ok(sec)) = (mm.trim().parse::<u16>(), ss.trim().parse::<u16>()) {
+                let mut minute = m;
+                if sec > 0 {
+                    minute = minute.saturating_add(1);
+                }
+                return Some(minute.clamp(0, 130));
+            }
+        }
+        if let Ok(m) = s.parse::<u16>() {
+            return Some(m.clamp(0, 130));
+        }
+    }
+    lt.base_period
 }
 
 fn non_empty(value: &str) -> Option<&str> {

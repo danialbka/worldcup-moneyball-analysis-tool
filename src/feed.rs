@@ -732,7 +732,9 @@ fn merge_fotmob_matches(
         let prev = previous.remove(&row.id);
         let is_live = row.started && !row.finished && !row.cancelled;
         let minute = if is_live {
-            prev.as_ref().map(|m| m.minute).unwrap_or(1)
+            row.minute
+                .or_else(|| prev.as_ref().map(|m| m.minute))
+                .unwrap_or(1)
         } else if row.finished {
             90
         } else {
