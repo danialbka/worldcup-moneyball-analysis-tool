@@ -56,6 +56,17 @@ pub fn fetch_match_details_from_fotmob(match_id: &str) -> Result<MatchDetail> {
     Ok(detail)
 }
 
+/// Fetch match details without attempting to fetch live-text commentary.
+/// Intended for background prefetch of stats/lineups for many matches.
+pub fn fetch_match_details_basic_from_fotmob(match_id: &str) -> Result<MatchDetail> {
+    let client = http_client()?;
+
+    let url = format!("https://www.fotmob.com/api/data/matchDetails?matchId={match_id}");
+    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
+    let root: Value = serde_json::from_str(body.trim()).context("invalid matchDetails json")?;
+    Ok(parse_match_details_value(&root))
+}
+
 fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
     let client = http_client()?;
 

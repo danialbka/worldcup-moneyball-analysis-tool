@@ -196,6 +196,49 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                             std::thread::spawn(job);
                         }
                     }
+                    ProviderCommand::FetchMatchDetailsBasic { fixture_id } => {
+                        {
+                            let mut inflight = inflight_match_details
+                                .lock()
+                                .expect("inflight match details lock poisoned");
+                            if inflight.contains(&fixture_id) {
+                                continue;
+                            }
+                            if inflight.len() >= inflight_max {
+                                continue;
+                            }
+                            inflight.insert(fixture_id.clone());
+                        }
+
+                        let tx = tx.clone();
+                        let inflight_match_details = inflight_match_details.clone();
+                        let job = move || {
+                            match upcoming_fetch::fetch_match_details_basic_from_fotmob(&fixture_id)
+                            {
+                                Ok(detail) => {
+                                    let _ = tx.send(Delta::SetMatchDetailsBasic {
+                                        id: fixture_id.clone(),
+                                        detail,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = tx.send(Delta::Log(format!(
+                                        "[WARN] Match details basic error: {fixture_id}: {err}"
+                                    )));
+                                }
+                            }
+                            let mut inflight = inflight_match_details
+                                .lock()
+                                .expect("inflight match details lock poisoned");
+                            inflight.remove(&fixture_id);
+                        };
+
+                        if let Some(pool) = pool.as_ref() {
+                            pool.spawn(job);
+                        } else {
+                            std::thread::spawn(job);
+                        }
+                    }
                     ProviderCommand::FetchUpcoming => {
                         if last_upcoming.elapsed() < upcoming_interval {
                             let _ = tx.send(Delta::Log(format!(

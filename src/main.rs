@@ -166,7 +166,7 @@ impl App {
         }
 
         // Quietly warm details while the user hovers. UI updates when the provider responds.
-        self.request_match_details_for(&match_id, false);
+        self.request_match_details_basic_for(&match_id);
         self.hover_prefetched_match_id = Some(match_id);
     }
 
@@ -658,6 +658,49 @@ impl App {
             return;
         };
         self.request_match_details_for(&match_id, announce);
+    }
+
+    fn request_match_details_basic_for(&mut self, match_id: &str) {
+        if match_id == PLACEHOLDER_MATCH_ID && self.state.placeholder_match_enabled {
+            self.state
+                .match_detail
+                .insert(PLACEHOLDER_MATCH_ID.to_string(), placeholder_match_detail());
+            self.state
+                .match_detail_cached_at
+                .insert(PLACEHOLDER_MATCH_ID.to_string(), SystemTime::now());
+            return;
+        }
+        if let Some(last) = self.last_detail_refresh.get(match_id) {
+            if last.elapsed() < self.detail_request_throttle {
+                return;
+            }
+        }
+
+        let is_live = self
+            .state
+            .matches
+            .iter()
+            .find(|m| m.id == match_id)
+            .map(|m| m.is_live)
+            .unwrap_or(false);
+        let cached_at = self.state.match_detail_cached_at.get(match_id).copied();
+        let has_cached = self.state.match_detail.contains_key(match_id);
+
+        // For non-live matches, avoid re-fetching when cache is fresh.
+        if !is_live && has_cached && cache_fresh(cached_at, self.detail_cache_ttl) {
+            self.last_detail_refresh
+                .insert(match_id.to_string(), Instant::now());
+            return;
+        }
+
+        let Some(tx) = &self.cmd_tx else {
+            return;
+        };
+        let _ = tx.send(state::ProviderCommand::FetchMatchDetailsBasic {
+            fixture_id: match_id.to_string(),
+        });
+        self.last_detail_refresh
+            .insert(match_id.to_string(), Instant::now());
     }
 
     fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
@@ -1168,23 +1211,54 @@ impl App {
     }
 
     fn maybe_refresh_match_details(&mut self) {
-        let live_matches: Vec<String> = self
+        const PREFETCH_LIMIT: usize = 3;
+        let mut sent = 0usize;
+
+        // Refresh live match stats/lineups periodically.
+        let live_ids: Vec<String> = self
             .state
-            .filtered_matches()
-            .into_iter()
+            .matches
+            .iter()
             .filter(|m| m.is_live)
             .filter(|m| m.id != PLACEHOLDER_MATCH_ID)
             .map(|m| m.id.clone())
             .collect();
 
-        for match_id in live_matches {
+        for match_id in live_ids {
+            if sent >= PREFETCH_LIMIT {
+                return;
+            }
             let last = self.last_detail_refresh.get(&match_id);
             let should_fetch = last
                 .map(|t| t.elapsed() >= self.detail_refresh)
                 .unwrap_or(true);
             if should_fetch {
-                self.request_match_details_for(&match_id, false);
+                self.request_match_details_basic_for(&match_id);
+                sent += 1;
             }
+        }
+
+        // Warm stats for finished matches (fetch once when missing/stale).
+        let finished_ids: Vec<String> = self
+            .state
+            .matches
+            .iter()
+            .filter(|m| !m.is_live && m.minute >= 90)
+            .filter(|m| m.id != PLACEHOLDER_MATCH_ID)
+            .map(|m| m.id.clone())
+            .collect();
+
+        for match_id in finished_ids {
+            if sent >= PREFETCH_LIMIT {
+                return;
+            }
+            let cached_at = self.state.match_detail_cached_at.get(&match_id).copied();
+            let has_cached = self.state.match_detail.contains_key(&match_id);
+            if has_cached && cache_fresh(cached_at, self.detail_cache_ttl) {
+                continue;
+            }
+            self.request_match_details_basic_for(&match_id);
+            sent += 1;
         }
     }
 

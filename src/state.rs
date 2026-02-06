@@ -1376,6 +1376,10 @@ pub enum Delta {
         id: String,
         detail: MatchDetail,
     },
+    SetMatchDetailsBasic {
+        id: String,
+        detail: MatchDetail,
+    },
     UpsertMatch(MatchSummary),
     SetUpcoming(Vec<UpcomingMatch>),
     AddEvent {
@@ -1436,6 +1440,9 @@ pub enum Delta {
 #[derive(Debug, Clone)]
 pub enum ProviderCommand {
     FetchMatchDetails {
+        fixture_id: String,
+    },
+    FetchMatchDetailsBasic {
         fixture_id: String,
     },
     FetchUpcoming,
@@ -1512,6 +1519,41 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             }
         }
         Delta::SetMatchDetails { id, detail } => {
+            state.match_detail.insert(id.clone(), detail);
+            state
+                .match_detail_cached_at
+                .insert(id.clone(), SystemTime::now());
+
+            // Update prediction immediately when details (stats/lineups) arrive.
+            if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
+                let prev_p_home = existing.win.p_home;
+                let detail_ref = state.match_detail.get(&id);
+                existing.win = win_prob::compute_win_prob(
+                    existing,
+                    detail_ref,
+                    &state.combined_player_cache,
+                    &state.analysis,
+                );
+                existing.win.delta_home = existing.win.p_home - prev_p_home;
+
+                let entry = state.win_prob_history.entry(id).or_default();
+                entry.push(existing.win.p_home);
+                if entry.len() > 40 {
+                    let drain_count = entry.len() - 40;
+                    entry.drain(..drain_count);
+                }
+            }
+        }
+        Delta::SetMatchDetailsBasic { id, detail } => {
+            let mut detail = detail;
+            if let Some(existing) = state.match_detail.get(&id) {
+                // Basic fetches should not clobber commentary a user explicitly fetched.
+                if detail.commentary.is_empty() && !existing.commentary.is_empty() {
+                    detail.commentary = existing.commentary.clone();
+                    detail.commentary_error = existing.commentary_error.clone();
+                }
+            }
+
             state.match_detail.insert(id.clone(), detail);
             state
                 .match_detail_cached_at
