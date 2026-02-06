@@ -1,0 +1,23 @@
+{
+  "id": "bt-1",
+  "league_id": null,
+  "league_name": "Backtest",
+  "home": "Home",
+  "away": "Away",
+  "minute": 45,
+  "score_home": 0,
+  "score_away": 0,
+  "is_live": true,
+  "detail": {
+    "home_team": "Home",
+    "away_team": "Away",
+    "events": [],
+    "commentary": [],
+    "commentary_error": null,
+    "lineups": null,
+    "stats": [
+      { "name": "xG", "home": "1.20", "away": "0.40" }
+    ]
+  },
+  "analysis": []
+}

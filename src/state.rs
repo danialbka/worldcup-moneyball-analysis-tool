@@ -159,6 +159,8 @@ pub fn placeholder_match_detail() -> MatchDetail {
     };
 
     MatchDetail {
+        home_team: Some(PLACEHOLDER_HOME.to_string()),
+        away_team: Some(PLACEHOLDER_AWAY.to_string()),
         events,
         commentary: Vec::new(),
         commentary_error: None,
@@ -1089,6 +1091,10 @@ pub struct WinProbRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchDetail {
+    #[serde(default)]
+    pub home_team: Option<String>,
+    #[serde(default)]
+    pub away_team: Option<String>,
     pub events: Vec<Event>,
     #[serde(default)]
     pub commentary: Vec<CommentaryEntry>,
@@ -1429,8 +1435,12 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             let preserved_selected = state.selected;
             for summary in &mut matches {
                 let detail = state.match_detail.get(&summary.id);
-                summary.win =
-                    win_prob::compute_win_prob(summary, detail, &state.combined_player_cache);
+                summary.win = win_prob::compute_win_prob(
+                    summary,
+                    detail,
+                    &state.combined_player_cache,
+                    &state.analysis,
+                );
                 if let Some(existing) = state.matches.iter().find(|m| m.id == summary.id) {
                     summary.win.delta_home = summary.win.p_home - existing.win.p_home;
                 } else {
@@ -1469,8 +1479,12 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
                 let prev_p_home = existing.win.p_home;
                 let detail_ref = state.match_detail.get(&id);
-                existing.win =
-                    win_prob::compute_win_prob(existing, detail_ref, &state.combined_player_cache);
+                existing.win = win_prob::compute_win_prob(
+                    existing,
+                    detail_ref,
+                    &state.combined_player_cache,
+                    &state.analysis,
+                );
                 existing.win.delta_home = existing.win.p_home - prev_p_home;
 
                 let entry = state.win_prob_history.entry(id).or_default();
@@ -1484,8 +1498,12 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         Delta::UpsertMatch(mut summary) => {
             let match_id = summary.id.clone();
             let detail = state.match_detail.get(&match_id);
-            summary.win =
-                win_prob::compute_win_prob(&summary, detail, &state.combined_player_cache);
+            summary.win = win_prob::compute_win_prob(
+                &summary,
+                detail,
+                &state.combined_player_cache,
+                &state.analysis,
+            );
             let home_prob = summary.win.p_home;
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == summary.id) {
                 summary.win.delta_home = summary.win.p_home - existing.win.p_home;
@@ -1510,6 +1528,8 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         }
         Delta::AddEvent { id, event } => {
             let entry = state.match_detail.entry(id).or_insert_with(|| MatchDetail {
+                home_team: None,
+                away_team: None,
                 events: Vec::new(),
                 commentary: Vec::new(),
                 commentary_error: None,

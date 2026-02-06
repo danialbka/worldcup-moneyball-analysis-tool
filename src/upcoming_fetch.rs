@@ -99,6 +99,8 @@ pub fn parse_match_details_json(raw: &str) -> Result<MatchDetail> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Ok(MatchDetail {
+            home_team: None,
+            away_team: None,
             events: Vec::new(),
             commentary: Vec::new(),
             commentary_error: None,
@@ -129,6 +131,16 @@ fn parse_match_details_value(root: &Value) -> MatchDetail {
     let stats = parse_stats(content.get("stats").and_then(|v| v.get("stats")));
 
     MatchDetail {
+        home_team: if home_name.is_empty() {
+            None
+        } else {
+            Some(home_name.clone())
+        },
+        away_team: if away_name.is_empty() {
+            None
+        } else {
+            Some(away_name.clone())
+        },
         events,
         commentary: Vec::new(),
         commentary_error: None,

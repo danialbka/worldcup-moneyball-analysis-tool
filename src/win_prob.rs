@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::state::{LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, WinProbRow};
+use crate::state::{
+    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, TeamAnalysis, WinProbRow,
+};
 
 const GOALS_TOTAL_BASE: f64 = 2.60;
 const HOME_ADV_GOALS: f64 = 0.15;
@@ -13,6 +15,7 @@ pub fn compute_win_prob(
     summary: &MatchSummary,
     detail: Option<&MatchDetail>,
     players: &HashMap<u32, PlayerDetail>,
+    analysis: &[TeamAnalysis],
 ) -> WinProbRow {
     // If the match is effectively final, just reflect the result.
     if !summary.is_live && summary.minute >= 90 {
@@ -34,28 +37,52 @@ pub fn compute_win_prob(
     }
 
     let lineup = detail.and_then(|d| d.lineups.as_ref());
-    let (s_home, s_away) = if let Some(lineups) = lineup {
-        // `upcoming_fetch::parse_lineups` pushes homeTeam then awayTeam, so treat that as
-        // the primary mapping. If that ever changes upstream, we still do a best-effort
-        // match by team_abbr against the match summary.
-        let home_key = summary.home.trim().to_uppercase();
-        let away_key = summary.away.trim().to_uppercase();
-
-        let mut home_side: Option<&LineupSide> = None;
-        let mut away_side: Option<&LineupSide> = None;
-        for side in &lineups.sides {
-            let abbr = side.team_abbr.trim().to_uppercase();
-            if home_side.is_none() && abbr == home_key {
-                home_side = Some(side);
-            }
-            if away_side.is_none() && abbr == away_key {
-                away_side = Some(side);
-            }
-        }
-
+    let (lineup_s_home, lineup_s_away) = if let Some(lineups) = lineup {
         if lineups.sides.is_empty() {
             (None, None)
         } else {
+            // Prefer mapping by explicit home/away team name from match details.
+            let home_name = detail
+                .and_then(|d| d.home_team.as_deref())
+                .unwrap_or_default();
+            let away_name = detail
+                .and_then(|d| d.away_team.as_deref())
+                .unwrap_or_default();
+
+            let home_key = normalize_team_key(home_name);
+            let away_key = normalize_team_key(away_name);
+
+            let mut home_side: Option<&LineupSide> = None;
+            let mut away_side: Option<&LineupSide> = None;
+
+            if !home_key.is_empty() || !away_key.is_empty() {
+                for side in &lineups.sides {
+                    let team_key = normalize_team_key(&side.team);
+                    if home_side.is_none() && !home_key.is_empty() && team_key == home_key {
+                        home_side = Some(side);
+                    }
+                    if away_side.is_none() && !away_key.is_empty() && team_key == away_key {
+                        away_side = Some(side);
+                    }
+                }
+            }
+
+            // Fallback: match by abbreviation against match summary labels.
+            let home_abbr = normalize_team_key(&summary.home);
+            let away_abbr = normalize_team_key(&summary.away);
+            if home_side.is_none() || away_side.is_none() {
+                for side in &lineups.sides {
+                    let abbr = normalize_team_key(&side.team_abbr);
+                    if home_side.is_none() && !home_abbr.is_empty() && abbr == home_abbr {
+                        home_side = Some(side);
+                    }
+                    if away_side.is_none() && !away_abbr.is_empty() && abbr == away_abbr {
+                        away_side = Some(side);
+                    }
+                }
+            }
+
+            // Final fallback: ordering from `upcoming_fetch::parse_lineups` (homeTeam then awayTeam).
             let home_side = home_side.or_else(|| lineups.sides.first());
             let away_side = away_side.or_else(|| lineups.sides.get(1));
             match (home_side, away_side) {
@@ -70,17 +97,36 @@ pub fn compute_win_prob(
         (None, None)
     };
 
-    let track = s_home.is_some() && s_away.is_some();
-    let s_home = s_home.unwrap_or(0.0);
-    let s_away = s_away.unwrap_or(0.0);
+    let track = lineup_s_home.is_some() && lineup_s_away.is_some();
+
+    // If we don't have enough lineup+player coverage, fall back to TeamAnalysis (FIFA points/rank)
+    // for a conservative pre-match prior.
+    let (s_home, s_away) = if track {
+        (lineup_s_home.unwrap_or(0.0), lineup_s_away.unwrap_or(0.0))
+    } else {
+        let home_label = detail
+            .and_then(|d| d.home_team.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&summary.home);
+        let away_label = detail
+            .and_then(|d| d.away_team.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&summary.away);
+
+        (
+            team_strength_from_analysis(home_label, analysis).unwrap_or(0.0),
+            team_strength_from_analysis(away_label, analysis).unwrap_or(0.0),
+        )
+    };
 
     let diff = HOME_ADV_GOALS + K_STRENGTH * (s_home - s_away);
     let lambda_home_pre = clamp((GOALS_TOTAL_BASE / 2.0) + (diff / 2.0), 0.20, 3.80);
     let lambda_away_pre = clamp((GOALS_TOTAL_BASE / 2.0) - (diff / 2.0), 0.20, 3.80);
 
-    let minute = summary.minute.max(1).min(90) as f64;
-    let t = minute / 90.0;
-    let remain = (90.0 - minute) / 90.0;
+    let effective_total = estimate_total_minutes(summary, detail);
+    let minute = (summary.minute as f64).max(1.0).min(effective_total);
+    let t = minute / effective_total;
+    let remain = (effective_total - minute) / effective_total;
 
     let mut quality = if track {
         ModelQuality::Track
@@ -129,7 +175,35 @@ pub fn compute_win_prob(
                     3.00,
                 );
             }
+
+            // Extra live signals (bounded).
+            apply_red_card_adjustment(summary, d, &mut lambda_home_rem, &mut lambda_away_rem);
+
+            // If xG is missing, try other weak signals.
+            if !xg_present {
+                if let Some((bc_h, bc_a)) = extract_stat_f64(d, &["big chances"]) {
+                    used_live_stats = true;
+                    let delta = bc_h - bc_a;
+                    let b = clamp(t, 0.0, 0.50);
+                    lambda_home_rem = clamp(lambda_home_rem * (1.0 + 0.06 * delta * b), 0.05, 3.00);
+                    lambda_away_rem = clamp(lambda_away_rem * (1.0 - 0.06 * delta * b), 0.05, 3.00);
+                } else if let Some((xgot_h, xgot_a)) =
+                    extract_stat_f64(d, &["xgot", "xg on target"])
+                {
+                    used_live_stats = true;
+                    let delta = xgot_h - xgot_a;
+                    let b = clamp(t, 0.0, 0.50);
+                    lambda_home_rem = clamp(lambda_home_rem * (1.0 + 0.04 * delta * b), 0.05, 3.00);
+                    lambda_away_rem = clamp(lambda_away_rem * (1.0 - 0.04 * delta * b), 0.05, 3.00);
+                }
+            }
         }
+    }
+
+    // Late-game damping: teams protect a lead.
+    if summary.is_live && summary.minute >= 75 && summary.score_home != summary.score_away {
+        lambda_home_rem = clamp(lambda_home_rem * 0.90, 0.05, 3.00);
+        lambda_away_rem = clamp(lambda_away_rem * 0.90, 0.05, 3.00);
     }
 
     if quality != ModelQuality::Track && used_live_stats {
@@ -180,6 +254,94 @@ fn compute_confidence(t: f64, xg_present: bool, track: bool) -> u8 {
     clamp(score, 5.0, 95.0).round() as u8
 }
 
+fn estimate_total_minutes(summary: &MatchSummary, detail: Option<&MatchDetail>) -> f64 {
+    // Conservative stoppage estimate based on event volume after 60'.
+    if !summary.is_live {
+        return 90.0;
+    }
+    let Some(d) = detail else {
+        return 90.0;
+    };
+
+    let mut goals = 0u32;
+    let mut cards = 0u32;
+    let mut subs = 0u32;
+
+    for e in &d.events {
+        if e.minute < 60 {
+            continue;
+        }
+        match e.kind {
+            crate::state::EventKind::Goal => goals += 1,
+            crate::state::EventKind::Card => cards += 1,
+            crate::state::EventKind::Sub => subs += 1,
+            crate::state::EventKind::Shot => {}
+        }
+    }
+
+    let stoppage = (goals + cards + subs).min(7) as f64;
+    90.0 + stoppage
+}
+
+fn apply_red_card_adjustment(
+    summary: &MatchSummary,
+    detail: &MatchDetail,
+    lambda_home_rem: &mut f64,
+    lambda_away_rem: &mut f64,
+) {
+    // We only have EventKind::Card; infer red via description.
+    let mut red_home = 0u32;
+    let mut red_away = 0u32;
+
+    let home_name = detail
+        .home_team
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&summary.home);
+    let away_name = detail
+        .away_team
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&summary.away);
+
+    let home_key = normalize_team_key(home_name);
+    let away_key = normalize_team_key(away_name);
+
+    for e in &detail.events {
+        if e.kind != crate::state::EventKind::Card {
+            continue;
+        }
+        let desc = e.description.to_lowercase();
+        if !desc.contains("red") {
+            continue;
+        }
+        let team_key = normalize_team_key(&e.team);
+        if !home_key.is_empty() && team_key == home_key {
+            red_home += 1;
+        } else if !away_key.is_empty() && team_key == away_key {
+            red_away += 1;
+        }
+    }
+
+    if red_home == 0 && red_away == 0 {
+        return;
+    }
+
+    // Bounded multipliers, per red (stacking but clamped).
+    if red_home > 0 {
+        let penal = clamp(0.80_f64.powi(red_home as i32), 0.55, 1.0);
+        let boost = clamp(1.10_f64.powi(red_home as i32), 1.0, 1.35);
+        *lambda_home_rem = clamp(*lambda_home_rem * penal, 0.05, 3.00);
+        *lambda_away_rem = clamp(*lambda_away_rem * boost, 0.05, 3.00);
+    }
+    if red_away > 0 {
+        let penal = clamp(0.80_f64.powi(red_away as i32), 0.55, 1.0);
+        let boost = clamp(1.10_f64.powi(red_away as i32), 1.0, 1.35);
+        *lambda_away_rem = clamp(*lambda_away_rem * penal, 0.05, 3.00);
+        *lambda_home_rem = clamp(*lambda_home_rem * boost, 0.05, 3.00);
+    }
+}
+
 fn extract_stat_f64(detail: &MatchDetail, keys: &[&str]) -> Option<(f64, f64)> {
     let want = keys
         .iter()
@@ -204,6 +366,67 @@ fn parse_stat_cell(raw: &str) -> Option<f64> {
     }
     let s = s.trim_end_matches('%').replace(',', "");
     s.parse::<f64>().ok()
+}
+
+fn normalize_team_key(raw: &str) -> String {
+    raw.trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn team_strength_from_analysis(label: &str, analysis: &[TeamAnalysis]) -> Option<f64> {
+    let key = normalize_team_key(label);
+    if key.is_empty() {
+        return None;
+    }
+    for t in analysis {
+        let name_key = normalize_team_key(&t.name);
+        if name_key == key {
+            return analysis_team_strength(t);
+        }
+        if abbreviate_team_key(&t.name) == key {
+            return analysis_team_strength(t);
+        }
+    }
+    None
+}
+
+fn analysis_team_strength(t: &TeamAnalysis) -> Option<f64> {
+    if let Some(points) = t.fifa_points {
+        let s = (points as f64 - 1600.0) / 400.0;
+        return Some(clamp(s, -1.0, 1.0));
+    }
+    if let Some(rank) = t.fifa_rank {
+        let s = (100.0 - rank as f64) / 100.0;
+        return Some(clamp(s, -1.0, 1.0));
+    }
+    None
+}
+
+fn abbreviate_team_key(name: &str) -> String {
+    let trimmed = normalize_team_key(name);
+    if trimmed.len() <= 3 {
+        return trimmed;
+    }
+    let mut abbr = String::new();
+    for part in trimmed.split_whitespace() {
+        if let Some(ch) = part.chars().next() {
+            abbr.push(ch);
+        }
+        if abbr.len() >= 3 {
+            break;
+        }
+    }
+    if abbr.len() >= 2 {
+        abbr
+    } else {
+        trimmed.chars().take(3).collect()
+    }
 }
 
 fn player_form_rating(p: &PlayerDetail, n: usize) -> Option<f64> {
@@ -242,8 +465,9 @@ fn lineup_team_strength(lineup: &LineupSide, players: &HashMap<u32, PlayerDetail
     let mut cnt = 0usize;
 
     for slot in &lineup.starting {
-        let Some(id) = slot.id else { continue };
-        let Some(p) = players.get(&id) else { continue };
+        let Some(p) = match_player(slot, players, Some(&lineup.team)) else {
+            continue;
+        };
         let Some(r) = player_form_rating(p, 8) else {
             continue;
         };
@@ -254,6 +478,68 @@ fn lineup_team_strength(lineup: &LineupSide, players: &HashMap<u32, PlayerDetail
 
     if cnt >= 7 {
         Some(sum / cnt as f64)
+    } else {
+        None
+    }
+}
+
+fn normalize_player_name(raw: &str) -> String {
+    let lowered = raw.trim().to_lowercase();
+    let cleaned = lowered
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        .collect::<String>();
+    let mut parts = cleaned.split_whitespace().collect::<Vec<_>>();
+    parts.retain(|p| !matches!(*p, "jr" | "sr" | "ii" | "iii" | "iv"));
+    parts.join(" ")
+}
+
+fn match_player<'a>(
+    slot: &crate::state::PlayerSlot,
+    players: &'a HashMap<u32, PlayerDetail>,
+    team_hint: Option<&str>,
+) -> Option<&'a PlayerDetail> {
+    if let Some(id) = slot.id {
+        if let Some(p) = players.get(&id) {
+            return Some(p);
+        }
+    }
+
+    let slot_key = normalize_player_name(&slot.name);
+    if slot_key.is_empty() {
+        return None;
+    }
+
+    let team_key = team_hint.map(normalize_team_key);
+
+    let mut exact: Vec<&PlayerDetail> = Vec::new();
+    for p in players.values() {
+        if normalize_player_name(&p.name) != slot_key {
+            continue;
+        }
+        exact.push(p);
+    }
+    if exact.is_empty() {
+        return None;
+    }
+
+    if let Some(team_key) = team_key {
+        let mut team_filtered: Vec<&PlayerDetail> = exact
+            .iter()
+            .copied()
+            .filter(|p| {
+                p.team
+                    .as_deref()
+                    .is_some_and(|t| normalize_team_key(t) == team_key)
+            })
+            .collect();
+        if team_filtered.len() == 1 {
+            return Some(team_filtered.remove(0));
+        }
+    }
+
+    if exact.len() == 1 {
+        Some(exact[0])
     } else {
         None
     }
@@ -403,7 +689,7 @@ mod tests {
             },
             is_live: true,
         };
-        let win = compute_win_prob(&summary, None, &HashMap::new());
+        let win = compute_win_prob(&summary, None, &HashMap::new(), &[]);
         let sum = win.p_home + win.p_draw + win.p_away;
         assert!((sum - 100.0).abs() < 0.01);
     }
@@ -429,7 +715,7 @@ mod tests {
             },
             is_live: true,
         };
-        let win = compute_win_prob(&summary, None, &HashMap::new());
+        let win = compute_win_prob(&summary, None, &HashMap::new(), &[]);
         assert!(win.p_home > 95.0);
     }
 
@@ -456,6 +742,8 @@ mod tests {
         };
 
         let detail = MatchDetail {
+            home_team: Some("Home".to_string()),
+            away_team: Some("Away".to_string()),
             events: Vec::new(),
             commentary: Vec::new(),
             commentary_error: None,
@@ -498,7 +786,7 @@ mod tests {
         cache.insert(1, stub_player(1, &["7.2", "7.0", "6.9"]));
         cache.insert(2, stub_player(2, &["6.8", "6.7", "6.6"]));
 
-        let win = compute_win_prob(&summary, Some(&detail), &cache);
+        let win = compute_win_prob(&summary, Some(&detail), &cache, &[]);
         // With heavy xG edge at HT, home should be favored.
         assert!(win.p_home > win.p_away);
     }

@@ -169,6 +169,8 @@ pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>)
                                     )));
                                     if let Some(lineups) = lineups.get(&fixture_id) {
                                         let detail = MatchDetail {
+                                            home_team: None,
+                                            away_team: None,
                                             events: Vec::new(),
                                             commentary: Vec::new(),
                                             commentary_error: None,
