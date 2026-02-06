@@ -4,6 +4,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::win_prob;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Pulse,
@@ -192,6 +194,7 @@ fn placeholder_lineup_side(
 
 fn placeholder_player(name: &str, number: u32, pos: &str) -> PlayerSlot {
     PlayerSlot {
+        id: None,
         name: name.to_string(),
         number: Some(number),
         pos: Some(pos.to_string()),
@@ -1125,6 +1128,8 @@ pub struct CommentaryEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSlot {
+    #[serde(default)]
+    pub id: Option<u32>,
     pub name: String,
     pub number: Option<u32>,
     pub pos: Option<String>,
@@ -1423,6 +1428,9 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 && selected_id.is_none();
             let preserved_selected = state.selected;
             for summary in &mut matches {
+                let detail = state.match_detail.get(&summary.id);
+                summary.win =
+                    win_prob::compute_win_prob(summary, detail, &state.combined_player_cache);
                 if let Some(existing) = state.matches.iter().find(|m| m.id == summary.id) {
                     summary.win.delta_home = summary.win.p_home - existing.win.p_home;
                 } else {
@@ -1453,10 +1461,31 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         }
         Delta::SetMatchDetails { id, detail } => {
             state.match_detail.insert(id.clone(), detail);
-            state.match_detail_cached_at.insert(id, SystemTime::now());
+            state
+                .match_detail_cached_at
+                .insert(id.clone(), SystemTime::now());
+
+            // Update prediction immediately when details (stats/lineups) arrive.
+            if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
+                let prev_p_home = existing.win.p_home;
+                let detail_ref = state.match_detail.get(&id);
+                existing.win =
+                    win_prob::compute_win_prob(existing, detail_ref, &state.combined_player_cache);
+                existing.win.delta_home = existing.win.p_home - prev_p_home;
+
+                let entry = state.win_prob_history.entry(id).or_default();
+                entry.push(existing.win.p_home);
+                if entry.len() > 40 {
+                    let keep = entry.split_off(entry.len() - 40);
+                    *entry = keep;
+                }
+            }
         }
         Delta::UpsertMatch(mut summary) => {
             let match_id = summary.id.clone();
+            let detail = state.match_detail.get(&match_id);
+            summary.win =
+                win_prob::compute_win_prob(&summary, detail, &state.combined_player_cache);
             let home_prob = summary.win.p_home;
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == summary.id) {
                 summary.win.delta_home = summary.win.p_home - existing.win.p_home;

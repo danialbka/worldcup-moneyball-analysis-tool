@@ -1024,6 +1024,7 @@ fn seed_lineups() -> Vec<(String, MatchLineups)> {
 
 fn player(name: &str, number: u32, pos: &str) -> PlayerSlot {
     PlayerSlot {
+        id: None,
         name: name.to_string(),
         number: Some(number),
         pos: Some(pos.to_string()),

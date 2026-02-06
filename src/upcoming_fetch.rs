@@ -440,6 +440,11 @@ fn parse_players(value: Option<&Value>) -> Vec<PlayerSlot> {
 }
 
 fn parse_player(value: &Value) -> Option<PlayerSlot> {
+    let id = pick_u32(value, &["playerId", "id", "player_id"]).or_else(|| {
+        value
+            .get("player")
+            .and_then(|p| pick_u32(p, &["id", "playerId", "player_id"]))
+    });
     let name = pick_string(value, &["name", "playerName"])
         .or_else(|| pick_string(value, &["fullName"]))
         .or_else(|| {
@@ -453,7 +458,12 @@ fn parse_player(value: &Value) -> Option<PlayerSlot> {
     }
     let number = pick_u32(value, &["shirtNumber", "number"]);
     let pos = pick_string(value, &["position", "pos", "role", "positionShort"]);
-    Some(PlayerSlot { name, number, pos })
+    Some(PlayerSlot {
+        id,
+        name,
+        number,
+        pos,
+    })
 }
 
 fn parse_events(value: Option<&Value>, home: &str, away: &str) -> Vec<Event> {

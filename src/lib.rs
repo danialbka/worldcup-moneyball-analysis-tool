@@ -7,3 +7,4 @@ pub mod http_client;
 pub mod persist;
 pub mod state;
 pub mod upcoming_fetch;
+pub mod win_prob;
