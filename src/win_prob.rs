@@ -146,7 +146,7 @@ pub fn compute_win_prob(
 
     if summary.is_live {
         if let Some(d) = detail {
-            if let Some((xg_h, xg_a)) = extract_stat_f64(d, &["xg", "expected goals"]) {
+            if let Some((xg_h, xg_a)) = extract_xg_pair(d) {
                 xg_present = true;
                 used_live_stats = true;
 
@@ -163,7 +163,9 @@ pub fn compute_win_prob(
 
                 lambda_home_rem = clamp(lambda_home_live_total * remain, 0.05, 3.00);
                 lambda_away_rem = clamp(lambda_away_live_total * remain, 0.05, 3.00);
-            } else if let Some((sot_h, sot_a)) = extract_stat_f64(d, &["shots on target"]) {
+            } else if let Some((sot_h, sot_a)) =
+                extract_stat_f64_pref(d, &["Top stats", "Shots"], &["shots on target"])
+            {
                 used_live_stats = true;
                 let delta = sot_h - sot_a;
                 let b = clamp(t, 0.0, 0.50);
@@ -184,20 +186,29 @@ pub fn compute_win_prob(
 
             // If xG is missing, try other weak signals.
             if !xg_present {
-                if let Some((bc_h, bc_a)) = extract_stat_f64(d, &["big chances"]) {
+                if let Some((bc_h, bc_a)) =
+                    extract_stat_f64_pref(d, &["Top stats", "Shots"], &["big chances"])
+                {
                     used_live_stats = true;
                     let delta = bc_h - bc_a;
                     let b = clamp(t, 0.0, 0.50);
                     lambda_home_rem = clamp(lambda_home_rem * (1.0 + 0.06 * delta * b), 0.05, 3.00);
                     lambda_away_rem = clamp(lambda_away_rem * (1.0 - 0.06 * delta * b), 0.05, 3.00);
-                } else if let Some((xgot_h, xgot_a)) =
-                    extract_stat_f64(d, &["xgot", "xg on target"])
-                {
+                } else if let Some((xgot_h, xgot_a)) = extract_stat_f64_pref(
+                    d,
+                    &["Expected goals (xG)", "Top stats"],
+                    &["xg on target", "xgot"],
+                ) {
                     used_live_stats = true;
                     let delta = xgot_h - xgot_a;
                     let b = clamp(t, 0.0, 0.50);
                     lambda_home_rem = clamp(lambda_home_rem * (1.0 + 0.04 * delta * b), 0.05, 3.00);
                     lambda_away_rem = clamp(lambda_away_rem * (1.0 - 0.04 * delta * b), 0.05, 3.00);
+                }
+
+                if apply_extra_match_stats_signals(d, t, &mut lambda_home_rem, &mut lambda_away_rem)
+                {
+                    used_live_stats = true;
                 }
             }
         }
@@ -345,26 +356,240 @@ fn apply_red_card_adjustment(
     }
 }
 
-fn extract_stat_f64(detail: &MatchDetail, keys: &[&str]) -> Option<(f64, f64)> {
+fn extract_stat_f64_pref(
+    detail: &MatchDetail,
+    group_prefs: &[&str],
+    needles: &[&str],
+) -> Option<(f64, f64)> {
+    for group in group_prefs {
+        if let Some(pair) = extract_stat_f64_group(detail, Some(group), needles) {
+            return Some(pair);
+        }
+    }
+    extract_stat_f64_group(detail, None, needles)
+}
+
+fn extract_xg_pair(detail: &MatchDetail) -> Option<(f64, f64)> {
+    // Prefer the new FotMob title.
+    if let Some(pair) = extract_stat_f64_pref(
+        detail,
+        &["Top stats", "Expected goals (xG)"],
+        &["expected goals"],
+    ) {
+        return Some(pair);
+    }
+    // Fallback: legacy "xG" row.
     for row in &detail.stats {
         let name = row.name.trim();
-        if !keys.iter().any(|k| name.eq_ignore_ascii_case(k.trim())) {
-            continue;
+        if name.eq_ignore_ascii_case("xg") && !contains_ascii_case_insensitive(name, "xgot") {
+            let h = parse_stat_cell(&row.home)?;
+            let a = parse_stat_cell(&row.away)?;
+            return Some((h, a));
         }
-        let h = parse_stat_cell(&row.home)?;
-        let a = parse_stat_cell(&row.away)?;
-        return Some((h, a));
     }
     None
 }
 
+fn extract_stat_f64_group(
+    detail: &MatchDetail,
+    group_pref: Option<&str>,
+    needles: &[&str],
+) -> Option<(f64, f64)> {
+    let row = find_stat_row(detail, group_pref, needles)?;
+    let h = parse_stat_cell(&row.home)?;
+    let a = parse_stat_cell(&row.away)?;
+    Some((h, a))
+}
+
+fn extract_stat_pct_pref(
+    detail: &MatchDetail,
+    group_prefs: &[&str],
+    needles: &[&str],
+) -> Option<(f64, f64)> {
+    for group in group_prefs {
+        if let Some(pair) = extract_stat_pct_group(detail, Some(group), needles) {
+            return Some(pair);
+        }
+    }
+    extract_stat_pct_group(detail, None, needles)
+}
+
+fn extract_stat_pct_group(
+    detail: &MatchDetail,
+    group_pref: Option<&str>,
+    needles: &[&str],
+) -> Option<(f64, f64)> {
+    let row = find_stat_row(detail, group_pref, needles)?;
+    let h = parse_stat_percent(&row.home)?;
+    let a = parse_stat_percent(&row.away)?;
+    Some((h, a))
+}
+
+fn find_stat_row<'a>(
+    detail: &'a MatchDetail,
+    group_pref: Option<&str>,
+    needles: &[&str],
+) -> Option<&'a crate::state::StatRow> {
+    if needles.is_empty() {
+        return None;
+    }
+
+    if let Some(group_pref) = group_pref {
+        for row in &detail.stats {
+            let matches_group = row
+                .group
+                .as_deref()
+                .is_some_and(|g| g.eq_ignore_ascii_case(group_pref));
+            if !matches_group {
+                continue;
+            }
+            if stat_title_matches(&row.name, needles) {
+                return Some(row);
+            }
+        }
+    }
+
+    for row in &detail.stats {
+        if stat_title_matches(&row.name, needles) {
+            return Some(row);
+        }
+    }
+    None
+}
+
+fn stat_title_matches(title: &str, needles: &[&str]) -> bool {
+    let t = title.trim();
+    if t.is_empty() {
+        return false;
+    }
+    needles
+        .iter()
+        .any(|n| contains_ascii_case_insensitive(t, n.trim()))
+}
+
 fn parse_stat_cell(raw: &str) -> Option<f64> {
+    // Parse the first numeric token found (handles "248 (88%)", "58%", etc.)
     let s = raw.trim();
     if s.is_empty() || s == "-" {
         return None;
     }
-    let s = s.trim_end_matches('%').replace(',', "");
-    s.parse::<f64>().ok()
+    let s = s.replace(',', "");
+
+    let mut buf = String::new();
+    let mut started = false;
+    for ch in s.chars() {
+        let is_num = ch.is_ascii_digit() || ch == '.' || (ch == '-' && !started);
+        if is_num {
+            started = true;
+            buf.push(ch);
+            continue;
+        }
+        if started {
+            break;
+        }
+    }
+    if buf.is_empty() || buf == "-" {
+        return None;
+    }
+    buf.parse::<f64>().ok()
+}
+
+fn parse_stat_percent(raw: &str) -> Option<f64> {
+    // Prefer percent in parentheses: "248 (88%)" -> 88
+    let s = raw.trim();
+    if s.is_empty() || s == "-" {
+        return None;
+    }
+    if let Some(start) = s.find('(') {
+        if let Some(end) = s[start..].find(')') {
+            let inner = &s[start + 1..start + end];
+            if inner.contains('%') {
+                let inner = inner.trim_end_matches('%').trim();
+                if let Some(v) = parse_stat_cell(inner) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    if s.contains('%') {
+        let cleaned = s.trim_end_matches('%').trim();
+        return parse_stat_cell(cleaned);
+    }
+    None
+}
+
+fn apply_extra_match_stats_signals(
+    detail: &MatchDetail,
+    t: f64,
+    lambda_home_rem: &mut f64,
+    lambda_away_rem: &mut f64,
+) -> bool {
+    // Apply weak bounded live signals derived from match stats categories.
+    let b = clamp(t, 0.0, 0.50);
+    if b <= 0.0 {
+        return false;
+    }
+
+    let mut applied = false;
+
+    // 1) Possession tilt.
+    if let Some((ph, pa)) =
+        extract_stat_f64_pref(detail, &["Top stats", "Passes"], &["ball possession"])
+    {
+        let delta = ph - pa;
+        *lambda_home_rem = clamp(*lambda_home_rem * (1.0 + 0.003 * delta * b), 0.05, 3.00);
+        *lambda_away_rem = clamp(*lambda_away_rem * (1.0 - 0.003 * delta * b), 0.05, 3.00);
+        applied = true;
+    }
+
+    // 2) Shot volume (when xG is missing, this is a rough proxy).
+    if let Some((sh, sa)) = extract_stat_f64_pref(detail, &["Top stats", "Shots"], &["total shots"])
+    {
+        let delta = sh - sa;
+        *lambda_home_rem = clamp(*lambda_home_rem * (1.0 + 0.02 * delta * b), 0.05, 3.00);
+        *lambda_away_rem = clamp(*lambda_away_rem * (1.0 - 0.02 * delta * b), 0.05, 3.00);
+        applied = true;
+    }
+
+    // 3) Passing quality (use % from "Accurate passes": "248 (88%)").
+    if let Some((ah, aa)) =
+        extract_stat_pct_pref(detail, &["Top stats", "Passes"], &["accurate passes"])
+    {
+        let delta = ah - aa;
+        *lambda_home_rem = clamp(*lambda_home_rem * (1.0 + 0.002 * delta * b), 0.05, 3.00);
+        *lambda_away_rem = clamp(*lambda_away_rem * (1.0 - 0.002 * delta * b), 0.05, 3.00);
+        applied = true;
+    }
+
+    // 4) Duels control (ground duels %).
+    if let Some((dh, da)) = extract_stat_pct_pref(detail, &["Duels"], &["ground duels won"]) {
+        let delta = dh - da;
+        *lambda_home_rem = clamp(*lambda_home_rem * (1.0 + 0.002 * delta * b), 0.05, 3.00);
+        *lambda_away_rem = clamp(*lambda_away_rem * (1.0 - 0.002 * delta * b), 0.05, 3.00);
+        applied = true;
+    }
+
+    // 5) Defence disruption (tackles+interceptions).
+    let tack = extract_stat_f64_pref(detail, &["Defence"], &["tackles"]);
+    let ints = extract_stat_f64_pref(detail, &["Defence"], &["interceptions"]);
+    if let (Some((th, ta)), Some((ih, ia))) = (tack, ints) {
+        let delta = (th + ih) - (ta + ia);
+        *lambda_home_rem = clamp(*lambda_home_rem * (1.0 + 0.005 * delta * b), 0.05, 3.00);
+        *lambda_away_rem = clamp(*lambda_away_rem * (1.0 - 0.005 * delta * b), 0.05, 3.00);
+        applied = true;
+    }
+
+    // 6) Discipline (fouls committed, small negative).
+    if let Some((fh, fa)) =
+        extract_stat_f64_pref(detail, &["Top stats", "Discipline"], &["fouls committed"])
+    {
+        let delta = fh - fa;
+        *lambda_home_rem = clamp(*lambda_home_rem * (1.0 - 0.01 * delta * b), 0.05, 3.00);
+        *lambda_away_rem = clamp(*lambda_away_rem * (1.0 + 0.01 * delta * b), 0.05, 3.00);
+        applied = true;
+    }
+
+    applied
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
@@ -1196,6 +1421,7 @@ mod tests {
                 ],
             }),
             stats: vec![StatRow {
+                group: None,
                 name: "xG".to_string(),
                 home: "1.80".to_string(),
                 away: "0.30".to_string(),

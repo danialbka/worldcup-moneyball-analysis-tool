@@ -49,6 +49,31 @@ fn parses_match_details_fixture() {
 }
 
 #[test]
+fn parses_match_details_periods_stats_fixture() {
+    let raw = read_fixture("match_details_periods.json");
+    let detail = parse_match_details_json(&raw).expect("fixture should parse");
+    assert!(!detail.stats.is_empty());
+    assert!(
+        detail
+            .stats
+            .iter()
+            .any(|row| row.group.as_deref() == Some("Top stats")
+                && row.name == "Expected goals (xG)")
+    );
+    assert!(
+        detail.stats.iter().any(|row| {
+            row.group.as_deref() == Some("Top stats") && row.name == "Accurate passes"
+        })
+    );
+    assert!(
+        detail
+            .stats
+            .iter()
+            .any(|row| { row.group.as_deref() == Some("Duels") && row.name == "Ground duels won" })
+    );
+}
+
+#[test]
 fn match_details_null_is_empty() {
     let detail = parse_match_details_json("null").expect("null should parse");
     assert!(detail.events.is_empty());

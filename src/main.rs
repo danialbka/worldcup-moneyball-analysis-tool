@@ -4038,14 +4038,105 @@ fn stats_text(state: &AppState) -> String {
                 format!("Live: {}", if m.is_live { "yes" } else { "no" }),
             ];
             if let Some(detail) = state.match_detail.get(&m.id) {
-                for row in detail.stats.iter().take(6) {
-                    lines.push(format!("{}: {}-{}", row.name, row.home, row.away));
-                }
+                lines.extend(stats_compact_lines(detail, 6));
             }
             lines.join("\n")
         }
         None => "No match selected".to_string(),
     }
+}
+
+fn stats_compact_lines(detail: &state::MatchDetail, limit: usize) -> Vec<String> {
+    if detail.stats.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    // Prefer Top stats, and pick a consistent subset.
+    let preferred = [
+        "Expected goals",
+        "Total shots",
+        "Shots on target",
+        "Ball possession",
+        "Accurate passes",
+        "Big chances",
+    ];
+    let mut out = Vec::new();
+    for needle in preferred {
+        if out.len() >= limit {
+            break;
+        }
+        if let Some(row) = detail.stats.iter().find(|row| {
+            row.group
+                .as_deref()
+                .is_some_and(|g| g.eq_ignore_ascii_case("Top stats"))
+                && row.name.to_lowercase().contains(&needle.to_lowercase())
+        }) {
+            out.push(format!("{}: {}-{}", row.name, row.home, row.away));
+        }
+    }
+    if out.len() >= limit {
+        return out;
+    }
+
+    // Fallback: first stats rows (any group).
+    for row in detail.stats.iter() {
+        if out.len() >= limit {
+            break;
+        }
+        out.push(format!("{}: {}-{}", row.name, row.home, row.away));
+    }
+    out
+}
+
+fn grouped_stats_lines(detail: &state::MatchDetail) -> Vec<String> {
+    if detail.stats.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups: std::collections::HashMap<String, Vec<&state::StatRow>> =
+        std::collections::HashMap::new();
+    for row in &detail.stats {
+        let g = row.group.clone().unwrap_or_else(|| "Other".to_string());
+        groups.entry(g).or_default().push(row);
+    }
+
+    let preferred = [
+        "Top stats",
+        "Expected goals (xG)",
+        "Shots",
+        "Passes",
+        "Defence",
+        "Duels",
+        "Discipline",
+        "Other",
+    ];
+    let mut out = Vec::new();
+
+    for g in preferred {
+        let Some(rows) = groups.remove(g) else {
+            continue;
+        };
+        out.push(format!("{g}:"));
+        for row in rows {
+            out.push(format!("  {}: {}-{}", row.name, row.home, row.away));
+        }
+        out.push(String::new());
+    }
+
+    let mut rest: Vec<(String, Vec<&state::StatRow>)> = groups.into_iter().collect();
+    rest.sort_by(|a, b| a.0.cmp(&b.0));
+    for (g, rows) in rest {
+        out.push(format!("{g}:"));
+        for row in rows {
+            out.push(format!("  {}: {}-{}", row.name, row.home, row.away));
+        }
+        out.push(String::new());
+    }
+
+    while out.last().is_some_and(|s| s.is_empty()) {
+        out.pop();
+    }
+    out
 }
 
 fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -4374,12 +4465,7 @@ fn stats_full_text(state: &AppState) -> String {
     if detail.stats.is_empty() {
         return "No stats yet".to_string();
     }
-    detail
-        .stats
-        .iter()
-        .map(|row| format!("{}: {}-{}", row.name, row.home, row.away))
-        .collect::<Vec<_>>()
-        .join("\n")
+    grouped_stats_lines(detail).join("\n")
 }
 
 fn lineups_full_text(state: &AppState) -> String {
@@ -4500,12 +4586,7 @@ fn match_detail_overview_text(state: &AppState) -> String {
     if !detail.stats.is_empty() {
         lines.push(String::new());
         lines.push("Stats:".to_string());
-        lines.extend(
-            detail
-                .stats
-                .iter()
-                .map(|row| format!("{}: {}-{}", row.name, row.home, row.away)),
-        );
+        lines.extend(grouped_stats_lines(detail));
     }
 
     if !detail.events.is_empty() {

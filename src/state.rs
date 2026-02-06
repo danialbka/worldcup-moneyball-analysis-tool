@@ -65,31 +65,37 @@ pub fn placeholder_match_summary(mode: LeagueMode) -> MatchSummary {
 pub fn placeholder_match_detail() -> MatchDetail {
     let stats = vec![
         StatRow {
+            group: None,
             name: "Possession".to_string(),
             home: "58%".to_string(),
             away: "42%".to_string(),
         },
         StatRow {
+            group: None,
             name: "Shots".to_string(),
             home: "14".to_string(),
             away: "9".to_string(),
         },
         StatRow {
+            group: None,
             name: "Shots on target".to_string(),
             home: "6".to_string(),
             away: "3".to_string(),
         },
         StatRow {
+            group: None,
             name: "xG".to_string(),
             home: "1.72".to_string(),
             away: "0.86".to_string(),
         },
         StatRow {
+            group: None,
             name: "Passes".to_string(),
             home: "412".to_string(),
             away: "298".to_string(),
         },
         StatRow {
+            group: None,
             name: "Corners".to_string(),
             home: "5".to_string(),
             away: "2".to_string(),
@@ -1177,6 +1183,8 @@ pub struct MatchLineups {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatRow {
+    #[serde(default)]
+    pub group: Option<String>,
     pub name: String,
     pub home: String,
     pub away: String,

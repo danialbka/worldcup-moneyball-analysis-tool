@@ -141,7 +141,7 @@ fn parse_match_details_value(root: &Value) -> MatchDetail {
         &home_name,
         &away_name,
     );
-    let stats = parse_stats(content.get("stats").and_then(|v| v.get("stats")));
+    let stats = parse_stats(content.get("stats"));
 
     MatchDetail {
         home_team: if home_name.is_empty() {
@@ -597,10 +597,87 @@ fn parse_event_kind(event_type: Option<&str>) -> Option<EventKind> {
 
 fn parse_stats(value: Option<&Value>) -> Vec<StatRow> {
     let mut rows = Vec::new();
-    let Some(groups) = value.and_then(|v| v.as_array()) else {
+    let Some(value) = value else {
+        return rows;
+    };
+
+    // New schema: content.stats.Periods.All.stats[]
+    if let Some(periods) = value.get("Periods").and_then(|v| v.as_object()) {
+        let picked = periods
+            .get("All")
+            .or_else(|| periods.values().next())
+            .and_then(|v| v.as_object());
+        if let Some(period) = picked {
+            if let Some(groups) = period.get("stats").and_then(|v| v.as_array()) {
+                for group in groups {
+                    let group_title = group
+                        .get("title")
+                        .and_then(as_string)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let Some(stats) = group.get("stats").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    for stat in stats {
+                        let name = pick_string(stat, &["title", "name"]).unwrap_or_default();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        if let Some(vals) = stat.get("stats").and_then(|v| v.as_array())
+                            && vals.len() >= 2
+                        {
+                            if vals[0].is_null() || vals[1].is_null() {
+                                continue;
+                            }
+                            let home = value_to_string(Some(&vals[0]));
+                            let away = value_to_string(Some(&vals[1]));
+                            if home == "-" && away == "-" {
+                                continue;
+                            }
+                            rows.push(StatRow {
+                                group: group_title.clone(),
+                                name,
+                                home,
+                                away,
+                            });
+                            continue;
+                        }
+
+                        // Fallback: try legacy home/away keys if present.
+                        let home =
+                            value_to_string(stat.get("homeValue").or_else(|| stat.get("home")));
+                        let away =
+                            value_to_string(stat.get("awayValue").or_else(|| stat.get("away")));
+                        if home == "-" && away == "-" {
+                            continue;
+                        }
+                        rows.push(StatRow {
+                            group: group_title.clone(),
+                            name,
+                            home,
+                            away,
+                        });
+                    }
+                }
+                return rows;
+            }
+        }
+    }
+
+    // Legacy schema: content.stats.stats[] (array of groups).
+    let groups = value
+        .get("stats")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array());
+    let Some(groups) = groups else {
         return rows;
     };
     for group in groups {
+        let group_title = group
+            .get("title")
+            .and_then(as_string)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let Some(stats) = group.get("stats").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -611,9 +688,15 @@ fn parse_stats(value: Option<&Value>) -> Vec<StatRow> {
             }
             let home = value_to_string(stat.get("homeValue").or_else(|| stat.get("home")));
             let away = value_to_string(stat.get("awayValue").or_else(|| stat.get("away")));
-            rows.push(StatRow { name, home, away });
+            rows.push(StatRow {
+                group: group_title.clone(),
+                name,
+                home,
+                away,
+            });
         }
     }
+
     rows
 }
 

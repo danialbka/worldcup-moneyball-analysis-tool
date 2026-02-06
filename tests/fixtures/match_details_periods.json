@@ -1,0 +1,50 @@
+{
+  "general": {
+    "homeTeam": { "name": "Leeds" },
+    "awayTeam": { "name": "Nottm Forest" }
+  },
+  "content": {
+    "stats": {
+      "Periods": {
+        "All": {
+          "stats": [
+            {
+              "title": "Top stats",
+              "key": "topStats",
+              "stats": [
+                { "title": "Ball possession", "key": "possession", "stats": [62, 38] },
+                {
+                  "title": "Expected goals (xG)",
+                  "key": "xg",
+                  "stats": ["1.72", "0.43"]
+                },
+                { "title": "Total shots", "key": "shots", "stats": [7, 9] },
+                { "title": "Shots on target", "key": "sot", "stats": [3, 4] },
+                { "title": "Big chances", "key": "bigChances", "stats": [4, 0] },
+                {
+                  "title": "Accurate passes",
+                  "key": "accuratePasses",
+                  "stats": ["248 (88%)", "139 (84%)"]
+                },
+                { "title": "Fouls committed", "key": "fouls", "stats": [2, 6] }
+              ]
+            },
+            {
+              "title": "Duels",
+              "key": "duels",
+              "stats": [
+                {
+                  "title": "Ground duels won",
+                  "key": "groundDuelsWon",
+                  "stats": ["24 (65%)", "13 (35%)"]
+                }
+              ]
+            }
+          ],
+          "teamColors": {}
+        }
+      }
+    }
+  }
+}
+
