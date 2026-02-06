@@ -17,7 +17,7 @@ use crate::state::{
 };
 use crate::upcoming_fetch::{self, FotmobMatchRow};
 
-pub fn spawn_fake_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
+pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
     thread::spawn(move || {
         let mut rng = rand::thread_rng();
         let lineups = Arc::new(seed_lineups().into_iter().collect::<HashMap<_, _>>());

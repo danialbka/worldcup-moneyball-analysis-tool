@@ -16,7 +16,7 @@ Quick orientation guide for navigating the repo.
 │   ├── analysis_export.rs
 │   ├── analysis_fetch.rs
 │   ├── analysis_rankings.rs
-│   ├── fake_feed.rs
+│   ├── feed.rs
 │   ├── main.rs
 │   ├── persist.rs
 │   ├── state.rs
@@ -37,7 +37,7 @@ Quick orientation guide for navigating the repo.
          v                                |
 +------------------+          +--------------------+
 | Background worker|  fetch   | FotMob endpoints   |
-| (fake_feed.rs)   +--------->| (matches/details)  |
+| (feed.rs)        +--------->| (matches/details)  |
 |                  |          | + analysis data    |
 +------------------+          +--------------------+
 ```
@@ -52,9 +52,9 @@ Quick orientation guide for navigating the repo.
   Core domain types and UI state (`AppState`), filters, selections,
   and `Delta` application.
 
-- `fake_feed.rs`  
-  Background worker thread: polls FotMob, jitters probabilities,
-  handles `ProviderCommand` requests, and emits `Delta` updates.
+- `feed.rs`  
+  Background worker thread: polls FotMob, handles `ProviderCommand`
+  requests, and emits `Delta` updates.
 
 - `upcoming_fetch.rs`  
   FotMob API calls and JSON parsing for match lists and match details
@@ -126,4 +126,4 @@ Notes:
 - UI behavior: `src/main.rs`
 - State model + filtering: `src/state.rs`
 - Network/data parsing: `src/upcoming_fetch.rs`, `src/analysis_fetch.rs`
-- Background orchestration: `src/fake_feed.rs`
+- Background orchestration: `src/feed.rs`

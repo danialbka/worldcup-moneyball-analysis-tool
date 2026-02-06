@@ -13,7 +13,7 @@ The application follows a **multi-threaded architecture** with clear separation 
 ```
 ┌─────────────┐         ┌──────────────┐         ┌─────────────┐
 │   UI/Input  │◄──deltas─┤   AppState   │◄──cmds──┤ Background  │
-│  (main.rs)  │          │  (state.rs)  │          │ (fake_feed) │
+│  (main.rs)  │          │  (state.rs)  │          │   (feed)    │
 └─────────────┘          └──────────────┘          └─────────────┘
                                                           │
                                                           ▼
