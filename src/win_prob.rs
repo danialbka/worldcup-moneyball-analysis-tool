@@ -343,13 +343,9 @@ fn apply_red_card_adjustment(
 }
 
 fn extract_stat_f64(detail: &MatchDetail, keys: &[&str]) -> Option<(f64, f64)> {
-    let want = keys
-        .iter()
-        .map(|k| k.trim().to_lowercase())
-        .collect::<Vec<_>>();
     for row in &detail.stats {
-        let name = row.name.trim().to_lowercase();
-        if !want.iter().any(|k| name == *k) {
+        let name = row.name.trim();
+        if !keys.iter().any(|k| name.eq_ignore_ascii_case(k.trim())) {
             continue;
         }
         let h = parse_stat_cell(&row.home)?;

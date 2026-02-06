@@ -1370,16 +1370,9 @@ fn run_app<B: Backend>(
             app.recompute_rankings_from_cache();
             changed = true;
         }
-        let export_before = (
-            app.state.export.active,
-            app.state.export.done,
-            app.state.export.path.clone(),
-        );
+        let export_was_active = app.state.export.active;
         app.state.maybe_clear_export(Instant::now());
-        if export_before.0 != app.state.export.active
-            || export_before.1 != app.state.export.done
-            || export_before.2 != app.state.export.path
-        {
+        if export_was_active != app.state.export.active {
             changed = true;
         }
 

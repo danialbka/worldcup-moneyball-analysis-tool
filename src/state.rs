@@ -388,13 +388,13 @@ impl AppState {
             league_l1_ids,
             league_cl_ids,
             league_wc_ids,
-            matches: Vec::new(),
-            upcoming: Vec::new(),
+            matches: Vec::with_capacity(32),
+            upcoming: Vec::with_capacity(32),
             upcoming_scroll: 0,
             upcoming_cached_at: None,
-            match_detail: HashMap::new(),
-            match_detail_cached_at: HashMap::new(),
-            logs: VecDeque::new(),
+            match_detail: HashMap::with_capacity(16),
+            match_detail_cached_at: HashMap::with_capacity(16),
+            logs: VecDeque::with_capacity(200),
             help_overlay: false,
             analysis: Vec::new(),
             analysis_selected: 0,
@@ -412,14 +412,14 @@ impl AppState {
             rankings_progress_current: 0,
             rankings_progress_total: 0,
             rankings_progress_message: String::new(),
-            rankings_cache_squads: HashMap::new(),
-            rankings_cache_players: HashMap::new(),
-            rankings_cache_squads_at: HashMap::new(),
-            rankings_cache_players_at: HashMap::new(),
-            combined_player_cache: HashMap::new(),
+            rankings_cache_squads: HashMap::with_capacity(32),
+            rankings_cache_players: HashMap::with_capacity(256),
+            rankings_cache_squads_at: HashMap::with_capacity(32),
+            rankings_cache_players_at: HashMap::with_capacity(256),
+            combined_player_cache: HashMap::with_capacity(256),
             rankings_dirty: false,
             rankings_fetched_at: None,
-            win_prob_history: HashMap::new(),
+            win_prob_history: HashMap::with_capacity(16),
             placeholder_match_enabled: false,
             squad: Vec::new(),
             squad_selected: 0,
@@ -507,9 +507,7 @@ impl AppState {
         self.rankings_fetched_at = None;
         self.win_prob_history.clear();
         self.placeholder_match_enabled = false;
-        self.matches.retain(|m| m.id != PLACEHOLDER_MATCH_ID);
-        self.match_detail.remove(PLACEHOLDER_MATCH_ID);
-        self.match_detail_cached_at.remove(PLACEHOLDER_MATCH_ID);
+        self.matches.clear();
         self.match_detail.clear();
         self.match_detail_cached_at.clear();
         self.squad.clear();
@@ -1518,8 +1516,8 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 let entry = state.win_prob_history.entry(id).or_default();
                 entry.push(existing.win.p_home);
                 if entry.len() > 40 {
-                    let keep = entry.split_off(entry.len() - 40);
-                    *entry = keep;
+                    let drain_count = entry.len() - 40;
+                    entry.drain(..drain_count);
                 }
             }
         }
@@ -1543,8 +1541,8 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             let entry = state.win_prob_history.entry(match_id).or_default();
             entry.push(home_prob);
             if entry.len() > 40 {
-                let keep = entry.split_off(entry.len() - 40);
-                *entry = keep;
+                let drain_count = entry.len() - 40;
+                entry.drain(..drain_count);
             }
             state.clamp_selection();
         }
@@ -1629,6 +1627,20 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             team_id,
             players,
         } => {
+            // Always cache for rankings reuse, even if stale for the UI.
+            if !players.is_empty() {
+                state.rankings_cache_squads.insert(team_id, players.clone());
+                state
+                    .rankings_cache_squads_at
+                    .insert(team_id, SystemTime::now());
+                state.rankings_dirty = true;
+            }
+
+            // Only update the visible squad if this is still the team the user selected.
+            if state.squad_team_id.is_some() && state.squad_team_id != Some(team_id) {
+                return;
+            }
+
             state.squad = players;
             state.squad_selected = 0;
             state.squad_loading = false;
@@ -1638,16 +1650,6 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 state.squad_prefetch_pending = None;
             } else {
                 state.squad_prefetch_pending = Some(state.squad.iter().map(|p| p.id).collect());
-            }
-            // Also cache for rankings so we don't refetch later.
-            if !state.squad.is_empty() {
-                state
-                    .rankings_cache_squads
-                    .insert(team_id, state.squad.clone());
-                state
-                    .rankings_cache_squads_at
-                    .insert(team_id, SystemTime::now());
-                state.rankings_dirty = true;
             }
         }
         Delta::SetPlayerDetail(detail) => {
@@ -1769,8 +1771,9 @@ fn matches_league(m: &MatchSummary, ids: &[u32], keywords: &[&str]) -> bool {
         return ids.contains(&id);
     }
     if !m.league_name.is_empty() {
-        let name = m.league_name.to_lowercase();
-        return keywords.iter().any(|kw| name.contains(kw));
+        return keywords
+            .iter()
+            .any(|kw| contains_ascii_ci(&m.league_name, kw));
     }
     ids.is_empty()
 }
@@ -1782,10 +1785,25 @@ fn matches_league_upcoming(m: &UpcomingMatch, ids: &[u32], keywords: &[&str]) ->
         return ids.contains(&id);
     }
     if !m.league_name.is_empty() {
-        let name = m.league_name.to_lowercase();
-        return keywords.iter().any(|kw| name.contains(kw));
+        return keywords
+            .iter()
+            .any(|kw| contains_ascii_ci(&m.league_name, kw));
     }
     ids.is_empty()
+}
+
+/// Case-insensitive ASCII substring search without allocating a lowercased copy.
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    if n.is_empty() {
+        return true;
+    }
+    h.windows(n.len())
+        .any(|window| window.iter().zip(n).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
 pub fn league_label(mode: LeagueMode) -> &'static str {
