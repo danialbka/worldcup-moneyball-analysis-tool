@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::state::{
-    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, TeamAnalysis, WinProbRow,
+    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, PlayerSlot, RoleCategory,
+    TeamAnalysis, WinProbRow,
 };
 
 const GOALS_TOTAL_BASE: f64 = 2.60;
@@ -10,6 +11,8 @@ const K_STRENGTH: f64 = 0.45;
 
 const BASELINE_RATING: f64 = 6.80;
 const RATING_STDDEV: f64 = 0.60;
+const SEASON_BLEND: f64 = 0.70;
+const FORM_BLEND: f64 = 0.30;
 
 pub fn compute_win_prob(
     summary: &MatchSummary,
@@ -364,6 +367,32 @@ fn parse_stat_cell(raw: &str) -> Option<f64> {
     s.parse::<f64>().ok()
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    for start in 0..=h.len() - n.len() {
+        if h[start].to_ascii_lowercase().eq(&n[0].to_ascii_lowercase()) {
+            let mut matched = true;
+            for idx in 1..n.len() {
+                if !h[start + idx].eq_ignore_ascii_case(&n[idx]) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn normalize_team_key(raw: &str) -> String {
     raw.trim()
         .to_lowercase()
@@ -456,6 +485,367 @@ fn player_form_rating(p: &PlayerDetail, n: usize) -> Option<f64> {
     Some(shrink * mean + (1.0 - shrink) * BASELINE_RATING)
 }
 
+fn player_form_z(p: &PlayerDetail, n: usize) -> Option<f64> {
+    let r = player_form_rating(p, n)?;
+    let z = (r - BASELINE_RATING) / RATING_STDDEV;
+    Some(clamp(z, -2.0, 2.0))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    HigherBetter,
+    LowerBetter,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PctStat {
+    Goals,
+    XgNonPenalty,
+    Xa,
+    ChancesCreated,
+    TouchesInOppBox,
+    ShotsOnTarget,
+    AccuratePasses,
+    PassAccuracy,
+    AccurateLongBalls,
+    Tackles,
+    Interceptions,
+    Recoveries,
+    DribbledPast,
+    DuelsWonPct,
+    AerialsWonPct,
+    Clearances,
+    Blocks,
+    BlockedScoringAttempt,
+    XgAgainstOnPitch,
+    GoalsConcededOnPitch,
+    Saves,
+    SavePct,
+    GoalsConceded,
+    CleanSheets,
+    ErrorLedToGoal,
+    HighClaims,
+    ActedAsSweeper,
+    PossWonFinalThird,
+    Rating,
+}
+
+fn infer_role(slot: &PlayerSlot, detail: &PlayerDetail) -> RoleCategory {
+    if let Some(pos) = slot.pos.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(r) = role_from_pos_label(pos) {
+            return r;
+        }
+    }
+    if let Some(pos) = detail.position.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(r) = role_from_pos_label(pos) {
+            return r;
+        }
+    }
+    for pos in &detail.positions {
+        if let Some(r) = role_from_pos_label(pos) {
+            return r;
+        }
+    }
+    RoleCategory::Midfielder
+}
+
+fn role_from_pos_label(raw: &str) -> Option<RoleCategory> {
+    let s = raw.trim().to_ascii_uppercase();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains("GK") || s.contains("KEEP") {
+        return Some(RoleCategory::Goalkeeper);
+    }
+    if s.contains("CB")
+        || s.contains("RB")
+        || s.contains("LB")
+        || s.contains("WB")
+        || s.contains("DEF")
+        || s.contains("BACK")
+    {
+        return Some(RoleCategory::Defender);
+    }
+    if s.contains("DM")
+        || s.contains("CM")
+        || s.contains("AM")
+        || s.contains("MF")
+        || s.contains("MID")
+    {
+        return Some(RoleCategory::Midfielder);
+    }
+    if s.contains("ST")
+        || s.contains("CF")
+        || s.contains("FW")
+        || s.contains("LW")
+        || s.contains("RW")
+        || s.contains("WING")
+        || s.contains("ATT")
+    {
+        return Some(RoleCategory::Attacker);
+    }
+    None
+}
+
+fn player_season_strength_z(p: &PlayerDetail, role: RoleCategory) -> Option<f64> {
+    let (attack_specs, defense_specs, mix_a, mix_d) = match role {
+        RoleCategory::Goalkeeper => (
+            &[
+                (PctStat::AccuratePasses, Direction::HigherBetter, 0.8),
+                (PctStat::PassAccuracy, Direction::HigherBetter, 0.7),
+                (PctStat::AccurateLongBalls, Direction::HigherBetter, 0.7),
+                (PctStat::ActedAsSweeper, Direction::HigherBetter, 0.5),
+                (PctStat::Rating, Direction::HigherBetter, 0.4),
+            ][..],
+            &[
+                (PctStat::SavePct, Direction::HigherBetter, 1.3),
+                (PctStat::Saves, Direction::HigherBetter, 0.8),
+                (PctStat::GoalsConceded, Direction::LowerBetter, 1.1),
+                (PctStat::CleanSheets, Direction::HigherBetter, 0.7),
+                (PctStat::ErrorLedToGoal, Direction::LowerBetter, 0.9),
+                (PctStat::HighClaims, Direction::HigherBetter, 0.5),
+                (PctStat::Rating, Direction::HigherBetter, 0.4),
+            ][..],
+            0.2,
+            0.8,
+        ),
+        RoleCategory::Defender => (
+            &[
+                (PctStat::AccuratePasses, Direction::HigherBetter, 0.8),
+                (PctStat::PassAccuracy, Direction::HigherBetter, 0.7),
+                (PctStat::AccurateLongBalls, Direction::HigherBetter, 0.7),
+                (PctStat::Rating, Direction::HigherBetter, 0.4),
+            ][..],
+            &[
+                (PctStat::Tackles, Direction::HigherBetter, 1.0),
+                (PctStat::Interceptions, Direction::HigherBetter, 1.0),
+                (PctStat::Clearances, Direction::HigherBetter, 0.9),
+                (PctStat::Blocks, Direction::HigherBetter, 0.8),
+                (PctStat::BlockedScoringAttempt, Direction::HigherBetter, 0.8),
+                (PctStat::Recoveries, Direction::HigherBetter, 0.8),
+                (PctStat::DuelsWonPct, Direction::HigherBetter, 0.8),
+                (PctStat::AerialsWonPct, Direction::HigherBetter, 0.9),
+                (PctStat::DribbledPast, Direction::LowerBetter, 0.8),
+                (PctStat::GoalsConcededOnPitch, Direction::LowerBetter, 0.7),
+                (PctStat::XgAgainstOnPitch, Direction::LowerBetter, 0.7),
+                (PctStat::Rating, Direction::HigherBetter, 0.3),
+            ][..],
+            0.35,
+            0.65,
+        ),
+        RoleCategory::Midfielder => (
+            &[
+                (PctStat::Xa, Direction::HigherBetter, 1.2),
+                (PctStat::ChancesCreated, Direction::HigherBetter, 1.0),
+                (PctStat::AccuratePasses, Direction::HigherBetter, 0.9),
+                (PctStat::PassAccuracy, Direction::HigherBetter, 0.7),
+                (PctStat::AccurateLongBalls, Direction::HigherBetter, 0.6),
+                (PctStat::Rating, Direction::HigherBetter, 0.6),
+            ][..],
+            &[
+                (PctStat::Tackles, Direction::HigherBetter, 0.9),
+                (PctStat::Interceptions, Direction::HigherBetter, 0.9),
+                (PctStat::Recoveries, Direction::HigherBetter, 0.9),
+                (PctStat::DuelsWonPct, Direction::HigherBetter, 0.6),
+                (PctStat::DribbledPast, Direction::LowerBetter, 0.6),
+                (PctStat::PossWonFinalThird, Direction::HigherBetter, 0.6),
+                (PctStat::Rating, Direction::HigherBetter, 0.4),
+            ][..],
+            0.5,
+            0.5,
+        ),
+        RoleCategory::Attacker => (
+            &[
+                (PctStat::Goals, Direction::HigherBetter, 1.2),
+                (PctStat::XgNonPenalty, Direction::HigherBetter, 2.0),
+                (PctStat::Xa, Direction::HigherBetter, 1.2),
+                (PctStat::ChancesCreated, Direction::HigherBetter, 1.0),
+                (PctStat::TouchesInOppBox, Direction::HigherBetter, 0.9),
+                (PctStat::ShotsOnTarget, Direction::HigherBetter, 0.7),
+                (PctStat::Rating, Direction::HigherBetter, 0.6),
+            ][..],
+            &[
+                (PctStat::PossWonFinalThird, Direction::HigherBetter, 1.0),
+                (PctStat::Recoveries, Direction::HigherBetter, 0.6),
+                (PctStat::DuelsWonPct, Direction::HigherBetter, 0.4),
+                (PctStat::Rating, Direction::HigherBetter, 0.3),
+            ][..],
+            0.7,
+            0.3,
+        ),
+    };
+
+    let attack = composite_pct_z(p, attack_specs);
+    let defense = composite_pct_z(p, defense_specs);
+
+    if attack.is_none() && defense.is_none() {
+        return None;
+    }
+
+    let denom = (if attack.is_some() { mix_a } else { 0.0 })
+        + (if defense.is_some() { mix_d } else { 0.0 });
+    if denom <= 0.0 {
+        return None;
+    }
+
+    let overall = match (attack, defense) {
+        (Some(a), Some(d)) => (mix_a * a + mix_d * d) / denom,
+        (Some(a), None) => a,
+        (None, Some(d)) => d,
+        (None, None) => return None,
+    };
+    Some(clamp(overall, -2.0, 2.0))
+}
+
+fn composite_pct_z(p: &PlayerDetail, specs: &[(PctStat, Direction, f64)]) -> Option<f64> {
+    const COVERAGE_MIN: f64 = 0.40;
+    let mut w_total = 0.0;
+    let mut w_used = 0.0;
+    let mut sum = 0.0;
+
+    for (stat, dir, w) in specs {
+        w_total += *w;
+        let Some(pct) = pct_for_stat(p, *stat) else {
+            continue;
+        };
+        let mut z = pct_to_z(pct);
+        if matches!(dir, Direction::LowerBetter) {
+            z = -z;
+        }
+        sum += *w * z;
+        w_used += *w;
+    }
+
+    if w_total <= 0.0 || w_used <= 0.0 {
+        return None;
+    }
+    let coverage = (w_used / w_total).clamp(0.0, 1.0);
+    if coverage < COVERAGE_MIN {
+        return None;
+    }
+    Some(sum / w_used)
+}
+
+fn pct_to_z(pct: f64) -> f64 {
+    ((pct - 50.0) / 15.0).clamp(-3.0, 3.0)
+}
+
+fn pct_for_stat(p: &PlayerDetail, stat: PctStat) -> Option<f64> {
+    match stat {
+        PctStat::Goals => find_stat_pct(p, &["goals"], &["goals conceded"]),
+        PctStat::XgNonPenalty => find_stat_pct(
+            p,
+            &["xg excl. penalty", "xg excl penalty", "xg (excl. penalty)"],
+            &[],
+        )
+        .or_else(|| find_stat_pct(p, &["expected goals", "xg"], &[])),
+        PctStat::Xa => find_stat_pct(p, &["expected assists", "xa", "x a"], &[]),
+        PctStat::ChancesCreated => find_stat_pct(p, &["chances created"], &[]),
+        PctStat::TouchesInOppBox => find_stat_pct(p, &["touches in opposition box"], &[]),
+        PctStat::ShotsOnTarget => find_stat_pct(p, &["shots on target"], &[]),
+        PctStat::AccuratePasses => find_stat_pct(p, &["accurate passes"], &[]),
+        PctStat::PassAccuracy => find_stat_pct(p, &["pass accuracy"], &[]),
+        PctStat::AccurateLongBalls => find_stat_pct(p, &["accurate long balls"], &[]),
+        PctStat::Tackles => find_stat_pct(p, &["tackles"], &[]),
+        PctStat::Interceptions => find_stat_pct(p, &["interceptions"], &[]),
+        PctStat::Recoveries => find_stat_pct(p, &["recoveries"], &[]),
+        PctStat::DribbledPast => find_stat_pct(p, &["dribbled past"], &[]),
+        PctStat::DuelsWonPct => find_stat_pct(p, &["duels won %", "duels won%"], &[]),
+        PctStat::AerialsWonPct => find_stat_pct(p, &["aerials won %", "aerials won%"], &[]),
+        PctStat::Clearances => find_stat_pct(p, &["clearances"], &[]),
+        PctStat::Blocks => find_stat_pct(p, &["blocks"], &[]),
+        PctStat::BlockedScoringAttempt => find_stat_pct(p, &["blocked scoring attempt"], &[]),
+        PctStat::XgAgainstOnPitch => find_stat_pct(p, &["xg against while on pitch"], &[]),
+        PctStat::GoalsConcededOnPitch => find_stat_pct(p, &["goals conceded while on pitch"], &[]),
+        PctStat::Saves => find_stat_pct(p, &["saves"], &[]),
+        PctStat::SavePct => find_stat_pct(p, &["save percentage", "save%", "save %"], &[]),
+        PctStat::GoalsConceded => {
+            find_stat_pct(p, &["goals conceded"], &["goals conceded while on pitch"])
+        }
+        PctStat::CleanSheets => find_stat_pct(p, &["clean sheets"], &[]),
+        PctStat::ErrorLedToGoal => find_stat_pct(p, &["error led to goal"], &[]),
+        PctStat::HighClaims => find_stat_pct(p, &["high claims"], &[]),
+        PctStat::ActedAsSweeper => find_stat_pct(p, &["acted as sweeper"], &[]),
+        PctStat::PossWonFinalThird => find_stat_pct(
+            p,
+            &["possession won final 3rd", "possession won final third"],
+            &[],
+        ),
+        PctStat::Rating => find_stat_pct(p, &["rating"], &[]),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatCandidate<'a> {
+    title: &'a str,
+    pct_total: Option<f64>,
+    pct_per90: Option<f64>,
+}
+
+fn find_stat_pct(detail: &PlayerDetail, needles: &[&str], excludes: &[&str]) -> Option<f64> {
+    let mut best: Option<(u8, f64)> = None;
+    for c in iter_all_stats(detail) {
+        if !needles
+            .iter()
+            .any(|n| contains_ascii_case_insensitive(c.title, n))
+        {
+            continue;
+        }
+        if excludes
+            .iter()
+            .any(|e| contains_ascii_case_insensitive(c.title, e))
+        {
+            continue;
+        }
+        if let Some(pct) = c.pct_per90 {
+            best = Some((2, pct));
+            break;
+        }
+        if let Some(pct) = c.pct_total {
+            match best.as_ref() {
+                Some((q, _)) if *q >= 1 => {}
+                _ => best = Some((1, pct)),
+            }
+        }
+    }
+    best.map(|(_, pct)| pct)
+}
+
+fn iter_all_stats<'a>(detail: &'a PlayerDetail) -> impl Iterator<Item = StatCandidate<'a>> + 'a {
+    let perf = detail.season_performance.iter().flat_map(|g| {
+        g.items.iter().map(|item| StatCandidate {
+            title: item.title.as_str(),
+            pct_total: item.percentile_rank,
+            pct_per90: item.percentile_rank_per90,
+        })
+    });
+    let all_comp = detail.all_competitions.iter().map(|s| StatCandidate {
+        title: s.title.as_str(),
+        pct_total: s.percentile_rank,
+        pct_per90: s.percentile_rank_per90,
+    });
+    let top = detail.top_stats.iter().map(|s| StatCandidate {
+        title: s.title.as_str(),
+        pct_total: s.percentile_rank,
+        pct_per90: s.percentile_rank_per90,
+    });
+    let main = detail.main_league.as_ref().into_iter().flat_map(|l| {
+        l.stats.iter().map(|s| StatCandidate {
+            title: s.title.as_str(),
+            pct_total: s.percentile_rank,
+            pct_per90: s.percentile_rank_per90,
+        })
+    });
+    let groups = detail.season_groups.iter().flat_map(|g| {
+        g.items.iter().map(|s| StatCandidate {
+            title: s.title.as_str(),
+            pct_total: s.percentile_rank,
+            pct_per90: s.percentile_rank_per90,
+        })
+    });
+    perf.chain(all_comp).chain(top).chain(main).chain(groups)
+}
+
 fn lineup_team_strength(lineup: &LineupSide, players: &HashMap<u32, PlayerDetail>) -> Option<f64> {
     let mut sum = 0.0;
     let mut cnt = 0usize;
@@ -464,16 +854,23 @@ fn lineup_team_strength(lineup: &LineupSide, players: &HashMap<u32, PlayerDetail
         let Some(p) = match_player(slot, players, Some(&lineup.team)) else {
             continue;
         };
-        let Some(r) = player_form_rating(p, 8) else {
-            continue;
-        };
+        let role = infer_role(slot, p);
+        let season_z = player_season_strength_z(p, role);
+        let form_z = player_form_z(p, 8);
 
-        sum += (r - BASELINE_RATING) / RATING_STDDEV;
+        let overall_z = match (season_z, form_z) {
+            (Some(s), Some(f)) => SEASON_BLEND * s + FORM_BLEND * f,
+            (Some(s), None) => s,
+            (None, Some(f)) => f,
+            (None, None) => continue,
+        };
+        let overall_z = clamp(overall_z, -2.0, 2.0);
+        sum += overall_z / 2.0;
         cnt += 1;
     }
 
     if cnt >= 7 {
-        Some(sum / cnt as f64)
+        Some(clamp(sum / cnt as f64, -1.0, 1.0))
     } else {
         None
     }
@@ -604,7 +1001,10 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{MatchLineups, PlayerMatchStat, PlayerSlot, StatRow};
+    use crate::state::{
+        MatchLineups, PlayerMatchStat, PlayerSeasonPerformanceGroup, PlayerSeasonPerformanceItem,
+        StatRow,
+    };
 
     fn stub_player(id: u32, ratings: &[&str]) -> PlayerDetail {
         PlayerDetail {
@@ -647,6 +1047,30 @@ mod tests {
             career_sections: Vec::new(),
             trophies: Vec::new(),
         }
+    }
+
+    fn stub_player_with_percentiles(
+        id: u32,
+        name: &str,
+        pct: &[(&str, f64)],
+        ratings: &[&str],
+    ) -> PlayerDetail {
+        let mut p = stub_player(id, ratings);
+        p.name = name.to_string();
+        p.season_performance = vec![PlayerSeasonPerformanceGroup {
+            title: "Stats".to_string(),
+            items: pct
+                .iter()
+                .map(|(title, val)| PlayerSeasonPerformanceItem {
+                    title: (*title).to_string(),
+                    total: "0".to_string(),
+                    per90: Some("0".to_string()),
+                    percentile_rank: Some(*val),
+                    percentile_rank_per90: Some(*val),
+                })
+                .collect(),
+        }];
+        p
     }
 
     #[test]
@@ -785,5 +1209,311 @@ mod tests {
         let win = compute_win_prob(&summary, Some(&detail), &cache, &[]);
         // With heavy xG edge at HT, home should be favored.
         assert!(win.p_home > win.p_away);
+    }
+
+    #[test]
+    fn season_strength_favors_stronger_lineup_pre_match() {
+        let summary = MatchSummary {
+            id: "m".to_string(),
+            league_id: None,
+            league_name: "L".to_string(),
+            home: "Home".to_string(),
+            away: "Away".to_string(),
+            minute: 0,
+            score_home: 0,
+            score_away: 0,
+            win: WinProbRow {
+                p_home: 0.0,
+                p_draw: 0.0,
+                p_away: 0.0,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 0,
+            },
+            is_live: false,
+        };
+
+        let lineup_home = LineupSide {
+            team: "Home".to_string(),
+            team_abbr: "HOM".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (1..=7)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("H{id}"),
+                    number: None,
+                    pos: Some("FW".to_string()),
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+        let lineup_away = LineupSide {
+            team: "Away".to_string(),
+            team_abbr: "AWY".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (101..=107)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("A{id}"),
+                    number: None,
+                    pos: Some("FW".to_string()),
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+
+        let detail = MatchDetail {
+            home_team: Some("Home".to_string()),
+            away_team: Some("Away".to_string()),
+            events: Vec::new(),
+            commentary: Vec::new(),
+            commentary_error: None,
+            lineups: Some(MatchLineups {
+                sides: vec![lineup_home, lineup_away],
+            }),
+            stats: Vec::new(),
+        };
+
+        let home_pct = &[
+            ("Goals", 90.0),
+            ("xG excl. penalty", 90.0),
+            ("xA", 80.0),
+            ("Chances created", 80.0),
+            ("Touches in opposition box", 85.0),
+            ("Shots on target", 80.0),
+            ("Rating", 80.0),
+        ];
+        let away_pct = &[
+            ("Goals", 10.0),
+            ("xG excl. penalty", 10.0),
+            ("xA", 20.0),
+            ("Chances created", 20.0),
+            ("Touches in opposition box", 15.0),
+            ("Shots on target", 20.0),
+            ("Rating", 20.0),
+        ];
+
+        let mut cache: HashMap<u32, PlayerDetail> = HashMap::new();
+        for id in 1..=7 {
+            cache.insert(
+                id,
+                stub_player_with_percentiles(id, &format!("H{id}"), home_pct, &[]),
+            );
+        }
+        for id in 101..=107 {
+            cache.insert(
+                id,
+                stub_player_with_percentiles(id, &format!("A{id}"), away_pct, &[]),
+            );
+        }
+
+        let win = compute_win_prob(&summary, Some(&detail), &cache, &[]);
+        assert_eq!(win.quality, ModelQuality::Track);
+        assert!(win.p_home > win.p_away);
+    }
+
+    #[test]
+    fn blend_includes_form_when_season_equal() {
+        let summary = MatchSummary {
+            id: "m".to_string(),
+            league_id: None,
+            league_name: "L".to_string(),
+            home: "Home".to_string(),
+            away: "Away".to_string(),
+            minute: 0,
+            score_home: 0,
+            score_away: 0,
+            win: WinProbRow {
+                p_home: 0.0,
+                p_draw: 0.0,
+                p_away: 0.0,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 0,
+            },
+            is_live: false,
+        };
+
+        let lineup_home = LineupSide {
+            team: "Home".to_string(),
+            team_abbr: "HOM".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (1..=7)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("H{id}"),
+                    number: None,
+                    pos: Some("FW".to_string()),
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+        let lineup_away = LineupSide {
+            team: "Away".to_string(),
+            team_abbr: "AWY".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (101..=107)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("A{id}"),
+                    number: None,
+                    pos: Some("FW".to_string()),
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+
+        let detail = MatchDetail {
+            home_team: Some("Home".to_string()),
+            away_team: Some("Away".to_string()),
+            events: Vec::new(),
+            commentary: Vec::new(),
+            commentary_error: None,
+            lineups: Some(MatchLineups {
+                sides: vec![lineup_home, lineup_away],
+            }),
+            stats: Vec::new(),
+        };
+
+        let season_equal = &[
+            ("Goals", 50.0),
+            ("xG excl. penalty", 50.0),
+            ("xA", 50.0),
+            ("Chances created", 50.0),
+            ("Touches in opposition box", 50.0),
+            ("Shots on target", 50.0),
+            ("Rating", 50.0),
+        ];
+
+        let mut cache: HashMap<u32, PlayerDetail> = HashMap::new();
+        for id in 1..=7 {
+            cache.insert(
+                id,
+                stub_player_with_percentiles(
+                    id,
+                    &format!("H{id}"),
+                    season_equal,
+                    &["5.6", "5.6", "5.6", "5.6", "5.6", "5.6", "5.6", "5.6"],
+                ),
+            );
+        }
+        for id in 101..=107 {
+            cache.insert(
+                id,
+                stub_player_with_percentiles(
+                    id,
+                    &format!("A{id}"),
+                    season_equal,
+                    &["8.0", "8.0", "8.0", "8.0", "8.0", "8.0", "8.0", "8.0"],
+                ),
+            );
+        }
+
+        let win = compute_win_prob(&summary, Some(&detail), &cache, &[]);
+        assert_eq!(win.quality, ModelQuality::Track);
+        assert!(win.p_away > win.p_home);
+    }
+
+    #[test]
+    fn insufficient_lineup_strength_falls_back_to_team_analysis() {
+        let summary = MatchSummary {
+            id: "m".to_string(),
+            league_id: None,
+            league_name: "L".to_string(),
+            home: "Home".to_string(),
+            away: "Away".to_string(),
+            minute: 0,
+            score_home: 0,
+            score_away: 0,
+            win: WinProbRow {
+                p_home: 0.0,
+                p_draw: 0.0,
+                p_away: 0.0,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 0,
+            },
+            is_live: false,
+        };
+
+        let lineup_home = LineupSide {
+            team: "Home".to_string(),
+            team_abbr: "HOM".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (1..=7)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("H{id}"),
+                    number: None,
+                    pos: Some("FW".to_string()),
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+        let lineup_away = LineupSide {
+            team: "Away".to_string(),
+            team_abbr: "AWY".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (101..=107)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("A{id}"),
+                    number: None,
+                    pos: Some("FW".to_string()),
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+
+        let detail = MatchDetail {
+            home_team: Some("Home".to_string()),
+            away_team: Some("Away".to_string()),
+            events: Vec::new(),
+            commentary: Vec::new(),
+            commentary_error: None,
+            lineups: Some(MatchLineups {
+                sides: vec![lineup_home, lineup_away],
+            }),
+            stats: Vec::new(),
+        };
+
+        // Only 3 players present => lineup_team_strength() should return None.
+        let mut cache: HashMap<u32, PlayerDetail> = HashMap::new();
+        for id in 1..=3 {
+            cache.insert(id, stub_player(id, &[]));
+        }
+        for id in 101..=103 {
+            cache.insert(id, stub_player(id, &[]));
+        }
+
+        let analysis = vec![
+            TeamAnalysis {
+                id: 1,
+                name: "Home".to_string(),
+                confed: crate::state::Confederation::UEFA,
+                host: false,
+                fifa_rank: None,
+                fifa_points: Some(1800),
+                fifa_updated: None,
+            },
+            TeamAnalysis {
+                id: 2,
+                name: "Away".to_string(),
+                confed: crate::state::Confederation::UEFA,
+                host: false,
+                fifa_rank: None,
+                fifa_points: Some(1400),
+                fifa_updated: None,
+            },
+        ];
+
+        let win_with_lineups = compute_win_prob(&summary, Some(&detail), &cache, &analysis);
+        let win_no_lineups = compute_win_prob(&summary, None, &cache, &analysis);
+
+        assert_eq!(win_with_lineups.quality, ModelQuality::Basic);
+        assert_eq!(win_no_lineups.quality, ModelQuality::Basic);
+        assert!((win_with_lineups.p_home - win_no_lineups.p_home).abs() < 0.001);
+        assert!((win_with_lineups.p_draw - win_no_lineups.p_draw).abs() < 0.001);
+        assert!((win_with_lineups.p_away - win_no_lineups.p_away).abs() < 0.001);
     }
 }

@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::state::{
-    PlayerDetail, RoleCategory, RoleRankingEntry, SquadPlayer, TeamAnalysis, player_detail_is_stub,
+    PlayerDetail, RankFactor, RoleCategory, RoleRankingEntry, SquadPlayer, TeamAnalysis,
+    player_detail_is_stub,
 };
 
 /// Build role rankings from cached squads + cached player details.
@@ -13,6 +14,7 @@ pub fn compute_role_rankings_from_cache(
 ) -> Vec<RoleRankingEntry> {
     let team_name_map: HashMap<u32, String> =
         teams.iter().map(|t| (t.id, t.name.clone())).collect();
+
     let mut features: Vec<PlayerFeatures> = Vec::new();
     let mut capacity = 0usize;
     for team in teams {
@@ -46,35 +48,89 @@ pub fn compute_role_rankings_from_cache(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CanonStat {
+    // Participation / sample size.
     Appearances,
     MinutesPlayed,
+
+    // Attacking / creation.
     Goals,
     Assists,
     Xg,
+    XgNonPenalty,
     Xa,
+    Xgot,
     Shots,
     ShotsOnTarget,
     KeyPasses,
     ChancesCreated,
+    BigChancesCreated,
+    Touches,
+    TouchesInOppBox,
     Dribbles,
+    Dispossessed,
+
+    // Possession / passing.
+    AccuratePasses,
+    PassAccuracy,
+    AccurateLongBalls,
+    LongBallAccuracy,
+    SuccessfulCrosses,
+    CrossAccuracy,
+
+    // Defensive / duels.
     Tackles,
     Interceptions,
     Clearances,
     Blocks,
     Recoveries,
+    PossWonFinalThird,
     DuelsWon,
+    DuelsWonPct,
     AerialsWon,
+    AerialsWonPct,
+    DribbledPast,
+    BlockedScoringAttempt,
+    FoulsCommitted,
+    YellowCards,
+    RedCards,
+
+    // Team suppression (player on-pitch).
+    GoalsConcededOnPitch,
+    XgAgainstOnPitch,
+
+    // Goalkeeping.
     Saves,
     SavePct,
     CleanSheets,
     GoalsConceded,
+    ErrorLedToGoal,
+    ActedAsSweeper,
+    HighClaims,
+
+    // Rating.
     Rating,
+
+    // Derived.
+    FinishingDelta,
+    ShotPlacementDelta,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Direction {
     HigherBetter,
     LowerBetter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatSource {
+    Percentile,
+    Raw,
+}
+
+#[derive(Debug, Clone)]
+struct StatObs {
+    raw: Option<f64>,
+    pct: Option<f64>, // 0..=100
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +141,7 @@ struct PlayerFeatures {
     pub team_id: u32,
     pub team_name: String,
     pub club: String,
-    pub stats: HashMap<CanonStat, f64>,
+    pub stats: HashMap<CanonStat, StatObs>,
     pub rating: Option<f64>,
 }
 
@@ -96,7 +152,8 @@ fn build_player_features(
     detail: &PlayerDetail,
 ) -> Option<PlayerFeatures> {
     let role = role_category_from_text(&squad_player.role)?;
-    let (stats, rating) = collect_stat_features(detail);
+    let (mut stats, rating) = collect_stat_features(detail);
+    insert_derived_stats(&mut stats);
     let team_name = team_name_map
         .get(&team.id)
         .cloned()
@@ -135,14 +192,13 @@ fn role_category_from_text(raw: &str) -> Option<RoleCategory> {
     {
         return Some(RoleCategory::Attacker);
     }
-    // FotMob sometimes uses short group titles like "Midfielders" etc; above handles most.
     None
 }
 
-/// Build a "collection" of attacking/defending stats (not a hand-tuned weighted sum).
-/// We prefer per-90 values when available.
-fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, f64>, Option<f64>) {
-    let mut out: HashMap<CanonStat, f64> = HashMap::new();
+/// Collect stats from `PlayerDetail` across multiple sections.
+/// We prefer per-90 values when present.
+fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, StatObs>, Option<f64>) {
+    let mut out: HashMap<CanonStat, StatObs> = HashMap::new();
 
     // Participation / sample size.
     insert_stat(
@@ -151,7 +207,6 @@ fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, f64>, Opt
         detail,
         &["appearances", "matches played", "apps"],
         &[],
-        Prefer::Per90OrTotal,
     );
     insert_stat(
         &mut out,
@@ -159,59 +214,65 @@ fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, f64>, Opt
         detail,
         &["minutes played", "minutes"],
         &[],
-        Prefer::Per90OrTotal,
     );
 
     // Rating (used as extra signal + display).
-    let rating = find_stat_value(detail, &["rating"], &[], Prefer::Per90OrTotal).or_else(|| {
-        detail
-            .season_breakdown
-            .first()
-            .and_then(|row| parse_number(&row.rating))
-    });
+    let rating = find_stat_observation(detail, &["rating"], &[])
+        .and_then(|o| o.raw)
+        .or_else(|| {
+            detail
+                .season_breakdown
+                .first()
+                .and_then(|row| parse_number(&row.rating))
+        });
     if let Some(r) = rating {
-        out.insert(CanonStat::Rating, r);
+        out.insert(
+            CanonStat::Rating,
+            StatObs {
+                raw: Some(r),
+                pct: None,
+            },
+        );
     }
 
+    // Scoring / shooting.
     insert_stat(
         &mut out,
         CanonStat::Goals,
         detail,
         &["goals"],
         &["goals conceded"],
-        Prefer::Per90OrTotal,
     );
-    insert_stat(
-        &mut out,
-        CanonStat::Assists,
-        detail,
-        &["assists"],
-        &[],
-        Prefer::Per90OrTotal,
-    );
+    insert_stat(&mut out, CanonStat::Assists, detail, &["assists"], &[]);
     insert_stat(
         &mut out,
         CanonStat::Xg,
         detail,
         &["expected goals", "xg"],
         &[],
-        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::XgNonPenalty,
+        detail,
+        &["xg excl. penalty", "xg excl penalty", "xg (excl. penalty)"],
+        &[],
     );
     insert_stat(
         &mut out,
         CanonStat::Xa,
         detail,
-        &["expected assists", "xa"],
+        &["expected assists", "xa", "x a"],
         &[],
-        Prefer::Per90OrTotal,
     );
+    insert_stat(&mut out, CanonStat::Xgot, detail, &["xgot"], &[]);
+
     insert_stat(
         &mut out,
         CanonStat::ShotsOnTarget,
         detail,
         &["shots on target"],
         &[],
-        Prefer::Per90OrTotal,
     );
     insert_stat(
         &mut out,
@@ -219,48 +280,93 @@ fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, f64>, Opt
         detail,
         &["shots"],
         &["shots on target"],
-        Prefer::Per90OrTotal,
     );
-    insert_stat(
-        &mut out,
-        CanonStat::KeyPasses,
-        detail,
-        &["key passes"],
-        &[],
-        Prefer::Per90OrTotal,
-    );
+
+    // Creation / possession.
+    insert_stat(&mut out, CanonStat::KeyPasses, detail, &["key passes"], &[]);
     insert_stat(
         &mut out,
         CanonStat::ChancesCreated,
         detail,
         &["chances created"],
         &[],
-        Prefer::Per90OrTotal,
     );
     insert_stat(
         &mut out,
-        CanonStat::Dribbles,
+        CanonStat::BigChancesCreated,
         detail,
-        &["dribbles"],
+        &["big chances created"],
         &[],
-        Prefer::Per90OrTotal,
+    );
+    insert_stat(&mut out, CanonStat::Dribbles, detail, &["dribbles"], &[]);
+    insert_stat(
+        &mut out,
+        CanonStat::Dispossessed,
+        detail,
+        &["dispossessed"],
+        &[],
+    );
+    insert_stat(&mut out, CanonStat::Touches, detail, &["touches"], &[]);
+    insert_stat(
+        &mut out,
+        CanonStat::TouchesInOppBox,
+        detail,
+        &["touches in opposition box", "touches in opp box"],
+        &[],
     );
 
+    // Passing / distribution.
     insert_stat(
         &mut out,
-        CanonStat::Tackles,
+        CanonStat::AccuratePasses,
         detail,
-        &["tackles"],
+        &["accurate passes"],
         &[],
-        Prefer::Per90OrTotal,
     );
+    insert_stat(
+        &mut out,
+        CanonStat::PassAccuracy,
+        detail,
+        &["pass accuracy"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::AccurateLongBalls,
+        detail,
+        &["accurate long balls"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::LongBallAccuracy,
+        detail,
+        &["long ball accuracy"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::SuccessfulCrosses,
+        detail,
+        &["successful crosses"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::CrossAccuracy,
+        detail,
+        &["cross accuracy"],
+        &[],
+    );
+
+    // Defending.
+    insert_stat(&mut out, CanonStat::Tackles, detail, &["tackles"], &[]);
     insert_stat(
         &mut out,
         CanonStat::Interceptions,
         detail,
         &["interceptions"],
         &[],
-        Prefer::Per90OrTotal,
     );
     insert_stat(
         &mut out,
@@ -268,55 +374,105 @@ fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, f64>, Opt
         detail,
         &["clearances"],
         &[],
-        Prefer::Per90OrTotal,
     );
-    insert_stat(
-        &mut out,
-        CanonStat::Blocks,
-        detail,
-        &["blocks"],
-        &[],
-        Prefer::Per90OrTotal,
-    );
+    insert_stat(&mut out, CanonStat::Blocks, detail, &["blocks"], &[]);
     insert_stat(
         &mut out,
         CanonStat::Recoveries,
         detail,
         &["recoveries"],
         &[],
-        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::PossWonFinalThird,
+        detail,
+        &["possession won final 3rd", "possession won final third"],
+        &[],
     );
     insert_stat(
         &mut out,
         CanonStat::DuelsWon,
         detail,
         &["duels won"],
+        &["duels won %"],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::DuelsWonPct,
+        detail,
+        &["duels won %", "duels won%"],
         &[],
-        Prefer::Per90OrTotal,
     );
     insert_stat(
         &mut out,
         CanonStat::AerialsWon,
         detail,
-        &["aerial duels won", "aerial won", "aerials won"],
-        &[],
-        Prefer::Per90OrTotal,
+        &["aerials won"],
+        &["aerials won %"],
     );
-
-    // GK-ish.
     insert_stat(
         &mut out,
-        CanonStat::Saves,
+        CanonStat::AerialsWonPct,
         detail,
-        &["saves"],
+        &["aerials won %", "aerials won%"],
         &[],
-        Prefer::Per90OrTotal,
     );
-    insert_stat_percent(
+    insert_stat(
+        &mut out,
+        CanonStat::DribbledPast,
+        detail,
+        &["dribbled past"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::BlockedScoringAttempt,
+        detail,
+        &["blocked scoring attempt"],
+        &[],
+    );
+
+    // Discipline / fouls.
+    insert_stat(
+        &mut out,
+        CanonStat::FoulsCommitted,
+        detail,
+        &["fouls committed"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::YellowCards,
+        detail,
+        &["yellow cards"],
+        &[],
+    );
+    insert_stat(&mut out, CanonStat::RedCards, detail, &["red cards"], &[]);
+
+    // Team suppression on pitch.
+    insert_stat(
+        &mut out,
+        CanonStat::GoalsConcededOnPitch,
+        detail,
+        &["goals conceded while on pitch"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::XgAgainstOnPitch,
+        detail,
+        &["xg against while on pitch"],
+        &[],
+    );
+
+    // GK.
+    insert_stat(&mut out, CanonStat::Saves, detail, &["saves"], &[]);
+    insert_stat(
         &mut out,
         CanonStat::SavePct,
         detail,
-        &["save%", "save %", "save percentage"],
+        &["save percentage", "save%", "save %", "save percentage"],
         &[],
     );
     insert_stat(
@@ -325,77 +481,101 @@ fn collect_stat_features(detail: &PlayerDetail) -> (HashMap<CanonStat, f64>, Opt
         detail,
         &["clean sheets"],
         &[],
-        Prefer::Per90OrTotal,
     );
     insert_stat(
         &mut out,
         CanonStat::GoalsConceded,
         detail,
         &["goals conceded"],
+        &["goals conceded while on pitch"],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::ErrorLedToGoal,
+        detail,
+        &["error led to goal"],
         &[],
-        Prefer::Per90OrTotal,
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::ActedAsSweeper,
+        detail,
+        &["acted as sweeper"],
+        &[],
+    );
+    insert_stat(
+        &mut out,
+        CanonStat::HighClaims,
+        detail,
+        &["high claims"],
+        &[],
     );
 
     (out, rating)
 }
 
+fn insert_derived_stats(stats: &mut HashMap<CanonStat, StatObs>) {
+    let goals = stats.get(&CanonStat::Goals).and_then(|o| o.raw);
+    let xg_np = stats
+        .get(&CanonStat::XgNonPenalty)
+        .and_then(|o| o.raw)
+        .or_else(|| stats.get(&CanonStat::Xg).and_then(|o| o.raw));
+    if let (Some(g), Some(xg)) = (goals, xg_np) {
+        stats.insert(
+            CanonStat::FinishingDelta,
+            StatObs {
+                raw: Some(g - xg),
+                pct: None,
+            },
+        );
+    }
+
+    let xg = stats.get(&CanonStat::Xg).and_then(|o| o.raw);
+    let xgot = stats.get(&CanonStat::Xgot).and_then(|o| o.raw);
+    if let (Some(xgot), Some(xg)) = (xgot, xg) {
+        stats.insert(
+            CanonStat::ShotPlacementDelta,
+            StatObs {
+                raw: Some(xgot - xg),
+                pct: None,
+            },
+        );
+    }
+}
+
 fn build_rankings_from_features(features: &[PlayerFeatures]) -> Vec<RoleRankingEntry> {
-    let attack_specs: &[(CanonStat, Direction)] = &[
-        (CanonStat::Goals, Direction::HigherBetter),
-        (CanonStat::Assists, Direction::HigherBetter),
-        (CanonStat::Xg, Direction::HigherBetter),
-        (CanonStat::Xa, Direction::HigherBetter),
-        (CanonStat::ShotsOnTarget, Direction::HigherBetter),
-        (CanonStat::Shots, Direction::HigherBetter),
-        (CanonStat::KeyPasses, Direction::HigherBetter),
-        (CanonStat::ChancesCreated, Direction::HigherBetter),
-        (CanonStat::Dribbles, Direction::HigherBetter),
-        (CanonStat::Rating, Direction::HigherBetter),
-    ];
+    let mut dist: HashMap<(RoleCategory, CanonStat, Direction), (f64, f64)> = HashMap::new();
 
-    let defend_specs: &[(CanonStat, Direction)] = &[
-        (CanonStat::Tackles, Direction::HigherBetter),
-        (CanonStat::Interceptions, Direction::HigherBetter),
-        (CanonStat::Clearances, Direction::HigherBetter),
-        (CanonStat::Blocks, Direction::HigherBetter),
-        (CanonStat::Recoveries, Direction::HigherBetter),
-        (CanonStat::DuelsWon, Direction::HigherBetter),
-        (CanonStat::AerialsWon, Direction::HigherBetter),
-        // Goalkeeper-relevant defensive set (still fine for outfield when missing).
-        (CanonStat::Saves, Direction::HigherBetter),
-        (CanonStat::SavePct, Direction::HigherBetter),
-        (CanonStat::CleanSheets, Direction::HigherBetter),
-        (CanonStat::GoalsConceded, Direction::LowerBetter),
-        (CanonStat::Rating, Direction::HigherBetter),
-    ];
-
-    // Precompute per-role mean+stddev per stat (after applying direction transform).
-    let mut dist_attack: HashMap<(RoleCategory, CanonStat), (f64, f64)> = HashMap::new();
-    let mut dist_defend: HashMap<(RoleCategory, CanonStat), (f64, f64)> = HashMap::new();
-
+    // Only build raw distributions for stats that appear in any spec. Percentile-based stats don't
+    // need this, but we still want fallback for missing percentiles.
+    let mut needed: HashSet<(RoleCategory, CanonStat, Direction)> = HashSet::new();
     for role in [
         RoleCategory::Goalkeeper,
         RoleCategory::Defender,
         RoleCategory::Midfielder,
         RoleCategory::Attacker,
     ] {
-        for (stat, dir) in attack_specs {
-            if let Some(d) = dist_for_role(features, role, *stat, *dir) {
-                dist_attack.insert((role, *stat), d);
-            }
+        for (s, d, _) in role_attack_specs(role) {
+            needed.insert((role, *s, *d));
         }
-        for (stat, dir) in defend_specs {
-            if let Some(d) = dist_for_role(features, role, *stat, *dir) {
-                dist_defend.insert((role, *stat), d);
-            }
+        for (s, d, _) in role_defense_specs(role) {
+            needed.insert((role, *s, *d));
+        }
+    }
+
+    for (role, stat, dir) in needed {
+        if let Some(d) = dist_for_role(features, role, stat, dir) {
+            dist.insert((role, stat, dir), d);
         }
     }
 
     features
         .iter()
         .map(|f| {
-            let attack_score = composite_zscore(f, attack_specs, &dist_attack);
-            let defense_score = composite_zscore(f, defend_specs, &dist_defend);
+            let (attack_score, attack_factors) =
+                composite_weighted_score(f, role_attack_specs(f.role), &dist);
+            let (defense_score, defense_factors) =
+                composite_weighted_score(f, role_defense_specs(f.role), &dist);
             RoleRankingEntry {
                 role: f.role,
                 player_id: f.player_id,
@@ -406,9 +586,115 @@ fn build_rankings_from_features(features: &[PlayerFeatures]) -> Vec<RoleRankingE
                 attack_score,
                 defense_score,
                 rating: f.rating,
+                attack_factors,
+                defense_factors,
             }
         })
         .collect()
+}
+
+fn role_attack_specs(role: RoleCategory) -> &'static [(CanonStat, Direction, f64)] {
+    use CanonStat as S;
+    use Direction::{HigherBetter as H, LowerBetter as L};
+
+    // Weights are in "z units"; composite is a weighted mean.
+    match role {
+        RoleCategory::Attacker => &[
+            (S::XgNonPenalty, H, 2.0),
+            (S::Goals, H, 1.2),
+            (S::FinishingDelta, H, 0.8),
+            (S::Xa, H, 1.2),
+            (S::Assists, H, 0.8),
+            (S::ChancesCreated, H, 1.0),
+            (S::BigChancesCreated, H, 1.0),
+            (S::ShotsOnTarget, H, 0.7),
+            (S::TouchesInOppBox, H, 0.9),
+            (S::Dribbles, H, 0.6),
+            (S::Dispossessed, L, 0.6),
+            (S::Rating, H, 0.6),
+        ],
+        RoleCategory::Midfielder => &[
+            (S::Xa, H, 1.2),
+            (S::ChancesCreated, H, 1.0),
+            (S::AccuratePasses, H, 0.9),
+            (S::PassAccuracy, H, 0.7),
+            (S::AccurateLongBalls, H, 0.6),
+            (S::LongBallAccuracy, H, 0.5),
+            (S::Touches, H, 0.5),
+            (S::Dribbles, H, 0.5),
+            (S::Dispossessed, L, 0.6),
+            (S::Rating, H, 0.6),
+        ],
+        RoleCategory::Defender => &[
+            (S::AccuratePasses, H, 0.8),
+            (S::PassAccuracy, H, 0.7),
+            (S::AccurateLongBalls, H, 0.7),
+            (S::LongBallAccuracy, H, 0.6),
+            (S::ChancesCreated, H, 0.4),
+            (S::Xa, H, 0.4),
+            (S::Touches, H, 0.4),
+            (S::Rating, H, 0.4),
+        ],
+        RoleCategory::Goalkeeper => &[
+            (S::AccuratePasses, H, 0.8),
+            (S::PassAccuracy, H, 0.7),
+            (S::AccurateLongBalls, H, 0.7),
+            (S::LongBallAccuracy, H, 0.6),
+            (S::ActedAsSweeper, H, 0.5),
+        ],
+    }
+}
+
+fn role_defense_specs(role: RoleCategory) -> &'static [(CanonStat, Direction, f64)] {
+    use CanonStat as S;
+    use Direction::{HigherBetter as H, LowerBetter as L};
+
+    match role {
+        RoleCategory::Attacker => &[
+            (S::PossWonFinalThird, H, 1.0),
+            (S::Recoveries, H, 0.6),
+            (S::DuelsWonPct, H, 0.4),
+            (S::AerialsWonPct, H, 0.3),
+            (S::FoulsCommitted, L, 0.3),
+            (S::YellowCards, L, 0.3),
+            (S::RedCards, L, 0.4),
+            (S::Rating, H, 0.3),
+        ],
+        RoleCategory::Midfielder => &[
+            (S::Tackles, H, 0.9),
+            (S::Interceptions, H, 0.9),
+            (S::Recoveries, H, 0.9),
+            (S::DuelsWonPct, H, 0.6),
+            (S::AerialsWonPct, H, 0.4),
+            (S::PossWonFinalThird, H, 0.6),
+            (S::DribbledPast, L, 0.6),
+            (S::YellowCards, L, 0.3),
+            (S::RedCards, L, 0.3),
+            (S::Rating, H, 0.4),
+        ],
+        RoleCategory::Defender => &[
+            (S::Tackles, H, 1.0),
+            (S::Interceptions, H, 1.0),
+            (S::Clearances, H, 0.9),
+            (S::Blocks, H, 0.8),
+            (S::Recoveries, H, 0.8),
+            (S::DuelsWonPct, H, 0.8),
+            (S::AerialsWonPct, H, 0.9),
+            (S::DribbledPast, L, 0.8),
+            (S::GoalsConcededOnPitch, L, 0.7),
+            (S::XgAgainstOnPitch, L, 0.7),
+            (S::Rating, H, 0.3),
+        ],
+        RoleCategory::Goalkeeper => &[
+            (S::SavePct, H, 1.3),
+            (S::Saves, H, 0.8),
+            (S::GoalsConceded, L, 1.1),
+            (S::CleanSheets, H, 0.7),
+            (S::ErrorLedToGoal, L, 0.9),
+            (S::HighClaims, H, 0.5),
+            (S::Rating, H, 0.4),
+        ],
+    }
 }
 
 fn dist_for_role(
@@ -419,9 +705,10 @@ fn dist_for_role(
 ) -> Option<(f64, f64)> {
     let mut values: Vec<f64> = Vec::new();
     for f in features.iter().filter(|f| f.role == role) {
-        if let Some(v) = f.stats.get(&stat).copied() {
-            values.push(apply_dir(v, dir));
-        }
+        let Some(v) = f.stats.get(&stat).and_then(|o| o.raw) else {
+            continue;
+        };
+        values.push(apply_dir(v, dir));
     }
     if values.len() < 2 {
         return None;
@@ -439,54 +726,116 @@ fn dist_for_role(
     if std <= 1e-9 { None } else { Some((mean, std)) }
 }
 
-fn composite_zscore(
+fn composite_weighted_score(
     f: &PlayerFeatures,
-    specs: &[(CanonStat, Direction)],
-    dist: &HashMap<(RoleCategory, CanonStat), (f64, f64)>,
-) -> f64 {
+    specs: &[(CanonStat, Direction, f64)],
+    dist: &HashMap<(RoleCategory, CanonStat, Direction), (f64, f64)>,
+) -> (f64, Vec<RankFactor>) {
+    const COVERAGE_MIN: f64 = 0.45;
+    const COVERAGE_PENALTY: f64 = 0.8; // in z units
+    const PART_PENALTY: f64 = 1.0; // in z units
+
+    let mut w_total = 0.0;
+    let mut w_used = 0.0;
     let mut sum = 0.0;
-    let mut n = 0usize;
-    for (stat, dir) in specs {
-        let Some(v) = f.stats.get(stat).copied() else {
+    let mut factors: Vec<RankFactor> = Vec::new();
+
+    for (stat, dir, w) in specs {
+        w_total += *w;
+        let Some(obs) = f.stats.get(stat) else {
             continue;
         };
-        let Some((mean, std)) = dist.get(&(f.role, *stat)).copied() else {
-            continue;
-        };
-        let v = apply_dir(v, *dir);
-        let z = (v - mean) / std;
-        if z.is_finite() {
-            sum += z;
-            n += 1;
+
+        let mut used_source: Option<StatSource> = None;
+        let mut z: Option<f64> = None;
+        let mut raw: Option<f64> = None;
+        let mut pct: Option<f64> = None;
+
+        if let Some(p) = obs.pct {
+            let mut z_pct = pct_to_z(p);
+            if matches!(dir, Direction::LowerBetter) {
+                z_pct = -z_pct;
+            }
+            used_source = Some(StatSource::Percentile);
+            z = Some(z_pct);
+            pct = Some(p);
+            raw = obs.raw;
+        } else if let Some(v) = obs.raw {
+            if let Some((mean, std)) = dist.get(&(f.role, *stat, *dir)).copied() {
+                let v_dir = apply_dir(v, *dir);
+                let z_raw = (v_dir - mean) / std;
+                if z_raw.is_finite() {
+                    used_source = Some(StatSource::Raw);
+                    z = Some(z_raw);
+                    raw = Some(v);
+                }
+            }
         }
+
+        let Some(z) = z else { continue };
+        if !z.is_finite() || !w.is_finite() || *w <= 0.0 {
+            continue;
+        }
+
+        sum += *w * z;
+        w_used += *w;
+        factors.push(RankFactor {
+            label: canon_label(*stat).to_string(),
+            z,
+            weight: *w,
+            raw,
+            pct,
+            source: match used_source.unwrap_or(StatSource::Raw) {
+                StatSource::Percentile => "pct".to_string(),
+                StatSource::Raw => "raw".to_string(),
+            },
+        });
     }
-    if n == 0 {
-        f64::NEG_INFINITY
-    } else {
-        let base = sum / n as f64;
-        apply_participation_adjustment(f, base)
+
+    if w_used <= 0.0 || w_total <= 0.0 {
+        return (f64::NEG_INFINITY, Vec::new());
     }
+
+    let coverage = (w_used / w_total).clamp(0.0, 1.0);
+    if coverage < COVERAGE_MIN {
+        return (f64::NEG_INFINITY, Vec::new());
+    }
+
+    let mut score = sum / w_used;
+    score -= (1.0 - coverage) * COVERAGE_PENALTY;
+    score = apply_participation_adjustment(f, score, PART_PENALTY);
+
+    // Keep top contributors by absolute impact (weight * z).
+    factors.sort_by(|a, b| {
+        let ia = (a.weight * a.z).abs();
+        let ib = (b.weight * b.z).abs();
+        ib.total_cmp(&ia)
+    });
+    factors.truncate(5);
+
+    (score, factors)
 }
 
-fn apply_participation_adjustment(f: &PlayerFeatures, base: f64) -> f64 {
-    // Penalize small sample sizes so 0–1 match players don't top lists.
-    // Prefer minutes if present; otherwise use appearances.
-    //
-    // reliability ~ 0 (no minutes) → heavy penalty
-    // reliability ~ 1 (enough minutes) → no penalty
+fn apply_participation_adjustment(f: &PlayerFeatures, base: f64, penalty: f64) -> f64 {
+    if !base.is_finite() {
+        return base;
+    }
+
     const FULL_MINUTES: f64 = 900.0; // ~10 full matches
     const FULL_APPS: f64 = 10.0;
-    const PENALTY: f64 = 1.5; // in "z-score units"
 
     let minutes = f
         .stats
         .get(&CanonStat::MinutesPlayed)
-        .copied()
+        .and_then(|o| o.raw)
         .unwrap_or(0.0);
-    let apps = f.stats.get(&CanonStat::Appearances).copied().unwrap_or(0.0);
+    let apps = f
+        .stats
+        .get(&CanonStat::Appearances)
+        .and_then(|o| o.raw)
+        .unwrap_or(0.0);
 
     let rel = if minutes > 0.0 {
-        // sqrt gives a softer ramp; 1 match (~90) => ~0.316
         (minutes / FULL_MINUTES).clamp(0.0, 1.0).sqrt()
     } else if apps > 0.0 {
         (apps / FULL_APPS).clamp(0.0, 1.0).sqrt()
@@ -494,13 +843,12 @@ fn apply_participation_adjustment(f: &PlayerFeatures, base: f64) -> f64 {
         0.0
     };
 
-    if !base.is_finite() {
-        return base;
-    }
+    base * rel - (1.0 - rel) * penalty
+}
 
-    // Shrink towards 0 and apply a penalty for low participation.
-    // This ensures low-minute players can't beat high-minute players just from variance.
-    base * rel - (1.0 - rel) * PENALTY
+fn pct_to_z(pct: f64) -> f64 {
+    // Simple stable mapping: 50 => 0, 65 => +1, 35 => -1.
+    ((pct - 50.0) / 15.0).clamp(-3.0, 3.0)
 }
 
 fn apply_dir(v: f64, dir: Direction) -> f64 {
@@ -510,127 +858,179 @@ fn apply_dir(v: f64, dir: Direction) -> f64 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Prefer {
-    Per90OrTotal,
+fn canon_label(stat: CanonStat) -> &'static str {
+    use CanonStat as S;
+    match stat {
+        S::Appearances => "Appearances",
+        S::MinutesPlayed => "Minutes",
+        S::Goals => "Goals",
+        S::Assists => "Assists",
+        S::Xg => "xG",
+        S::XgNonPenalty => "xG excl. pen",
+        S::Xa => "xA",
+        S::Xgot => "xGOT",
+        S::Shots => "Shots",
+        S::ShotsOnTarget => "Shots on target",
+        S::KeyPasses => "Key passes",
+        S::ChancesCreated => "Chances created",
+        S::BigChancesCreated => "Big chances created",
+        S::Touches => "Touches",
+        S::TouchesInOppBox => "Touches in box",
+        S::Dribbles => "Dribbles",
+        S::Dispossessed => "Dispossessed",
+        S::AccuratePasses => "Accurate passes",
+        S::PassAccuracy => "Pass accuracy",
+        S::AccurateLongBalls => "Accurate long balls",
+        S::LongBallAccuracy => "Long ball accuracy",
+        S::SuccessfulCrosses => "Successful crosses",
+        S::CrossAccuracy => "Cross accuracy",
+        S::Tackles => "Tackles",
+        S::Interceptions => "Interceptions",
+        S::Clearances => "Clearances",
+        S::Blocks => "Blocks",
+        S::Recoveries => "Recoveries",
+        S::PossWonFinalThird => "Poss. won final 3rd",
+        S::DuelsWon => "Duels won",
+        S::DuelsWonPct => "Duels won %",
+        S::AerialsWon => "Aerials won",
+        S::AerialsWonPct => "Aerials won %",
+        S::DribbledPast => "Dribbled past",
+        S::BlockedScoringAttempt => "Blocked scoring att.",
+        S::FoulsCommitted => "Fouls committed",
+        S::YellowCards => "Yellow cards",
+        S::RedCards => "Red cards",
+        S::GoalsConcededOnPitch => "GC on pitch",
+        S::XgAgainstOnPitch => "xGA on pitch",
+        S::Saves => "Saves",
+        S::SavePct => "Save %",
+        S::CleanSheets => "Clean sheets",
+        S::GoalsConceded => "Goals conceded",
+        S::ErrorLedToGoal => "Error led to goal",
+        S::ActedAsSweeper => "Sweeper actions",
+        S::HighClaims => "High claims",
+        S::Rating => "Rating",
+        S::FinishingDelta => "Goals - xG",
+        S::ShotPlacementDelta => "xGOT - xG",
+    }
 }
 
 fn insert_stat(
-    out: &mut HashMap<CanonStat, f64>,
-    key: CanonStat,
-    detail: &PlayerDetail,
-    needles: &[&str],
-    excludes: &[&str],
-    _prefer: Prefer,
-) {
-    if let Some(v) = find_stat_value(detail, needles, excludes, Prefer::Per90OrTotal) {
-        out.insert(key, v);
-    }
-}
-
-fn insert_stat_percent(
-    out: &mut HashMap<CanonStat, f64>,
+    out: &mut HashMap<CanonStat, StatObs>,
     key: CanonStat,
     detail: &PlayerDetail,
     needles: &[&str],
     excludes: &[&str],
 ) {
-    if let Some(v) = find_stat_percent(detail, needles, excludes) {
+    if let Some(v) = find_stat_observation(detail, needles, excludes) {
         out.insert(key, v);
     }
 }
 
-fn find_stat_value(
+#[derive(Debug, Clone, Copy)]
+struct StatCandidate<'a> {
+    title: &'a str,
+    total: &'a str,
+    per90: Option<&'a str>,
+    pct_total: Option<f64>,
+    pct_per90: Option<f64>,
+}
+
+fn find_stat_observation(
     detail: &PlayerDetail,
     needles: &[&str],
     excludes: &[&str],
-    _prefer: Prefer,
-) -> Option<f64> {
-    // Prefer per-90 if available (season_performance has per90).
-    for (title, total, per90) in iter_all_stats(detail) {
+) -> Option<StatObs> {
+    let mut best: Option<(u8, StatObs)> = None;
+
+    for c in iter_all_stats(detail) {
         if !needles
             .iter()
-            .any(|n| contains_ascii_case_insensitive(title, n))
+            .any(|n| contains_ascii_case_insensitive(c.title, n))
         {
             continue;
         }
         if excludes
             .iter()
-            .any(|e| contains_ascii_case_insensitive(title, e))
+            .any(|e| contains_ascii_case_insensitive(c.title, e))
         {
             continue;
         }
-        if let Some(per90) = per90
-            && let Some(v) = parse_number(per90)
-        {
-            return Some(v);
-        }
-        if let Some(v) = parse_number(total) {
-            return Some(v);
+
+        let pct = c.pct_per90.or(c.pct_total);
+        let raw = c
+            .per90
+            .and_then(parse_number)
+            .or_else(|| parse_number(c.total));
+        let obs = StatObs { raw, pct };
+
+        // Prefer percentile-per90 > percentile-total > raw-per90 > raw-total.
+        let quality = if c.pct_per90.is_some() {
+            4
+        } else if c.pct_total.is_some() {
+            3
+        } else if c.per90.is_some() {
+            2
+        } else {
+            1
+        };
+
+        match best.as_ref() {
+            Some((q, _)) if *q >= quality => {}
+            _ => best = Some((quality, obs)),
         }
     }
-    None
+
+    best.map(|(_, obs)| obs)
 }
 
-fn find_stat_percent(detail: &PlayerDetail, needles: &[&str], excludes: &[&str]) -> Option<f64> {
-    for (title, total, per90) in iter_all_stats(detail) {
-        if !needles
-            .iter()
-            .any(|n| contains_ascii_case_insensitive(title, n))
-        {
-            continue;
-        }
-        if excludes
-            .iter()
-            .any(|e| contains_ascii_case_insensitive(title, e))
-        {
-            continue;
-        }
-        if let Some(per90) = per90
-            && let Some(v) = parse_percent(per90)
-        {
-            return Some(v);
-        }
-        if let Some(v) = parse_percent(total) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-fn iter_all_stats<'a>(
-    detail: &'a PlayerDetail,
-) -> impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)> + 'a {
+fn iter_all_stats<'a>(detail: &'a PlayerDetail) -> impl Iterator<Item = StatCandidate<'a>> + 'a {
     // season_performance has per90, and is usually the most consistent place for per-90 values.
     let perf = detail.season_performance.iter().flat_map(|g| {
-        g.items.iter().map(|item| {
-            (
-                item.title.as_str(),
-                item.total.as_str(),
-                item.per90.as_deref(),
-            )
+        g.items.iter().map(|item| StatCandidate {
+            title: item.title.as_str(),
+            total: item.total.as_str(),
+            per90: item.per90.as_deref(),
+            pct_total: item.percentile_rank,
+            pct_per90: item.percentile_rank_per90,
         })
     });
-    let all_comp = detail
-        .all_competitions
-        .iter()
-        .map(|s| (s.title.as_str(), s.value.as_str(), None));
-    let top = detail
-        .top_stats
-        .iter()
-        .map(|s| (s.title.as_str(), s.value.as_str(), None));
-    let main = detail.main_league.as_ref().into_iter().flat_map(|l| {
-        l.stats
-            .iter()
-            .map(|s| (s.title.as_str(), s.value.as_str(), None))
-    });
-    let groups = detail.season_groups.iter().flat_map(|g| {
-        g.items
-            .iter()
-            .map(|s| (s.title.as_str(), s.value.as_str(), None))
+
+    let all_comp = detail.all_competitions.iter().map(|s| StatCandidate {
+        title: s.title.as_str(),
+        total: s.value.as_str(),
+        per90: None,
+        pct_total: s.percentile_rank,
+        pct_per90: s.percentile_rank_per90,
     });
 
-    // Prefer perf first, then the rest.
+    let top = detail.top_stats.iter().map(|s| StatCandidate {
+        title: s.title.as_str(),
+        total: s.value.as_str(),
+        per90: None,
+        pct_total: s.percentile_rank,
+        pct_per90: s.percentile_rank_per90,
+    });
+
+    let main = detail.main_league.as_ref().into_iter().flat_map(|l| {
+        l.stats.iter().map(|s| StatCandidate {
+            title: s.title.as_str(),
+            total: s.value.as_str(),
+            per90: None,
+            pct_total: s.percentile_rank,
+            pct_per90: s.percentile_rank_per90,
+        })
+    });
+
+    let groups = detail.season_groups.iter().flat_map(|g| {
+        g.items.iter().map(|s| StatCandidate {
+            title: s.title.as_str(),
+            total: s.value.as_str(),
+            per90: None,
+            pct_total: s.percentile_rank,
+            pct_per90: s.percentile_rank_per90,
+        })
+    });
+
     perf.chain(all_comp).chain(top).chain(main).chain(groups)
 }
 
@@ -649,15 +1049,6 @@ fn parse_number(raw: &str) -> Option<f64> {
         return None;
     }
     cleaned.parse::<f64>().ok()
-}
-
-fn parse_percent(raw: &str) -> Option<f64> {
-    let s = raw.trim();
-    if s.is_empty() || s == "-" {
-        return None;
-    }
-    let s = s.trim_end_matches('%');
-    parse_number(s)
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {

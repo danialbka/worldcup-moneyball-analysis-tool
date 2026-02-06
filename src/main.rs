@@ -2215,14 +2215,28 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
-        .split(area);
+    let detail_h: u16 = 7;
+    let show_detail = area.height >= 2 + 1 + detail_h + 1;
+    let sections = if show_detail {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(detail_h),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(area)
+    };
 
     let role = role_label(state.rankings_role);
     let metric = metric_label(state.rankings_metric);
@@ -2404,6 +2418,112 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             truncate(&entry.club, 18)
         );
         render_cell_text(frame, row_area, &text, row_style);
+    }
+
+    if show_detail {
+        let detail_area = sections[3];
+        if detail_area.height == 0 {
+            return;
+        }
+
+        let Some(selected) = rows.get(state.rankings_selected).copied() else {
+            return;
+        };
+
+        let (score, factors) = match state.rankings_metric {
+            state::RankMetric::Attacking => (selected.attack_score, &selected.attack_factors),
+            state::RankMetric::Defending => (selected.defense_score, &selected.defense_factors),
+        };
+
+        let score_text = if score.is_finite() {
+            format!("{score:.2}")
+        } else {
+            "-".to_string()
+        };
+        let rating_text = selected
+            .rating
+            .map(|r| format!("{r:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("Selected: ", on_black(Style::default().fg(Color::DarkGray))),
+            Span::styled(
+                truncate(&selected.player_name, 28),
+                on_black(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+            Span::styled(
+                format!(" ({})", truncate(&selected.team_name, 22)),
+                on_black(Style::default().fg(Color::Gray)),
+            ),
+            Span::styled("  Score ", on_black(Style::default().fg(Color::DarkGray))),
+            Span::styled(
+                score_text,
+                on_black(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+            Span::styled("  R ", on_black(Style::default().fg(Color::DarkGray))),
+            Span::styled(rating_text, on_black(Style::default().fg(Color::Magenta))),
+        ]));
+
+        lines.push(Line::from(Span::styled(
+            "Top contributors",
+            on_black(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )));
+
+        if factors.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No breakdown available (warm cache / insufficient stat coverage)",
+                on_black(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            )));
+        } else {
+            for f in factors
+                .iter()
+                .take((detail_area.height as usize).saturating_sub(2))
+            {
+                let impact = f.weight * f.z;
+                let impact_style = if impact >= 0.0 {
+                    on_black(Style::default().fg(Color::Green))
+                } else {
+                    on_black(Style::default().fg(Color::Red))
+                };
+                let mut tail = String::new();
+                if let Some(pct) = f.pct {
+                    tail.push_str(&format!(" pct={pct:.0}"));
+                } else if let Some(raw) = f.raw {
+                    tail.push_str(&format!(" raw={raw:.2}"));
+                }
+                tail.push_str(&format!(" ({}, w={:.2}, z={:.2})", f.source, f.weight, f.z));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{impact:+.2} "), impact_style),
+                    Span::styled(
+                        truncate(&f.label, 20),
+                        on_black(Style::default().fg(Color::White)),
+                    ),
+                    Span::styled(tail, on_black(Style::default().fg(Color::DarkGray))),
+                ]));
+            }
+        }
+
+        let detail = Paragraph::new(lines)
+            .style(Style::default().bg(Color::Black))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(detail, detail_area);
     }
 }
 

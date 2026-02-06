@@ -1,0 +1,34 @@
+{
+  "id": 103,
+  "name": "Gamma Sparse",
+  "primaryTeam": { "teamName": "Test FC" },
+  "positionDescription": {
+    "primaryPosition": { "label": "FW" },
+    "positions": [ { "strPos": { "label": "FW" }, "isMainPosition": true } ]
+  },
+  "mainLeague": { "leagueName": "Test League", "season": "2025/26", "stats": [] },
+  "topStatCard": { "items": [] },
+  "statsSection": {
+    "items": [
+      {
+        "title": "General",
+        "items": [
+          { "title": "Appearances", "statValue": 10, "statFormat": "number" },
+          { "title": "Minutes played", "statValue": 900, "statFormat": "number" },
+          { "title": "Rating", "statValue": 6.9, "statFormat": "number" }
+        ]
+      },
+      {
+        "title": "Shooting",
+        "items": [
+          { "title": "Goals", "statValue": 3, "statFormat": "number" }
+        ]
+      }
+    ]
+  },
+  "firstSeasonStats": { "topStatCard": { "items": [] }, "statsSection": { "items": [] } },
+  "careerHistory": { "careerItems": { "senior": { "teamEntries": [], "seasonEntries": [] } } },
+  "trophies": { "playerTrophies": [] },
+  "recentMatches": []
+}
+

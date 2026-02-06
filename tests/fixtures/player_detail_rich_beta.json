@@ -1,0 +1,53 @@
+{
+  "id": 102,
+  "name": "Beta Bench",
+  "primaryTeam": { "teamName": "Test FC" },
+  "positionDescription": {
+    "primaryPosition": { "label": "FW" },
+    "positions": [ { "strPos": { "label": "FW" }, "isMainPosition": true } ]
+  },
+  "mainLeague": { "leagueName": "Test League", "season": "2025/26", "stats": [] },
+  "topStatCard": { "items": [] },
+  "statsSection": {
+    "items": [
+      {
+        "title": "General",
+        "items": [
+          { "title": "Appearances", "statValue": 1, "statFormat": "number", "percentileRank": 15, "percentileRankPer90": 15 },
+          { "title": "Minutes played", "statValue": 90, "statFormat": "number", "percentileRank": 10, "percentileRankPer90": 10 },
+          { "title": "Rating", "statValue": 7.6, "statFormat": "number", "percentileRank": 90, "percentileRankPer90": 90 }
+        ]
+      },
+      {
+        "title": "Shooting",
+        "items": [
+          { "title": "Goals", "statValue": 2, "statFormat": "number", "per90": 2.00, "percentileRank": 95, "percentileRankPer90": 95 },
+          { "title": "xG excl. penalty", "statValue": 1.2, "statFormat": "number", "per90": 1.20, "percentileRank": 93, "percentileRankPer90": 93 },
+          { "title": "Shots on target", "statValue": 3, "statFormat": "number", "per90": 3.00, "percentileRank": 92, "percentileRankPer90": 92 }
+        ]
+      },
+      {
+        "title": "Creativity",
+        "items": [
+          { "title": "xA", "statValue": 0.2, "statFormat": "number", "per90": 0.20, "percentileRank": 40, "percentileRankPer90": 40 },
+          { "title": "Assists", "statValue": 0, "statFormat": "number", "per90": 0.00, "percentileRank": 20, "percentileRankPer90": 20 },
+          { "title": "Chances created", "statValue": 2, "statFormat": "number", "per90": 2.00, "percentileRank": 55, "percentileRankPer90": 55 },
+          { "title": "Big chances created", "statValue": 1, "statFormat": "number", "per90": 1.00, "percentileRank": 60, "percentileRankPer90": 60 }
+        ]
+      },
+      {
+        "title": "Possession",
+        "items": [
+          { "title": "Touches in opposition box", "statValue": 8, "statFormat": "number", "per90": 8.00, "percentileRank": 65, "percentileRankPer90": 65 },
+          { "title": "Dribbles", "statValue": 2, "statFormat": "number", "per90": 2.00, "percentileRank": 50, "percentileRankPer90": 50 },
+          { "title": "Dispossessed", "statValue": 4, "statFormat": "number", "per90": 4.00, "percentileRank": 85, "percentileRankPer90": 85 }
+        ]
+      }
+    ]
+  },
+  "firstSeasonStats": { "topStatCard": { "items": [] }, "statsSection": { "items": [] } },
+  "careerHistory": { "careerItems": { "senior": { "teamEntries": [], "seasonEntries": [] } } },
+  "trophies": { "playerTrophies": [] },
+  "recentMatches": []
+}
+

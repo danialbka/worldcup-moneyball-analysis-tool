@@ -1333,6 +1333,18 @@ pub struct PlayerTrophyEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankFactor {
+    pub label: String,
+    pub z: f64,
+    pub weight: f64,
+    #[serde(default)]
+    pub raw: Option<f64>,
+    #[serde(default)]
+    pub pct: Option<f64>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleRankingEntry {
     pub role: RoleCategory,
     pub player_id: u32,
@@ -1343,6 +1355,10 @@ pub struct RoleRankingEntry {
     pub attack_score: f64,
     pub defense_score: f64,
     pub rating: Option<f64>,
+    #[serde(default)]
+    pub attack_factors: Vec<RankFactor>,
+    #[serde(default)]
+    pub defense_factors: Vec<RankFactor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
