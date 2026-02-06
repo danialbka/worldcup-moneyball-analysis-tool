@@ -2700,18 +2700,46 @@ fn percentile(values: &[f64], value: f64) -> Option<f64> {
     Some(idx as f64 / values.len() as f64 * 100.0)
 }
 
+/// FotMob-style percentile gradient.
+///
+/// Key stops (matching FotMob's stat bar colors):
+///   0% → #E55541 (red)
+///  25% → #F09D51 (orange)
+///  50% → #EDC65E (gold)
+///  75% → #69C05F (green)
+/// 100% → #19BE62 (bright green)
 fn color_for_percentile(percentile: f64) -> Color {
-    if percentile >= 80.0 {
-        Color::LightGreen
-    } else if percentile >= 60.0 {
-        Color::Green
-    } else if percentile >= 40.0 {
-        Color::Yellow
-    } else if percentile >= 20.0 {
-        Color::LightRed
-    } else {
-        Color::Red
+    let p = percentile.clamp(0.0, 100.0);
+
+    // Color stops as (percentile, r, g, b).
+    const STOPS: &[(f64, u8, u8, u8)] = &[
+        (0.0, 229, 85, 65),   // #E55541
+        (25.0, 240, 157, 81), // #F09D51
+        (50.0, 237, 198, 94), // #EDC65E
+        (75.0, 105, 192, 95), // #69C05F
+        (100.0, 25, 190, 98), // #19BE62
+    ];
+
+    // Find the two stops to interpolate between.
+    let mut lo = STOPS[0];
+    let mut hi = STOPS[STOPS.len() - 1];
+    for window in STOPS.windows(2) {
+        if p >= window[0].0 && p <= window[1].0 {
+            lo = window[0];
+            hi = window[1];
+            break;
+        }
     }
+
+    let range = hi.0 - lo.0;
+    let t = if range > 0.0 { (p - lo.0) / range } else { 0.0 };
+
+    let lerp = |a: u8, b: u8| -> u8 {
+        let v = a as f64 + (b as f64 - a as f64) * t;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+
+    Color::Rgb(lerp(lo.1, hi.1), lerp(lo.2, hi.2), lerp(lo.3, hi.3))
 }
 
 fn style_from_percentile(percentile: Option<f64>) -> Option<Style> {
@@ -2985,17 +3013,25 @@ fn player_season_performance_text_styled(
         lines.push(Line::from(format!("{}:", group.title)));
         for item in &group.items {
             let per90 = item.per90.as_deref().unwrap_or("-");
-            let style = style_from_percentile(item.percentile_rank_per90)
-                .or_else(|| style_from_percentile(item.percentile_rank))
-                .unwrap_or_else(|| {
+
+            // Total column: use percentile_rank (total-based).
+            let total_style = style_from_percentile(item.percentile_rank).unwrap_or_else(|| {
+                let color_value = parse_stat_value(&item.total);
+                style_for_stat(dist, role, &item.title, color_value)
+            });
+
+            // Per 90 column: use percentile_rank_per90.
+            let per90_style =
+                style_from_percentile(item.percentile_rank_per90).unwrap_or_else(|| {
                     let color_value = item.per90.as_deref().and_then(parse_stat_value);
                     style_for_stat(dist, role, &item.title, color_value)
                 });
+
             lines.push(Line::from(vec![
                 Span::raw(format!("  {}: ", item.title)),
-                Span::styled(item.total.clone(), style),
+                Span::styled(item.total.clone(), total_style),
                 Span::raw(" | "),
-                Span::styled(per90.to_string(), style),
+                Span::styled(per90.to_string(), per90_style),
             ]));
         }
     }
