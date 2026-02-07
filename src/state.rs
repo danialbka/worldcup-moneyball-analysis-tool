@@ -6,6 +6,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::win_prob;
 
+#[derive(Debug, Clone)]
+pub struct PredictionExplain {
+    // Probability snapshots (H/D/A, in percent) used to explain pre-match priors.
+    pub p_home_baseline: f32,
+    pub p_draw_baseline: f32,
+    pub p_away_baseline: f32,
+    pub p_home_ha: f32,
+    pub p_draw_ha: f32,
+    pub p_away_ha: f32,
+    pub p_home_analysis: f32,
+    pub p_draw_analysis: f32,
+    pub p_away_analysis: f32,
+    pub p_home_final: f32,
+    pub p_draw_final: f32,
+    pub p_away_final: f32,
+
+    // Percentage-point contributions to home-win probability.
+    pub pp_home_adv: f32,
+    pub pp_analysis: f32,
+    pub pp_lineup: f32,
+
+    // Short tags describing what signals were available (best-effort).
+    pub signals: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PredictionExtras {
+    pub prematch_only: bool,
+    pub lambda_home_pre: f64,
+    pub lambda_away_pre: f64,
+
+    pub s_home_analysis: Option<f64>,
+    pub s_away_analysis: Option<f64>,
+    pub s_home_lineup: Option<f64>,
+    pub s_away_lineup: Option<f64>,
+    pub lineup_coverage_home: Option<f32>,
+    pub lineup_coverage_away: Option<f32>,
+    pub blend_w_lineup: f32,
+
+    pub explain: PredictionExplain,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Pulse,
@@ -329,6 +371,8 @@ pub struct AppState {
     pub win_prob_history: HashMap<String, Vec<f32>>,
     pub prematch_win: HashMap<String, WinProbRow>,
     pub prematch_locked: HashSet<String>,
+    pub prediction_extras: HashMap<String, PredictionExtras>,
+    pub prediction_show_why: bool,
     pub placeholder_match_enabled: bool,
     pub squad: Vec<SquadPlayer>,
     pub squad_selected: usize,
@@ -430,6 +474,8 @@ impl AppState {
             win_prob_history: HashMap::with_capacity(16),
             prematch_win: HashMap::with_capacity(16),
             prematch_locked: HashSet::new(),
+            prediction_extras: HashMap::with_capacity(16),
+            prediction_show_why: true,
             placeholder_match_enabled: false,
             squad: Vec::new(),
             squad_selected: 0,
@@ -1536,12 +1582,16 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 }
 
                 let detail = state.match_detail.get(&summary.id);
-                summary.win = win_prob::compute_win_prob(
+                let (win, extras) = win_prob::compute_win_prob_explainable(
                     summary,
                     detail,
                     &state.combined_player_cache,
                     &state.analysis,
                 );
+                summary.win = win;
+                if let Some(extras) = extras {
+                    state.prediction_extras.insert(summary.id.clone(), extras);
+                }
                 if let Some(existing) = state.matches.iter().find(|m| m.id == summary.id) {
                     summary.win.delta_home = summary.win.p_home - existing.win.p_home;
                 } else {
@@ -1566,12 +1616,15 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     pre.score_home = 0;
                     pre.score_away = 0;
                     let detail = state.match_detail.get(&pre.id);
-                    let prematch = win_prob::compute_win_prob(
+                    let (prematch, extras) = win_prob::compute_win_prob_explainable(
                         &pre,
                         detail,
                         &state.combined_player_cache,
                         &state.analysis,
                     );
+                    if let Some(extras) = extras {
+                        state.prediction_extras.insert(pre.id.clone(), extras);
+                    }
                     state.prematch_win.entry(pre.id.clone()).or_insert(prematch);
                     state.prematch_locked.insert(pre.id);
                 }
@@ -1609,12 +1662,16 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
                 let prev_p_home = existing.win.p_home;
                 let detail_ref = state.match_detail.get(&id);
-                existing.win = win_prob::compute_win_prob(
+                let (win, extras) = win_prob::compute_win_prob_explainable(
                     existing,
                     detail_ref,
                     &state.combined_player_cache,
                     &state.analysis,
                 );
+                existing.win = win;
+                if let Some(extras) = extras {
+                    state.prediction_extras.insert(id.clone(), extras);
+                }
                 existing.win.delta_home = existing.win.p_home - prev_p_home;
 
                 let entry = state.win_prob_history.entry(id).or_default();
@@ -1680,12 +1737,16 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
                 let prev_p_home = existing.win.p_home;
                 let detail_ref = state.match_detail.get(&id);
-                existing.win = win_prob::compute_win_prob(
+                let (win, extras) = win_prob::compute_win_prob_explainable(
                     existing,
                     detail_ref,
                     &state.combined_player_cache,
                     &state.analysis,
                 );
+                existing.win = win;
+                if let Some(extras) = extras {
+                    state.prediction_extras.insert(id.clone(), extras);
+                }
                 existing.win.delta_home = existing.win.p_home - prev_p_home;
 
                 let entry = state.win_prob_history.entry(id).or_default();
@@ -1708,12 +1769,16 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         Delta::UpsertMatch(mut summary) => {
             let match_id = summary.id.clone();
             let detail = state.match_detail.get(&match_id);
-            summary.win = win_prob::compute_win_prob(
+            let (win, extras) = win_prob::compute_win_prob_explainable(
                 &summary,
                 detail,
                 &state.combined_player_cache,
                 &state.analysis,
             );
+            summary.win = win;
+            if let Some(extras) = extras {
+                state.prediction_extras.insert(match_id.clone(), extras);
+            }
             let home_prob = summary.win.p_home;
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == summary.id) {
                 // Freeze pre-match snapshot when the match starts.
@@ -1748,12 +1813,15 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     pre.score_home = 0;
                     pre.score_away = 0;
                     let detail = state.match_detail.get(&match_id);
-                    let prematch = win_prob::compute_win_prob(
+                    let (prematch, extras) = win_prob::compute_win_prob_explainable(
                         &pre,
                         detail,
                         &state.combined_player_cache,
                         &state.analysis,
                     );
+                    if let Some(extras) = extras {
+                        state.prediction_extras.insert(match_id.clone(), extras);
+                    }
                     state
                         .prematch_win
                         .entry(match_id.clone())
@@ -1802,12 +1870,15 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     is_live: false,
                 };
                 let detail = state.match_detail.get(&u.id);
-                let prematch = win_prob::compute_win_prob(
+                let (prematch, extras) = win_prob::compute_win_prob_explainable(
                     &summary,
                     detail,
                     &state.combined_player_cache,
                     &state.analysis,
                 );
+                if let Some(extras) = extras {
+                    state.prediction_extras.insert(u.id.clone(), extras);
+                }
                 state.prematch_win.insert(u.id.clone(), prematch);
             }
         }

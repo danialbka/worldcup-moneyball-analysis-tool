@@ -1056,10 +1056,10 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
         })
         .unwrap_or_default();
 
-    let main_league = parsed.main_league.map(|league| PlayerLeagueStats {
-        league_name: league.league_name,
-        season: league.season,
-        stats: league
+    // FotMob sometimes returns an incomplete `mainLeague` object (e.g. `{ "stats": null }`),
+    // which used to hard-fail deserialization and cascaded into "invalid player json" spam.
+    let main_league = parsed.main_league.and_then(|league| {
+        let stats = league
             .stats
             .into_iter()
             .map(|stat| PlayerStatItem {
@@ -1068,7 +1068,26 @@ pub fn parse_player_detail_json(raw: &str) -> Result<PlayerDetail> {
                 percentile_rank: None,
                 percentile_rank_per90: None,
             })
-            .collect(),
+            .collect::<Vec<_>>();
+        let league_name = if league.league_name.trim().is_empty() {
+            "Main league".to_string()
+        } else {
+            league.league_name
+        };
+        let season = if league.season.trim().is_empty() {
+            "-".to_string()
+        } else {
+            league.season
+        };
+        if league_name == "Main league" && season == "-" && stats.is_empty() {
+            None
+        } else {
+            Some(PlayerLeagueStats {
+                league_name,
+                season,
+                stats,
+            })
+        }
     });
 
     let season_top_items = parsed
@@ -1732,8 +1751,11 @@ struct PlayerInfoValue {
 
 #[derive(Debug, Deserialize)]
 struct PlayerLeague {
-    #[serde(rename = "leagueName")]
+    // This object is not stable: sometimes FotMob returns only `{ "stats": null }`.
+    // Keep these fields lenient so deserialization doesn't fail the entire player payload.
+    #[serde(rename = "leagueName", default)]
     league_name: String,
+    #[serde(default)]
     season: String,
     #[serde(default, deserialize_with = "vec_or_default")]
     stats: Vec<PlayerStatValue>,

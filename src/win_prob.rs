@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::state::{
-    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, PlayerSlot, RoleCategory,
-    TeamAnalysis, WinProbRow,
+    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, PlayerSlot,
+    PredictionExplain, PredictionExtras, RoleCategory, TeamAnalysis, WinProbRow,
 };
 
 const GOALS_TOTAL_BASE: f64 = 2.60;
@@ -20,6 +20,15 @@ pub fn compute_win_prob(
     players: &HashMap<u32, PlayerDetail>,
     analysis: &[TeamAnalysis],
 ) -> WinProbRow {
+    compute_win_prob_explainable(summary, detail, players, analysis).0
+}
+
+pub fn compute_win_prob_explainable(
+    summary: &MatchSummary,
+    detail: Option<&MatchDetail>,
+    players: &HashMap<u32, PlayerDetail>,
+    analysis: &[TeamAnalysis],
+) -> (WinProbRow, Option<PredictionExtras>) {
     // If the match is effectively final, just reflect the result.
     if !summary.is_live && summary.minute >= 90 {
         let (p_home, p_draw, p_away) = if summary.score_home > summary.score_away {
@@ -29,18 +38,26 @@ pub fn compute_win_prob(
         } else {
             (0.0, 100.0, 0.0)
         };
-        return WinProbRow {
-            p_home,
-            p_draw,
-            p_away,
-            delta_home: 0.0,
-            quality: ModelQuality::Basic,
-            confidence: 95,
-        };
+        return (
+            WinProbRow {
+                p_home,
+                p_draw,
+                p_away,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 95,
+            },
+            None,
+        );
     }
 
+    let is_prematch = !summary.is_live
+        && summary.minute == 0
+        && summary.score_home == 0
+        && summary.score_away == 0;
+
     let lineup = detail.and_then(|d| d.lineups.as_ref());
-    let (lineup_s_home, lineup_s_away) = if let Some(lineups) = lineup {
+    let (lineup_home, lineup_away) = if let Some(lineups) = lineup {
         if lineups.sides.is_empty() {
             (None, None)
         } else {
@@ -90,8 +107,8 @@ pub fn compute_win_prob(
             let away_side = away_side.or_else(|| lineups.sides.get(1));
             match (home_side, away_side) {
                 (Some(h), Some(a)) => (
-                    lineup_team_strength(h, players),
-                    lineup_team_strength(a, players),
+                    lineup_strength_and_coverage(h, players),
+                    lineup_strength_and_coverage(a, players),
                 ),
                 _ => (None, None),
             }
@@ -100,25 +117,60 @@ pub fn compute_win_prob(
         (None, None)
     };
 
-    let track = lineup_s_home.is_some() && lineup_s_away.is_some();
+    let home_label = detail
+        .and_then(|d| d.home_team.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&summary.home);
+    let away_label = detail
+        .and_then(|d| d.away_team.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&summary.away);
 
-    // If we don't have enough lineup+player coverage, fall back to TeamAnalysis (FIFA points/rank)
-    // for a conservative pre-match prior.
-    let (s_home, s_away) = if track {
-        (lineup_s_home.unwrap_or(0.0), lineup_s_away.unwrap_or(0.0))
-    } else {
-        let home_label = detail
-            .and_then(|d| d.home_team.as_deref())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&summary.home);
-        let away_label = detail
-            .and_then(|d| d.away_team.as_deref())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&summary.away);
+    let (s_home_analysis, src_home) = team_strength_from_analysis(home_label, analysis)
+        .map(|(s, src)| (Some(s), Some(src)))
+        .unwrap_or((None, None));
+    let (s_away_analysis, src_away) = team_strength_from_analysis(away_label, analysis)
+        .map(|(s, src)| (Some(s), Some(src)))
+        .unwrap_or((None, None));
 
+    let lineup_s_home = lineup_home.map(|(s, _)| s);
+    let lineup_s_away = lineup_away.map(|(s, _)| s);
+    let lineup_cov_home = lineup_home.map(|(_, c)| c);
+    let lineup_cov_away = lineup_away.map(|(_, c)| c);
+
+    let have_lineups = lineup_s_home.is_some() && lineup_s_away.is_some();
+
+    // Pre-match: blend analysis prior with lineup prior based on usable starter coverage.
+    // Live: preserve the existing behavior (lineup if available, otherwise analysis).
+    let (s_home, s_away, blend_w_lineup) = if is_prematch {
+        let a_home = s_home_analysis.unwrap_or(0.0);
+        let a_away = s_away_analysis.unwrap_or(0.0);
+        if have_lineups {
+            let cov_min = lineup_cov_home
+                .unwrap_or(0.0)
+                .min(lineup_cov_away.unwrap_or(0.0));
+            let w = clamp_f32((cov_min - 0.25) / 0.50, 0.0, 1.0);
+            let l_home = lineup_s_home.unwrap_or(0.0);
+            let l_away = lineup_s_away.unwrap_or(0.0);
+            (
+                (1.0 - w as f64) * a_home + (w as f64) * l_home,
+                (1.0 - w as f64) * a_away + (w as f64) * l_away,
+                w,
+            )
+        } else {
+            (a_home, a_away, 0.0)
+        }
+    } else if have_lineups {
         (
-            team_strength_from_analysis(home_label, analysis).unwrap_or(0.0),
-            team_strength_from_analysis(away_label, analysis).unwrap_or(0.0),
+            lineup_s_home.unwrap_or(0.0),
+            lineup_s_away.unwrap_or(0.0),
+            1.0,
+        )
+    } else {
+        (
+            s_home_analysis.unwrap_or(0.0),
+            s_away_analysis.unwrap_or(0.0),
+            0.0,
         )
     };
 
@@ -139,7 +191,8 @@ pub fn compute_win_prob(
     let t = minute / effective_total;
     let remain = (effective_total - minute) / effective_total;
 
-    let mut quality = if track {
+    let track_used = have_lineups && blend_w_lineup > 0.10;
+    let mut quality = if track_used {
         ModelQuality::Track
     } else {
         ModelQuality::Basic
@@ -253,16 +306,46 @@ pub fn compute_win_prob(
     let residue = 100.0 - (p_home + p_draw + p_away);
     p_draw += residue;
 
-    let confidence = compute_confidence(t, xg_present, track);
+    let confidence = if is_prematch {
+        compute_confidence_prematch(
+            s_home_analysis.is_some() && s_away_analysis.is_some(),
+            blend_w_lineup,
+        )
+    } else {
+        compute_confidence(t, xg_present, track_used)
+    };
 
-    WinProbRow {
+    let win = WinProbRow {
         p_home,
         p_draw,
         p_away,
         delta_home: 0.0,
         quality,
         confidence,
-    }
+    };
+
+    let extras = if is_prematch {
+        Some(build_prematch_extras(
+            lambda_home_pre,
+            lambda_away_pre,
+            s_home_analysis,
+            s_away_analysis,
+            src_home,
+            src_away,
+            lineup_s_home,
+            lineup_s_away,
+            lineup_cov_home,
+            lineup_cov_away,
+            blend_w_lineup,
+            win.p_home,
+            win.p_draw,
+            win.p_away,
+        ))
+    } else {
+        None
+    };
+
+    (win, extras)
 }
 
 fn compute_confidence(t: f64, xg_present: bool, track: bool) -> u8 {
@@ -274,6 +357,121 @@ fn compute_confidence(t: f64, xg_present: bool, track: bool) -> u8 {
         score += 10.0;
     }
     clamp(score, 5.0, 95.0).round() as u8
+}
+
+fn compute_confidence_prematch(analysis_ok: bool, blend_w_lineup: f32) -> u8 {
+    let mut score = 35.0;
+    if analysis_ok {
+        score += 20.0;
+    }
+    score += 40.0 * (blend_w_lineup as f64);
+    clamp(score, 5.0, 95.0).round() as u8
+}
+
+fn build_prematch_extras(
+    lambda_home_pre: f64,
+    lambda_away_pre: f64,
+    s_home_analysis: Option<f64>,
+    s_away_analysis: Option<f64>,
+    src_home: Option<&'static str>,
+    src_away: Option<&'static str>,
+    s_home_lineup: Option<f64>,
+    s_away_lineup: Option<f64>,
+    cov_home: Option<f32>,
+    cov_away: Option<f32>,
+    blend_w_lineup: f32,
+    p_home_final: f32,
+    p_draw_final: f32,
+    p_away_final: f32,
+) -> PredictionExtras {
+    let (p_home_baseline, p_draw_baseline, p_away_baseline) =
+        prematch_probs_from_params(0.0, 0.0, 0.0);
+    let (p_home_ha, p_draw_ha, p_away_ha) = prematch_probs_from_params(HOME_ADV_GOALS, 0.0, 0.0);
+    let (p_home_analysis_p, p_draw_analysis_p, p_away_analysis_p) = prematch_probs_from_params(
+        HOME_ADV_GOALS,
+        s_home_analysis.unwrap_or(0.0),
+        s_away_analysis.unwrap_or(0.0),
+    );
+
+    let mut signals: Vec<String> = vec!["HA".to_string()];
+    let analysis_ok = s_home_analysis.is_some() && s_away_analysis.is_some();
+    if analysis_ok {
+        let points =
+            matches!(src_home, Some("FIFA_POINTS")) || matches!(src_away, Some("FIFA_POINTS"));
+        if points {
+            signals.push("FIFA_POINTS".to_string());
+        } else {
+            signals.push("FIFA_RANK".to_string());
+        }
+    }
+    if let (Some(ch), Some(ca)) = (cov_home, cov_away) {
+        let n_h = (ch * 11.0).round().clamp(0.0, 11.0) as u8;
+        let n_a = (ca * 11.0).round().clamp(0.0, 11.0) as u8;
+        signals.push(format!("LINEUP_{n_h}/11_{n_a}/11"));
+    }
+
+    let pp_home_adv = p_home_ha - p_home_baseline;
+    let pp_analysis = p_home_analysis_p - p_home_ha;
+    let pp_lineup = p_home_final - p_home_analysis_p;
+
+    PredictionExtras {
+        prematch_only: true,
+        lambda_home_pre,
+        lambda_away_pre,
+        s_home_analysis,
+        s_away_analysis,
+        s_home_lineup,
+        s_away_lineup,
+        lineup_coverage_home: cov_home,
+        lineup_coverage_away: cov_away,
+        blend_w_lineup,
+        explain: PredictionExplain {
+            p_home_baseline,
+            p_draw_baseline,
+            p_away_baseline,
+            p_home_ha,
+            p_draw_ha,
+            p_away_ha,
+            p_home_analysis: p_home_analysis_p,
+            p_draw_analysis: p_draw_analysis_p,
+            p_away_analysis: p_away_analysis_p,
+            p_home_final,
+            p_draw_final,
+            p_away_final,
+            pp_home_adv,
+            pp_analysis,
+            pp_lineup,
+            signals,
+        },
+    }
+}
+
+fn prematch_probs_from_params(home_adv_goals: f64, s_home: f64, s_away: f64) -> (f32, f32, f32) {
+    let diff = home_adv_goals + K_STRENGTH * (s_home - s_away);
+    let lambda_home = clamp((GOALS_TOTAL_BASE / 2.0) + (diff / 2.0), 0.20, 3.80);
+    let lambda_away = clamp((GOALS_TOTAL_BASE / 2.0) - (diff / 2.0), 0.20, 3.80);
+    probs_percent(0, 0, lambda_home, lambda_away)
+}
+
+fn probs_percent(
+    score_home: u32,
+    score_away: u32,
+    lambda_home_rem: f64,
+    lambda_away_rem: f64,
+) -> (f32, f32, f32) {
+    let (p_home, p_draw, p_away) =
+        outcome_probs_poisson(score_home, score_away, lambda_home_rem, lambda_away_rem, 10);
+
+    let mut p_home = (p_home * 100.0) as f32;
+    let mut p_draw = (p_draw * 100.0) as f32;
+    let mut p_away = (p_away * 100.0) as f32;
+    let sum = (p_home + p_draw + p_away).max(0.0001);
+    p_home = p_home / sum * 100.0;
+    p_draw = p_draw / sum * 100.0;
+    p_away = p_away / sum * 100.0;
+    let residue = 100.0 - (p_home + p_draw + p_away);
+    p_draw += residue;
+    (p_home, p_draw, p_away)
 }
 
 fn estimate_total_minutes(summary: &MatchSummary, detail: Option<&MatchDetail>) -> f64 {
@@ -637,7 +835,10 @@ fn normalize_team_key(raw: &str) -> String {
         .join(" ")
 }
 
-fn team_strength_from_analysis(label: &str, analysis: &[TeamAnalysis]) -> Option<f64> {
+fn team_strength_from_analysis(
+    label: &str,
+    analysis: &[TeamAnalysis],
+) -> Option<(f64, &'static str)> {
     let key = normalize_team_key(label);
     if key.is_empty() {
         return None;
@@ -654,14 +855,14 @@ fn team_strength_from_analysis(label: &str, analysis: &[TeamAnalysis]) -> Option
     None
 }
 
-fn analysis_team_strength(t: &TeamAnalysis) -> Option<f64> {
+fn analysis_team_strength(t: &TeamAnalysis) -> Option<(f64, &'static str)> {
     if let Some(points) = t.fifa_points {
         let s = (points as f64 - 1600.0) / 400.0;
-        return Some(clamp(s, -1.0, 1.0));
+        return Some((clamp(s, -1.0, 1.0), "FIFA_POINTS"));
     }
     if let Some(rank) = t.fifa_rank {
         let s = (100.0 - rank as f64) / 100.0;
-        return Some(clamp(s, -1.0, 1.0));
+        return Some((clamp(s, -1.0, 1.0), "FIFA_RANK"));
     }
     None
 }
@@ -1079,7 +1280,10 @@ fn iter_all_stats<'a>(detail: &'a PlayerDetail) -> impl Iterator<Item = StatCand
     perf.chain(all_comp).chain(top).chain(main).chain(groups)
 }
 
-fn lineup_team_strength(lineup: &LineupSide, players: &HashMap<u32, PlayerDetail>) -> Option<f64> {
+fn lineup_strength_and_coverage(
+    lineup: &LineupSide,
+    players: &HashMap<u32, PlayerDetail>,
+) -> Option<(f64, f32)> {
     let mut sum = 0.0;
     let mut cnt = 0usize;
 
@@ -1102,8 +1306,10 @@ fn lineup_team_strength(lineup: &LineupSide, players: &HashMap<u32, PlayerDetail
         cnt += 1;
     }
 
-    if cnt >= 7 {
-        Some(clamp(sum / cnt as f64, -1.0, 1.0))
+    if cnt >= 3 {
+        let strength = clamp(sum / cnt as f64, -1.0, 1.0);
+        let coverage = (cnt as f32 / 11.0).clamp(0.0, 1.0);
+        Some((strength, coverage))
     } else {
         None
     }
@@ -1228,6 +1434,10 @@ fn poisson_pmf(lambda: f64, max_k: u32) -> Vec<f64> {
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    v.max(lo).min(hi)
+}
+
+fn clamp_f32(v: f32, lo: f32, hi: f32) -> f32 {
     v.max(lo).min(hi)
 }
 
@@ -1749,5 +1959,77 @@ mod tests {
         assert!((win_with_lineups.p_home - win_no_lineups.p_home).abs() < 0.001);
         assert!((win_with_lineups.p_draw - win_no_lineups.p_draw).abs() < 0.001);
         assert!((win_with_lineups.p_away - win_no_lineups.p_away).abs() < 0.001);
+    }
+
+    #[test]
+    fn prematch_extras_explainability_is_consistent() {
+        let summary = MatchSummary {
+            id: "m".to_string(),
+            league_id: None,
+            league_name: "L".to_string(),
+            home: "Home".to_string(),
+            away: "Away".to_string(),
+            minute: 0,
+            score_home: 0,
+            score_away: 0,
+            win: WinProbRow {
+                p_home: 0.0,
+                p_draw: 0.0,
+                p_away: 0.0,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 0,
+            },
+            is_live: false,
+        };
+
+        let analysis = vec![
+            TeamAnalysis {
+                id: 1,
+                name: "Home".to_string(),
+                confed: crate::state::Confederation::UEFA,
+                host: false,
+                fifa_rank: None,
+                fifa_points: Some(1800),
+                fifa_updated: None,
+            },
+            TeamAnalysis {
+                id: 2,
+                name: "Away".to_string(),
+                confed: crate::state::Confederation::UEFA,
+                host: false,
+                fifa_rank: None,
+                fifa_points: Some(1500),
+                fifa_updated: None,
+            },
+        ];
+
+        let (win, extras) =
+            compute_win_prob_explainable(&summary, None, &HashMap::new(), &analysis);
+        let extras = extras.expect("prematch extras");
+
+        assert!((extras.explain.p_home_final - win.p_home).abs() < 0.01);
+        assert!((extras.explain.p_draw_final - win.p_draw).abs() < 0.01);
+        assert!((extras.explain.p_away_final - win.p_away).abs() < 0.01);
+
+        let total_shift = extras.explain.p_home_final - extras.explain.p_home_baseline;
+        let contrib_sum =
+            extras.explain.pp_home_adv + extras.explain.pp_analysis + extras.explain.pp_lineup;
+        assert!((total_shift - contrib_sum).abs() < 0.05);
+
+        // All snapshots should remain normalized.
+        let sum_baseline = extras.explain.p_home_baseline
+            + extras.explain.p_draw_baseline
+            + extras.explain.p_away_baseline;
+        let sum_ha = extras.explain.p_home_ha + extras.explain.p_draw_ha + extras.explain.p_away_ha;
+        let sum_analysis = extras.explain.p_home_analysis
+            + extras.explain.p_draw_analysis
+            + extras.explain.p_away_analysis;
+        let sum_final =
+            extras.explain.p_home_final + extras.explain.p_draw_final + extras.explain.p_away_final;
+        assert!((sum_baseline - 100.0).abs() < 0.01);
+        assert!((sum_ha - 100.0).abs() < 0.01);
+        assert!((sum_analysis - 100.0).abs() < 0.01);
+        assert!((sum_final - 100.0).abs() < 0.01);
     }
 }

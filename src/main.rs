@@ -535,6 +535,13 @@ impl App {
                     self.request_analysis_export(true);
                 }
             }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                if matches!(self.state.screen, Screen::Terminal { .. })
+                    && self.state.terminal_focus == TerminalFocus::Prediction
+                {
+                    self.state.prediction_show_why = !self.state.prediction_show_why;
+                }
+            }
             KeyCode::Char('?') => self.state.help_overlay = !self.state.help_overlay,
             _ => {}
         }
@@ -4552,6 +4559,8 @@ fn prediction_detail_text(state: &AppState) -> String {
         return "No prediction data".to_string();
     };
 
+    let extras = state.prediction_extras.get(&m.id);
+
     let mut lines = Vec::new();
     if m.is_live {
         lines.push("Now:".to_string());
@@ -4586,6 +4595,69 @@ fn prediction_detail_text(state: &AppState) -> String {
         lines.push(format!("{}: {:.1}%", m.away, m.win.p_away));
         lines.push(format!("Model: {}", quality_label(m.win.quality)));
         lines.push(format!("Confidence: {}", m.win.confidence));
+    }
+
+    if let Some(ex) = extras {
+        lines.push(String::new());
+        lines.push("Explain (pre-match):".to_string());
+        lines.push(format!(
+            "Contrib (home win pp): HA {:+.1}, FIFA {:+.1}, Lineup {:+.1}",
+            ex.explain.pp_home_adv, ex.explain.pp_analysis, ex.explain.pp_lineup
+        ));
+        lines.push(format!(
+            "Baseline: H{:.1} D{:.1} A{:.1}",
+            ex.explain.p_home_baseline, ex.explain.p_draw_baseline, ex.explain.p_away_baseline
+        ));
+        lines.push(format!(
+            "HA only:  H{:.1} D{:.1} A{:.1}",
+            ex.explain.p_home_ha, ex.explain.p_draw_ha, ex.explain.p_away_ha
+        ));
+        lines.push(format!(
+            "Analysis: H{:.1} D{:.1} A{:.1}",
+            ex.explain.p_home_analysis, ex.explain.p_draw_analysis, ex.explain.p_away_analysis
+        ));
+        lines.push(format!(
+            "Final:    H{:.1} D{:.1} A{:.1}",
+            ex.explain.p_home_final, ex.explain.p_draw_final, ex.explain.p_away_final
+        ));
+
+        lines.push(String::new());
+        lines.push(format!(
+            "xG prior (pre): {:.2} - {:.2}",
+            ex.lambda_home_pre, ex.lambda_away_pre
+        ));
+        let a_h = ex
+            .s_home_analysis
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let a_a = ex
+            .s_away_analysis
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!("Analysis strength: home={a_h} away={a_a}"));
+
+        let l_h = ex
+            .s_home_lineup
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let l_a = ex
+            .s_away_lineup
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!("Lineup strength:  home={l_h} away={l_a}"));
+        if let (Some(ch), Some(ca)) = (ex.lineup_coverage_home, ex.lineup_coverage_away) {
+            lines.push(format!(
+                "Lineup: {:.0}/11 vs {:.0}/11, w={:.2}",
+                (ch * 11.0).round().clamp(0.0, 11.0),
+                (ca * 11.0).round().clamp(0.0, 11.0),
+                ex.blend_w_lineup
+            ));
+        } else {
+            lines.push(format!("Lineup: none, w={:.2}", ex.blend_w_lineup));
+        }
+        if !ex.explain.signals.is_empty() {
+            lines.push(format!("Signals: {}", ex.explain.signals.join(", ")));
+        }
     }
 
     if let Some(history) = state.win_prob_history.get(&m.id)
@@ -4733,7 +4805,7 @@ fn prediction_text(state: &AppState) -> String {
                 } else {
                     "Pre (locks at kickoff):"
                 };
-                format!(
+                let mut out = format!(
                     "{} H{:>3.0} D{:>3.0} A{:>3.0}\nModel: {} ({}%)",
                     label,
                     m.win.p_home,
@@ -4741,7 +4813,16 @@ fn prediction_text(state: &AppState) -> String {
                     m.win.p_away,
                     quality_label(m.win.quality),
                     m.win.confidence
-                )
+                );
+                if state.prediction_show_why {
+                    if let Some(ex) = state.prediction_extras.get(&m.id) {
+                        out.push_str(&format!(
+                            "\nWhy: HA{:+.1} ANA{:+.1} LU{:+.1}",
+                            ex.explain.pp_home_adv, ex.explain.pp_analysis, ex.explain.pp_lineup
+                        ));
+                    }
+                }
+                out
             }
         }
         None => "No prediction data".to_string(),
@@ -5083,6 +5164,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
                 ("Tab", "Cycle focus"),
                 ("Enter", "Open focused detail"),
                 ("Arrows", "Scroll detail view"),
+                ("x", "Toggle prediction explain"),
             ],
         ),
         (

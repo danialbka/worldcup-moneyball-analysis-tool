@@ -29,6 +29,17 @@ fn player_detail_parses_percentiles() {
 }
 
 #[test]
+fn player_detail_parses_when_main_league_is_partial() {
+    // FotMob sometimes returns `{ "mainLeague": { "stats": null } }` (missing leagueName/season).
+    // That should not fail player parsing.
+    let raw = r#"{"id":1,"name":"Test Player","mainLeague":{"stats":null}}"#;
+    let detail = parse_player_detail_json(raw).expect("partial mainLeague should parse");
+    assert_eq!(detail.id, 1);
+    assert_eq!(detail.name, "Test Player");
+    assert!(detail.main_league.is_none());
+}
+
+#[test]
 fn rankings_weighted_and_explainable() {
     let team = TeamAnalysis {
         id: 1,
