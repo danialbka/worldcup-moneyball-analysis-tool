@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::time::SystemTime;
 
@@ -327,6 +327,8 @@ pub struct AppState {
     pub rankings_dirty: bool,
     pub rankings_fetched_at: Option<SystemTime>,
     pub win_prob_history: HashMap<String, Vec<f32>>,
+    pub prematch_win: HashMap<String, WinProbRow>,
+    pub prematch_locked: HashSet<String>,
     pub placeholder_match_enabled: bool,
     pub squad: Vec<SquadPlayer>,
     pub squad_selected: usize,
@@ -426,6 +428,8 @@ impl AppState {
             rankings_dirty: false,
             rankings_fetched_at: None,
             win_prob_history: HashMap::with_capacity(16),
+            prematch_win: HashMap::with_capacity(16),
+            prematch_locked: HashSet::new(),
             placeholder_match_enabled: false,
             squad: Vec::new(),
             squad_selected: 0,
@@ -450,7 +454,22 @@ impl AppState {
     }
 
     pub fn selected_match_id(&self) -> Option<String> {
-        self.selected_match().map(|m| m.id.clone())
+        match &self.screen {
+            // Terminal can be pinned to an id that isn't currently in `self.matches`
+            // (e.g. when opening an upcoming fixture from Pulse).
+            Screen::Terminal { match_id: Some(id) } => Some(id.clone()),
+            Screen::Pulse if self.pulse_view == PulseView::Live => {
+                let rows = self.pulse_live_rows();
+                match rows.get(self.selected) {
+                    Some(PulseLiveRow::Match(idx)) => self.matches.get(*idx).map(|m| m.id.clone()),
+                    Some(PulseLiveRow::Upcoming(idx)) => {
+                        self.upcoming.get(*idx).map(|u| u.id.clone())
+                    }
+                    None => None,
+                }
+            }
+            _ => self.selected_match().map(|m| m.id.clone()),
+        }
     }
 
     pub fn selected_match(&self) -> Option<&MatchSummary> {
@@ -512,6 +531,8 @@ impl AppState {
         self.rankings_dirty = false;
         self.rankings_fetched_at = None;
         self.win_prob_history.clear();
+        self.prematch_win.clear();
+        self.prematch_locked.clear();
         self.placeholder_match_enabled = false;
         self.matches.clear();
         self.match_detail.clear();
@@ -598,7 +619,9 @@ impl AppState {
                 let rows = self.pulse_live_rows();
                 if let Some(pos) = rows.iter().position(|row| match row {
                     PulseLiveRow::Match(idx) => self.matches.get(*idx).is_some_and(|m| m.id == id),
-                    PulseLiveRow::Upcoming(_) => false,
+                    PulseLiveRow::Upcoming(idx) => {
+                        self.upcoming.get(*idx).is_some_and(|u| u.id == id)
+                    }
                 }) {
                     self.selected = pos;
                     return;
@@ -722,6 +745,11 @@ impl AppState {
             ka.cmp(kb)
         });
         for idx in upcoming_indices {
+            if let Some(u) = self.upcoming.get(idx) {
+                if !seen_ids.insert(u.id.as_str()) {
+                    continue;
+                }
+            }
             rows.push(PulseLiveRow::Upcoming(idx));
         }
 
@@ -1491,6 +1519,22 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 && selected_id.is_none();
             let preserved_selected = state.selected;
             for summary in &mut matches {
+                if !state.prematch_locked.contains(&summary.id) {
+                    // If this match just flipped from not-started into live, freeze the pre-match
+                    // snapshot for later reference.
+                    if let Some(prev) = state.matches.iter().find(|m| m.id == summary.id)
+                        && !prev.is_live
+                        && prev.minute == 0
+                        && (summary.is_live || summary.minute > 0)
+                    {
+                        state
+                            .prematch_win
+                            .entry(summary.id.clone())
+                            .or_insert_with(|| prev.win.clone());
+                        state.prematch_locked.insert(summary.id.clone());
+                    }
+                }
+
                 let detail = state.match_detail.get(&summary.id);
                 summary.win = win_prob::compute_win_prob(
                     summary,
@@ -1502,6 +1546,34 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     summary.win.delta_home = summary.win.p_home - existing.win.p_home;
                 } else {
                     summary.win.delta_home = 0.0;
+                }
+
+                // Keep updating the "pre-match" preview until kickoff, then freeze it.
+                if !state.prematch_locked.contains(&summary.id)
+                    && !summary.is_live
+                    && summary.minute == 0
+                {
+                    state
+                        .prematch_win
+                        .insert(summary.id.clone(), summary.win.clone());
+                } else if (summary.is_live || summary.minute > 0)
+                    && !state.prematch_locked.contains(&summary.id)
+                {
+                    // If we missed the not-started window, synthesize a pre-match snapshot once.
+                    let mut pre = summary.clone();
+                    pre.is_live = false;
+                    pre.minute = 0;
+                    pre.score_home = 0;
+                    pre.score_away = 0;
+                    let detail = state.match_detail.get(&pre.id);
+                    let prematch = win_prob::compute_win_prob(
+                        &pre,
+                        detail,
+                        &state.combined_player_cache,
+                        &state.analysis,
+                    );
+                    state.prematch_win.entry(pre.id.clone()).or_insert(prematch);
+                    state.prematch_locked.insert(pre.id);
                 }
             }
             if state.placeholder_match_enabled
@@ -1527,6 +1599,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             }
         }
         Delta::SetMatchDetails { id, detail } => {
+            let match_id = id.clone();
             state.match_detail.insert(id.clone(), detail);
             state
                 .match_detail_cached_at
@@ -1551,13 +1624,49 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     entry.drain(..drain_count);
                 }
             }
+
+            // Update pre-match preview if not started and not locked yet.
+            if let Some(m) = state.matches.iter().find(|m| m.id == match_id)
+                && !state.prematch_locked.contains(&match_id)
+                && !m.is_live
+                && m.minute == 0
+            {
+                state.prematch_win.insert(match_id, m.win.clone());
+            }
         }
         Delta::SetMatchDetailsBasic { id, detail } => {
+            let match_id = id.clone();
             let mut detail = detail;
             if let Some(existing) = state.match_detail.get(&id) {
                 // Basic fetches should not clobber commentary a user explicitly fetched.
                 if detail.commentary.is_empty() && !existing.commentary.is_empty() {
                     detail.commentary = existing.commentary.clone();
+                    detail.commentary_error = existing.commentary_error.clone();
+                }
+
+                // Basic fetches may be partial; avoid clobbering richer detail when fields are empty.
+                if detail.home_team.is_none() && existing.home_team.is_some() {
+                    detail.home_team = existing.home_team.clone();
+                }
+                if detail.away_team.is_none() && existing.away_team.is_some() {
+                    detail.away_team = existing.away_team.clone();
+                }
+                if detail.events.is_empty() && !existing.events.is_empty() {
+                    detail.events = existing.events.clone();
+                }
+                if detail.stats.is_empty() && !existing.stats.is_empty() {
+                    detail.stats = existing.stats.clone();
+                }
+                if detail.lineups.is_none() && existing.lineups.is_some() {
+                    detail.lineups = existing.lineups.clone();
+                }
+
+                // Preserve existing commentary error if the new response is silent and we still
+                // have no commentary content.
+                if detail.commentary.is_empty()
+                    && detail.commentary_error.is_none()
+                    && existing.commentary_error.is_some()
+                {
                     detail.commentary_error = existing.commentary_error.clone();
                 }
             }
@@ -1586,6 +1695,15 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     entry.drain(..drain_count);
                 }
             }
+
+            // Update pre-match preview if not started and not locked yet.
+            if let Some(m) = state.matches.iter().find(|m| m.id == match_id)
+                && !state.prematch_locked.contains(&match_id)
+                && !m.is_live
+                && m.minute == 0
+            {
+                state.prematch_win.insert(match_id, m.win.clone());
+            }
         }
         Delta::UpsertMatch(mut summary) => {
             let match_id = summary.id.clone();
@@ -1598,12 +1716,52 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             );
             let home_prob = summary.win.p_home;
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == summary.id) {
+                // Freeze pre-match snapshot when the match starts.
+                if !state.prematch_locked.contains(&match_id)
+                    && !existing.is_live
+                    && existing.minute == 0
+                    && (summary.is_live || summary.minute > 0)
+                {
+                    state
+                        .prematch_win
+                        .entry(match_id.clone())
+                        .or_insert_with(|| existing.win.clone());
+                    state.prematch_locked.insert(match_id.clone());
+                }
                 summary.win.delta_home = summary.win.p_home - existing.win.p_home;
                 *existing = summary;
             } else {
                 summary.win.delta_home = 0.0;
                 state.matches.push(summary);
             }
+
+            // Keep updating the "pre-match" preview until kickoff, then freeze it.
+            if let Some(m) = state.matches.iter().find(|m| m.id == match_id) {
+                if !state.prematch_locked.contains(&match_id) && !m.is_live && m.minute == 0 {
+                    state.prematch_win.insert(match_id.clone(), m.win.clone());
+                } else if (m.is_live || m.minute > 0) && !state.prematch_locked.contains(&match_id)
+                {
+                    // If we missed the not-started window, synthesize a pre-match snapshot once.
+                    let mut pre = m.clone();
+                    pre.is_live = false;
+                    pre.minute = 0;
+                    pre.score_home = 0;
+                    pre.score_away = 0;
+                    let detail = state.match_detail.get(&match_id);
+                    let prematch = win_prob::compute_win_prob(
+                        &pre,
+                        detail,
+                        &state.combined_player_cache,
+                        &state.analysis,
+                    );
+                    state
+                        .prematch_win
+                        .entry(match_id.clone())
+                        .or_insert(prematch);
+                    state.prematch_locked.insert(match_id.clone());
+                }
+            }
+
             let entry = state.win_prob_history.entry(match_id).or_default();
             entry.push(home_prob);
             if entry.len() > 40 {
@@ -1617,6 +1775,41 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.upcoming_cached_at = Some(SystemTime::now());
             // Always reset scroll so new data is immediately visible when the user visits Upcoming.
             state.upcoming_scroll = 0;
+
+            // Seed/refresh pre-match previews for upcoming fixtures (until kickoff).
+            // These will be replaced with richer predictions once matchDetails are fetched.
+            for u in &state.upcoming {
+                if state.prematch_locked.contains(&u.id) {
+                    continue;
+                }
+                let summary = MatchSummary {
+                    id: u.id.clone(),
+                    league_id: u.league_id,
+                    league_name: u.league_name.clone(),
+                    home: u.home.clone(),
+                    away: u.away.clone(),
+                    minute: 0,
+                    score_home: 0,
+                    score_away: 0,
+                    win: WinProbRow {
+                        p_home: 0.0,
+                        p_draw: 0.0,
+                        p_away: 0.0,
+                        delta_home: 0.0,
+                        quality: ModelQuality::Basic,
+                        confidence: 0,
+                    },
+                    is_live: false,
+                };
+                let detail = state.match_detail.get(&u.id);
+                let prematch = win_prob::compute_win_prob(
+                    &summary,
+                    detail,
+                    &state.combined_player_cache,
+                    &state.analysis,
+                );
+                state.prematch_win.insert(u.id.clone(), prematch);
+            }
         }
         Delta::AddEvent { id, event } => {
             let entry = state.match_detail.entry(id).or_insert_with(|| MatchDetail {

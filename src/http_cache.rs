@@ -49,17 +49,41 @@ pub fn fetch_json_cached(
     url: &str,
     extra_headers: &[(&str, &str)],
 ) -> Result<String> {
+    fetch_json_cached_inner(client, url, extra_headers, false)
+}
+
+/// Like [`fetch_json_cached`], but always revalidates against the origin even if the cached
+/// response is still within its `Cache-Control: max-age` window.
+///
+/// This is useful for "live" endpoints (e.g. live-text commentary) where the server may set a
+/// non-trivial max-age that would otherwise make the UI appear stale.
+pub fn fetch_json_cached_revalidate(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<String> {
+    fetch_json_cached_inner(client, url, extra_headers, true)
+}
+
+fn fetch_json_cached_inner(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(&str, &str)],
+    force_revalidate: bool,
+) -> Result<String> {
     let cached_entry = {
-        let mut guard = CACHE.lock().expect("http cache lock poisoned");
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let state = guard.get_or_insert_with(load_cache_state);
         state.cache.entries.get(url).cloned()
     };
 
-    if let Some(entry) = cached_entry.as_ref() {
-        if let Some(max_age) = entry.max_age_secs {
-            let now = system_time_to_secs(SystemTime::now()).unwrap_or_default();
-            if now.saturating_sub(entry.fetched_at) < max_age {
-                return Ok(entry.body.clone());
+    if !force_revalidate {
+        if let Some(entry) = cached_entry.as_ref() {
+            if let Some(max_age) = entry.max_age_secs {
+                let now = system_time_to_secs(SystemTime::now()).unwrap_or_default();
+                if now.saturating_sub(entry.fetched_at) < max_age {
+                    return Ok(entry.body.clone());
+                }
             }
         }
     }
@@ -156,7 +180,7 @@ fn parse_cache_control_max_age(raw: &str) -> Option<u64> {
 }
 
 fn refresh_cache_entry(key: &str, entry: CacheEntry) {
-    let mut guard = CACHE.lock().expect("http cache lock poisoned");
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let state = guard.get_or_insert_with(load_cache_state);
     state.cache.version = CACHE_VERSION;
     state.cache.entries.insert(key.to_string(), entry);
@@ -165,7 +189,7 @@ fn refresh_cache_entry(key: &str, entry: CacheEntry) {
 }
 
 pub fn flush_http_cache() {
-    let mut guard = CACHE.lock().expect("http cache lock poisoned");
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(state) = guard.as_mut() else {
         return;
     };

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::http_cache::fetch_json_cached;
+use crate::http_cache::{fetch_json_cached, fetch_json_cached_revalidate};
 use crate::http_client::http_client;
 use crate::state::{
     CommentaryEntry, Event, EventKind, LineupSide, MatchDetail, MatchLineups, PlayerSlot, StatRow,
@@ -199,7 +199,9 @@ fn fetch_ltc_commentary(
         url_encode(&ltc_url),
         url_encode(&serde_json::to_string(&teams).unwrap_or_else(|_| "[]".to_string()))
     );
-    let body = fetch_json_cached(client, &url, &[]).context("ltc request failed")?;
+    // Live-text commentary is time-sensitive; always revalidate against origin rather than
+    // trusting potentially-long `Cache-Control: max-age` windows.
+    let body = fetch_json_cached_revalidate(client, &url, &[]).context("ltc request failed")?;
     parse_ltc_json(&body, &teams)
 }
 

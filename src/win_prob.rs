@@ -127,7 +127,15 @@ pub fn compute_win_prob(
     let lambda_away_pre = clamp((GOALS_TOTAL_BASE / 2.0) - (diff / 2.0), 0.20, 3.80);
 
     let effective_total = estimate_total_minutes(summary, detail);
-    let minute = (summary.minute as f64).max(1.0).min(effective_total);
+    let minute_raw = summary.minute as f64;
+    // Allow true pre-match predictions at minute 0 for non-live fixtures.
+    // For live games, clamp to >= 1 to avoid overreacting to missing/0' timestamps.
+    let minute = if summary.is_live {
+        minute_raw.max(1.0)
+    } else {
+        minute_raw.max(0.0)
+    }
+    .min(effective_total);
     let t = minute / effective_total;
     let remain = (effective_total - minute) / effective_total;
 

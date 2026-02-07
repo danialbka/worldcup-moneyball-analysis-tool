@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -29,6 +29,17 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
             .clamp(1, 64);
         let inflight_match_details: Arc<Mutex<HashSet<String>>> =
             Arc::new(Mutex::new(HashSet::new()));
+        // If a "full" details request comes in while a basic fetch is inflight, we can't run it
+        // immediately. Record it and let the basic job upgrade into a full fetch on completion.
+        let upgrade_match_details: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+
+        // When inflight capacity is exhausted, queue requests instead of dropping them.
+        // Dedup by fixture id to avoid unbounded growth when a key is held down.
+        let mut pending_full: VecDeque<String> = VecDeque::new();
+        let mut pending_full_set: HashSet<String> = HashSet::new();
+        let mut pending_basic: VecDeque<String> = VecDeque::new();
+        let mut pending_basic_set: HashSet<String> = HashSet::new();
 
         let allowed_league_ids = allowed_league_ids();
 
@@ -138,14 +149,27 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     ProviderCommand::FetchMatchDetails { fixture_id } => {
+                        let already_inflight = {
+                            let inflight = inflight_match_details
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            inflight.contains(&fixture_id)
+                        };
+                        if already_inflight {
+                            let mut upgrade = upgrade_match_details
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            upgrade.insert(fixture_id.clone());
+                            continue;
+                        }
                         {
                             let mut inflight = inflight_match_details
                                 .lock()
-                                .expect("inflight match details lock poisoned");
-                            if inflight.contains(&fixture_id) {
-                                continue;
-                            }
+                                .unwrap_or_else(|e| e.into_inner());
                             if inflight.len() >= inflight_max {
+                                if pending_full_set.insert(fixture_id.clone()) {
+                                    pending_full.push_back(fixture_id.clone());
+                                }
                                 continue;
                             }
                             inflight.insert(fixture_id.clone());
@@ -154,8 +178,16 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                         let tx = tx.clone();
                         let lineups = lineups.clone();
                         let inflight_match_details = inflight_match_details.clone();
+                        let upgrade_match_details = upgrade_match_details.clone();
                         let fixture_id = fixture_id.clone();
                         let job = move || {
+                            // Any previously-requested upgrade is satisfied by this full fetch.
+                            {
+                                let mut upgrade = upgrade_match_details
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                upgrade.remove(&fixture_id);
+                            }
                             match upcoming_fetch::fetch_match_details_from_fotmob(&fixture_id) {
                                 Ok(detail) => {
                                     let _ = tx.send(Delta::SetMatchDetails {
@@ -186,7 +218,7 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                             }
                             let mut inflight = inflight_match_details
                                 .lock()
-                                .expect("inflight match details lock poisoned");
+                                .unwrap_or_else(|e| e.into_inner());
                             inflight.remove(&fixture_id);
                         };
 
@@ -200,11 +232,14 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                         {
                             let mut inflight = inflight_match_details
                                 .lock()
-                                .expect("inflight match details lock poisoned");
+                                .unwrap_or_else(|e| e.into_inner());
                             if inflight.contains(&fixture_id) {
                                 continue;
                             }
                             if inflight.len() >= inflight_max {
+                                if pending_basic_set.insert(fixture_id.clone()) {
+                                    pending_basic.push_back(fixture_id.clone());
+                                }
                                 continue;
                             }
                             inflight.insert(fixture_id.clone());
@@ -212,6 +247,7 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
 
                         let tx = tx.clone();
                         let inflight_match_details = inflight_match_details.clone();
+                        let upgrade_match_details = upgrade_match_details.clone();
                         let job = move || {
                             match upcoming_fetch::fetch_match_details_basic_from_fotmob(&fixture_id)
                             {
@@ -227,9 +263,34 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                     )));
                                 }
                             }
+
+                            // If a full fetch was requested while this basic job was inflight,
+                            // run it now (in the same slot) so the UI doesn't miss commentary.
+                            let upgrade_to_full = {
+                                let mut upgrade = upgrade_match_details
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                upgrade.remove(&fixture_id)
+                            };
+                            if upgrade_to_full {
+                                match upcoming_fetch::fetch_match_details_from_fotmob(&fixture_id) {
+                                    Ok(detail) => {
+                                        let _ = tx.send(Delta::SetMatchDetails {
+                                            id: fixture_id.clone(),
+                                            detail,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        let _ = tx.send(Delta::Log(format!(
+                                            "[WARN] Match details upgrade error: {fixture_id}: {err}"
+                                        )));
+                                    }
+                                }
+                            }
+
                             let mut inflight = inflight_match_details
                                 .lock()
-                                .expect("inflight match details lock poisoned");
+                                .unwrap_or_else(|e| e.into_inner());
                             inflight.remove(&fixture_id);
                         };
 
@@ -408,7 +469,9 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                                             .send(Delta::CachePlayerDetail(detail));
                                                     }
                                                     Err(err) => {
-                                                        let mut guard = errors_ref.lock().unwrap();
+                                                        let mut guard = errors_ref
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
                                                         guard.push(format!(
                                                             "player detail {} ({}): {err}",
                                                             player.name, player.id
@@ -430,7 +493,8 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                         });
                                     }
                                     Err(err) => {
-                                        let mut guard = errors.lock().unwrap();
+                                        let mut guard =
+                                            errors.lock().unwrap_or_else(|e| e.into_inner());
                                         guard.push(format!(
                                             "squad {} ({}): {err}",
                                             team.name, team.id
@@ -516,7 +580,9 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                                             .send(Delta::CachePlayerDetail(detail));
                                                     }
                                                     Err(err) => {
-                                                        let mut guard = errors_ref.lock().unwrap();
+                                                        let mut guard = errors_ref
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
                                                         guard.push(format!(
                                                             "player detail {} ({}): {err}",
                                                             player.name, player.id
@@ -538,7 +604,8 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                         });
                                     }
                                     Err(err) => {
-                                        let mut guard = errors.lock().unwrap();
+                                        let mut guard =
+                                            errors.lock().unwrap_or_else(|e| e.into_inner());
                                         guard.push(format!("squad {team_id}: {err}"));
                                         let current_val =
                                             current.fetch_add(1, Ordering::SeqCst) + 1;
@@ -570,7 +637,9 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                                 tx_players.send(Delta::CachePlayerDetail(detail));
                                         }
                                         Err(err) => {
-                                            let mut guard = errors_ref.lock().unwrap();
+                                            let mut guard = errors_ref
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
                                             guard.push(format!("player detail {player_id}: {err}"));
                                         }
                                     }
@@ -662,7 +731,8 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                             let _ = tx.send(Delta::CachePlayerDetail(detail));
                                         }
                                         Err(err) => {
-                                            let mut guard = errors.lock().unwrap();
+                                            let mut guard =
+                                                errors.lock().unwrap_or_else(|e| e.into_inner());
                                             guard.push(format!(
                                                 "prefetch player {player_id}: {err}"
                                             ));
@@ -743,6 +813,192 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                 }
                             }
                         });
+                    }
+                }
+            }
+
+            // Drain pending detail requests when capacity is available.
+            // Prefer full requests (commentary) over basic requests.
+            loop {
+                let can_start_more = {
+                    let inflight = inflight_match_details
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    inflight.len() < inflight_max
+                };
+                if !can_start_more {
+                    break;
+                }
+
+                let next = if let Some(id) = pending_full.pop_front() {
+                    pending_full_set.remove(&id);
+                    Some((true, id))
+                } else if let Some(id) = pending_basic.pop_front() {
+                    pending_basic_set.remove(&id);
+                    Some((false, id))
+                } else {
+                    None
+                };
+                let Some((is_full, fixture_id)) = next else {
+                    break;
+                };
+
+                if is_full {
+                    // Re-run the same inflight/upgrade checks as the command handler.
+                    let mut should_start = false;
+                    let already_inflight = {
+                        let inflight = inflight_match_details
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        inflight.contains(&fixture_id)
+                    };
+                    if already_inflight {
+                        let mut upgrade = upgrade_match_details
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        upgrade.insert(fixture_id.clone());
+                    } else {
+                        let mut inflight = inflight_match_details
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if inflight.len() < inflight_max {
+                            inflight.insert(fixture_id.clone());
+                            should_start = true;
+                        } else {
+                            // Capacity vanished; put it back and stop trying this tick.
+                            pending_full.push_front(fixture_id.clone());
+                            pending_full_set.insert(fixture_id);
+                            break;
+                        }
+                    }
+
+                    if !should_start {
+                        continue;
+                    }
+
+                    let tx = tx.clone();
+                    let lineups = lineups.clone();
+                    let inflight_match_details = inflight_match_details.clone();
+                    let upgrade_match_details = upgrade_match_details.clone();
+                    let fixture_id = fixture_id.clone();
+                    let job = move || {
+                        {
+                            let mut upgrade = upgrade_match_details
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            upgrade.remove(&fixture_id);
+                        }
+                        match upcoming_fetch::fetch_match_details_from_fotmob(&fixture_id) {
+                            Ok(detail) => {
+                                let _ = tx.send(Delta::SetMatchDetails {
+                                    id: fixture_id.clone(),
+                                    detail,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(Delta::Log(format!("[WARN] Match details error: {err}")));
+                                if let Some(lineups) = lineups.get(&fixture_id) {
+                                    let detail = MatchDetail {
+                                        home_team: None,
+                                        away_team: None,
+                                        events: Vec::new(),
+                                        commentary: Vec::new(),
+                                        commentary_error: None,
+                                        lineups: Some(lineups.clone()),
+                                        stats: Vec::new(),
+                                    };
+                                    let _ = tx.send(Delta::SetMatchDetails {
+                                        id: fixture_id.clone(),
+                                        detail,
+                                    });
+                                }
+                            }
+                        }
+                        let mut inflight = inflight_match_details
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        inflight.remove(&fixture_id);
+                    };
+
+                    if let Some(pool) = pool.as_ref() {
+                        pool.spawn(job);
+                    } else {
+                        std::thread::spawn(job);
+                    }
+                } else {
+                    let mut should_start = false;
+                    {
+                        let mut inflight = inflight_match_details
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if inflight.contains(&fixture_id) {
+                            // Already inflight; basic request is satisfied by existing job.
+                        } else if inflight.len() < inflight_max {
+                            inflight.insert(fixture_id.clone());
+                            should_start = true;
+                        } else {
+                            pending_basic.push_front(fixture_id.clone());
+                            pending_basic_set.insert(fixture_id);
+                            break;
+                        }
+                    }
+
+                    if !should_start {
+                        continue;
+                    }
+
+                    let tx = tx.clone();
+                    let inflight_match_details = inflight_match_details.clone();
+                    let upgrade_match_details = upgrade_match_details.clone();
+                    let fixture_id = fixture_id.clone();
+                    let job = move || {
+                        match upcoming_fetch::fetch_match_details_basic_from_fotmob(&fixture_id) {
+                            Ok(detail) => {
+                                let _ = tx.send(Delta::SetMatchDetailsBasic {
+                                    id: fixture_id.clone(),
+                                    detail,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Delta::Log(format!(
+                                    "[WARN] Match details basic error: {fixture_id}: {err}"
+                                )));
+                            }
+                        }
+
+                        let upgrade_to_full = {
+                            let mut upgrade = upgrade_match_details
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            upgrade.remove(&fixture_id)
+                        };
+                        if upgrade_to_full {
+                            match upcoming_fetch::fetch_match_details_from_fotmob(&fixture_id) {
+                                Ok(detail) => {
+                                    let _ = tx.send(Delta::SetMatchDetails {
+                                        id: fixture_id.clone(),
+                                        detail,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = tx.send(Delta::Log(format!(
+                                        "[WARN] Match details upgrade error: {fixture_id}: {err}"
+                                    )));
+                                }
+                            }
+                        }
+
+                        let mut inflight = inflight_match_details
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        inflight.remove(&fixture_id);
+                    };
+
+                    if let Some(pool) = pool.as_ref() {
+                        pool.spawn(job);
+                    } else {
+                        std::thread::spawn(job);
                     }
                 }
             }

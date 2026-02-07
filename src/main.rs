@@ -34,6 +34,7 @@ struct App {
     last_upcoming_refresh: Instant,
     upcoming_cache_ttl: Duration,
     detail_refresh: Duration,
+    commentary_refresh: Duration,
     last_detail_refresh: HashMap<String, Instant>,
     detail_request_throttle: Duration,
     hover_prefetch_delay: Duration,
@@ -75,6 +76,11 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(60)
             .max(30);
+        let commentary_refresh = std::env::var("COMMENTARY_POLL_SECS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(15)
+            .clamp(5, 120);
         let detail_request_throttle = std::env::var("DETAILS_THROTTLE_SECS")
             .ok()
             .and_then(|val| val.parse::<u64>().ok())
@@ -119,6 +125,7 @@ impl App {
             last_upcoming_refresh: Instant::now(),
             upcoming_cache_ttl: Duration::from_secs(upcoming_cache_ttl),
             detail_refresh: Duration::from_secs(detail_refresh),
+            commentary_refresh: Duration::from_secs(commentary_refresh),
             last_detail_refresh: HashMap::new(),
             detail_request_throttle: Duration::from_secs(detail_request_throttle),
             hover_prefetch_delay: Duration::from_millis(hover_prefetch_delay_ms),
@@ -425,14 +432,27 @@ impl App {
                         self.recompute_rankings_from_cache();
                     }
                 } else if matches!(self.state.screen, Screen::Terminal { .. }) {
+                    let prev = self.state.terminal_focus;
                     self.state.cycle_terminal_focus_next();
+                    if prev != self.state.terminal_focus
+                        && self.state.terminal_focus == TerminalFocus::Commentary
+                    {
+                        // Ensure commentary is populated when the user focuses it.
+                        self.request_match_details(false);
+                    }
                 } else if matches!(self.state.screen, Screen::PlayerDetail) {
                     self.state.cycle_player_detail_section_next();
                 }
             }
             KeyCode::BackTab => {
                 if matches!(self.state.screen, Screen::Terminal { .. }) {
+                    let prev = self.state.terminal_focus;
                     self.state.cycle_terminal_focus_prev();
+                    if prev != self.state.terminal_focus
+                        && self.state.terminal_focus == TerminalFocus::Commentary
+                    {
+                        self.request_match_details(false);
+                    }
                 } else if matches!(self.state.screen, Screen::PlayerDetail) {
                     self.state.cycle_player_detail_section_prev();
                 }
@@ -1214,6 +1234,30 @@ impl App {
         const PREFETCH_LIMIT: usize = 3;
         let mut sent = 0usize;
 
+        // If the user is actively looking at commentary, refresh full match details for the
+        // selected live match. Background refreshes otherwise use the basic endpoint to reduce
+        // load.
+        let wants_commentary = matches!(self.state.screen, Screen::Terminal { .. })
+            && (self.state.terminal_focus == TerminalFocus::Commentary
+                || self.state.terminal_detail == Some(TerminalFocus::Commentary));
+        let selected_live_id = self
+            .state
+            .selected_match()
+            .filter(|m| m.is_live && m.id != PLACEHOLDER_MATCH_ID)
+            .map(|m| m.id.clone());
+        if wants_commentary {
+            if let Some(match_id) = selected_live_id.as_deref() {
+                let last = self.last_detail_refresh.get(match_id);
+                let should_fetch = last
+                    .map(|t| t.elapsed() >= self.commentary_refresh)
+                    .unwrap_or(true);
+                if should_fetch {
+                    self.request_match_details_for(match_id, false);
+                    sent += 1;
+                }
+            }
+        }
+
         // Refresh live match stats/lineups periodically.
         let live_ids: Vec<String> = self
             .state
@@ -1227,6 +1271,9 @@ impl App {
         for match_id in live_ids {
             if sent >= PREFETCH_LIMIT {
                 return;
+            }
+            if wants_commentary && selected_live_id.as_deref() == Some(match_id.as_str()) {
+                continue;
             }
             let last = self.last_detail_refresh.get(&match_id);
             let should_fetch = last
@@ -3825,9 +3872,14 @@ fn on_black(mut style: Style) -> Style {
 }
 
 fn render_cell_text(frame: &mut Frame, area: Rect, text: &str, style: Style) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let max_y = area.y.saturating_add(area.height.saturating_sub(1));
+    let text_y = area.y.saturating_add(area.height / 2).min(max_y);
     let text_area = Rect {
         x: area.x,
-        y: area.y + (area.height / 2),
+        y: text_y,
         width: area.width,
         height: 1,
     };
@@ -4500,14 +4552,41 @@ fn prediction_detail_text(state: &AppState) -> String {
         return "No prediction data".to_string();
     };
 
-    let mut lines = vec![
-        format!("{}: {:.1}%", m.home, m.win.p_home),
-        format!("Draw: {:.1}%", m.win.p_draw),
-        format!("{}: {:.1}%", m.away, m.win.p_away),
-        format!("Delta home: {:+.1}", m.win.delta_home),
-        format!("Model: {}", quality_label(m.win.quality)),
-        format!("Confidence: {}", m.win.confidence),
-    ];
+    let mut lines = Vec::new();
+    if m.is_live {
+        lines.push("Now:".to_string());
+        lines.push(format!("{}: {:.1}%", m.home, m.win.p_home));
+        lines.push(format!("Draw: {:.1}%", m.win.p_draw));
+        lines.push(format!("{}: {:.1}%", m.away, m.win.p_away));
+        lines.push(format!("Delta home: {:+.1}", m.win.delta_home));
+        lines.push(format!("Model: {}", quality_label(m.win.quality)));
+        lines.push(format!("Confidence: {}", m.win.confidence));
+
+        if let Some(pre) = state.prematch_win.get(&m.id) {
+            lines.push(String::new());
+            lines.push("Pre-match snapshot:".to_string());
+            lines.push(format!("{}: {:.1}%", m.home, pre.p_home));
+            lines.push(format!("Draw: {:.1}%", pre.p_draw));
+            lines.push(format!("{}: {:.1}%", m.away, pre.p_away));
+            lines.push(format!("Model: {}", quality_label(pre.quality)));
+            lines.push(format!("Confidence: {}", pre.confidence));
+        } else {
+            lines.push(String::new());
+            lines.push("Pre-match snapshot: (not captured)".to_string());
+        }
+    } else {
+        let label = if state.prematch_locked.contains(&m.id) {
+            "Pre-match snapshot:"
+        } else {
+            "Pre-match (preview, locks at kickoff):"
+        };
+        lines.push(label.to_string());
+        lines.push(format!("{}: {:.1}%", m.home, m.win.p_home));
+        lines.push(format!("Draw: {:.1}%", m.win.p_draw));
+        lines.push(format!("{}: {:.1}%", m.away, m.win.p_away));
+        lines.push(format!("Model: {}", quality_label(m.win.quality)));
+        lines.push(format!("Confidence: {}", m.win.confidence));
+    }
 
     if let Some(history) = state.win_prob_history.get(&m.id)
         && !history.is_empty()
@@ -4623,14 +4702,48 @@ fn match_detail_overview_text(state: &AppState) -> String {
 
 fn prediction_text(state: &AppState) -> String {
     match state.selected_match() {
-        Some(m) => format!(
-            "W: {:>4.0}%\nD: {:>4.0}%\nA: {:>4.0}%\nDelta: {:+.1}\nModel: {}",
-            m.win.p_home,
-            m.win.p_draw,
-            m.win.p_away,
-            m.win.delta_home,
-            quality_label(m.win.quality)
-        ),
+        Some(m) => {
+            if m.is_live {
+                let pre = state.prematch_win.get(&m.id);
+                let pre_line = pre
+                    .map(|w| {
+                        format!(
+                            "Pre: H{:>3.0} D{:>3.0} A{:>3.0} ({}, {}%)",
+                            w.p_home,
+                            w.p_draw,
+                            w.p_away,
+                            quality_label(w.quality),
+                            w.confidence
+                        )
+                    })
+                    .unwrap_or_else(|| "Pre: (not captured)".to_string());
+                format!(
+                    "Now: H{:>3.0} D{:>3.0} A{:>3.0} ({}, {}%)\n{}\nΔH: {:+.1}",
+                    m.win.p_home,
+                    m.win.p_draw,
+                    m.win.p_away,
+                    quality_label(m.win.quality),
+                    m.win.confidence,
+                    pre_line,
+                    m.win.delta_home
+                )
+            } else {
+                let label = if state.prematch_locked.contains(&m.id) {
+                    "Pre:"
+                } else {
+                    "Pre (locks at kickoff):"
+                };
+                format!(
+                    "{} H{:>3.0} D{:>3.0} A{:>3.0}\nModel: {} ({}%)",
+                    label,
+                    m.win.p_home,
+                    m.win.p_draw,
+                    m.win.p_away,
+                    quality_label(m.win.quality),
+                    m.win.confidence
+                )
+            }
+        }
         None => "No prediction data".to_string(),
     }
 }
