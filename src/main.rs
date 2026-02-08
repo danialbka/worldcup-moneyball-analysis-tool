@@ -3519,7 +3519,7 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             .map(|r| format!("{r:.2}"))
             .unwrap_or_else(|| "-".to_string());
         let text = format!(
-            "{rank:>3}. {:<24} {:<18} Score {}  R {rating}  Club {}",
+            "{rank:>3}. {:<24} {:<18} Score {}  R {rating}  Nation {}",
             truncate(&entry.player_name, 24),
             truncate(&entry.team_name, 18),
             score_text,
@@ -3788,7 +3788,7 @@ fn render_squad_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
         }
     ));
     lines.push(format!(
-        "Club: {}",
+        "Nation: {}",
         if p.club.is_empty() {
             "-"
         } else {
@@ -3846,7 +3846,7 @@ fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
     render_vseparator(frame, cols[3], sep_style);
     render_cell_text(frame, cols[4], "Role", style);
     render_vseparator(frame, cols[5], sep_style);
-    render_cell_text(frame, cols[6], "Club", style);
+    render_cell_text(frame, cols[6], "Nation", style);
     render_vseparator(frame, cols[7], sep_style);
     render_cell_text(frame, cols[8], "Age", style);
     render_vseparator(frame, cols[9], sep_style);
