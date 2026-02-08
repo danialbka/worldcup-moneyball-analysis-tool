@@ -134,6 +134,30 @@ fn fetch_json_cached_inner(
         return Err(anyhow::anyhow!("http {}: {}", status, body));
     }
 
+    // FotMob occasionally serves non-JSON bodies (e.g. transient HTML) with 200 OK.
+    // Since callers expect JSON, avoid caching obviously non-JSON responses.
+    let looks_like_json = {
+        let t = body
+            .trim_start()
+            .strip_prefix('\u{feff}')
+            .unwrap_or(body.trim_start());
+        t.starts_with('{') || t.starts_with('[') || t.starts_with("null")
+    };
+    if !looks_like_json {
+        let snippet = body
+            .trim()
+            .replace('\n', " ")
+            .replace('\r', " ")
+            .chars()
+            .take(220)
+            .collect::<String>();
+        return Err(anyhow::anyhow!(
+            "unexpected non-json response ({}): {}",
+            status,
+            snippet
+        ));
+    }
+
     let etag = headers
         .get(ETAG)
         .and_then(|v| v.to_str().ok())

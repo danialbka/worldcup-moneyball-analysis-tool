@@ -1,3 +1,4 @@
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::time::SystemTime;
@@ -296,6 +297,20 @@ pub enum PulseLiveRow {
     Upcoming(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PulseCacheKey {
+    matches_version: u64,
+    upcoming_version: u64,
+    league_mode: LeagueMode,
+}
+
+#[derive(Debug, Default, Clone)]
+struct PulseDerivedCache {
+    key: Option<PulseCacheKey>,
+    filtered_indices: Vec<usize>,
+    pulse_live_rows: Vec<PulseLiveRow>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelQuality {
@@ -355,7 +370,9 @@ pub struct AppState {
     pub league_cl_ids: Vec<u32>,
     pub league_wc_ids: Vec<u32>,
     pub matches: Vec<MatchSummary>,
+    matches_version: u64,
     pub upcoming: Vec<UpcomingMatch>,
+    upcoming_version: u64,
     pub upcoming_scroll: u16,
     pub upcoming_cached_at: Option<SystemTime>,
     pub match_detail: HashMap<String, MatchDetail>,
@@ -387,6 +404,8 @@ pub struct AppState {
     pub rankings_fetched_at: Option<SystemTime>,
     // Set when cached player/squad/analysis changes should trigger a win-probability refresh.
     pub predictions_dirty: bool,
+    // Monotonic generation number used to ignore stale background prediction results.
+    pub prediction_compute_generation: u64,
     // League-specific pre-match calibration (derived from historical fixtures).
     pub league_params: HashMap<u32, LeagueParams>,
     // League-specific Elo ratings keyed by team id.
@@ -417,6 +436,8 @@ pub struct AppState {
     pub terminal_focus: TerminalFocus,
     pub terminal_detail: Option<TerminalFocus>,
     pub terminal_detail_scroll: u16,
+
+    pulse_cache: RefCell<PulseDerivedCache>,
 }
 
 impl Default for AppState {
@@ -466,7 +487,9 @@ impl AppState {
             league_cl_ids,
             league_wc_ids,
             matches: Vec::with_capacity(32),
+            matches_version: 0,
             upcoming: Vec::with_capacity(32),
+            upcoming_version: 0,
             upcoming_scroll: 0,
             upcoming_cached_at: None,
             match_detail: HashMap::with_capacity(16),
@@ -497,6 +520,7 @@ impl AppState {
             rankings_dirty: false,
             rankings_fetched_at: None,
             predictions_dirty: false,
+            prediction_compute_generation: 0,
             league_params,
             elo_by_league: HashMap::with_capacity(8),
             prediction_model_fetched_at: HashMap::with_capacity(8),
@@ -525,7 +549,100 @@ impl AppState {
             terminal_focus: TerminalFocus::MatchList,
             terminal_detail: None,
             terminal_detail_scroll: 0,
+
+            pulse_cache: RefCell::new(PulseDerivedCache::default()),
         }
+    }
+
+    fn bump_matches_version(&mut self) {
+        self.matches_version = self.matches_version.wrapping_add(1);
+    }
+
+    fn bump_upcoming_version(&mut self) {
+        self.upcoming_version = self.upcoming_version.wrapping_add(1);
+    }
+
+    fn ensure_pulse_cache(&self) {
+        let key = PulseCacheKey {
+            matches_version: self.matches_version,
+            upcoming_version: self.upcoming_version,
+            league_mode: self.league_mode,
+        };
+
+        {
+            let cache = self.pulse_cache.borrow();
+            if cache.key == Some(key) {
+                return;
+            }
+        }
+
+        let Ok(mut cache) = self.pulse_cache.try_borrow_mut() else {
+            // Best-effort: prefer stale cache over panicking during rendering.
+            return;
+        };
+        if cache.key == Some(key) {
+            return;
+        }
+
+        let filtered_indices: Vec<usize> = self
+            .matches
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| self.matches_mode(m))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let mut seen_ids: HashSet<&str> = HashSet::new();
+        let mut rows: Vec<PulseLiveRow> = Vec::with_capacity(filtered_indices.len() + 16);
+        for idx in &filtered_indices {
+            if let Some(m) = self.matches.get(*idx) {
+                seen_ids.insert(m.id.as_str());
+                rows.push(PulseLiveRow::Match(*idx));
+            }
+        }
+
+        let mut upcoming_indices: Vec<usize> = self
+            .upcoming
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| self.upcoming_matches_mode(u) && !seen_ids.contains(u.id.as_str()))
+            .map(|(idx, _)| idx)
+            .collect();
+        upcoming_indices.sort_by(|a, b| {
+            let ka = self
+                .upcoming
+                .get(*a)
+                .map(|u| u.kickoff.as_str())
+                .unwrap_or("");
+            let kb = self
+                .upcoming
+                .get(*b)
+                .map(|u| u.kickoff.as_str())
+                .unwrap_or("");
+            ka.cmp(kb)
+        });
+        for idx in upcoming_indices {
+            if let Some(u) = self.upcoming.get(idx) {
+                if !seen_ids.insert(u.id.as_str()) {
+                    continue;
+                }
+            }
+            rows.push(PulseLiveRow::Upcoming(idx));
+        }
+
+        cache.filtered_indices = filtered_indices;
+        cache.pulse_live_rows = rows;
+        cache.key = Some(key);
+    }
+
+    pub fn filtered_indices_ref(&self) -> Ref<'_, Vec<usize>> {
+        self.ensure_pulse_cache();
+        Ref::map(self.pulse_cache.borrow(), |c| &c.filtered_indices)
+    }
+
+    pub fn pulse_live_rows_ref(&self) -> Ref<'_, Vec<PulseLiveRow>> {
+        self.ensure_pulse_cache();
+        Ref::map(self.pulse_cache.borrow(), |c| &c.pulse_live_rows)
     }
 
     pub fn selected_match_id(&self) -> Option<String> {
@@ -534,11 +651,11 @@ impl AppState {
             // (e.g. when opening an upcoming fixture from Pulse).
             Screen::Terminal { match_id: Some(id) } => Some(id.clone()),
             Screen::Pulse if self.pulse_view == PulseView::Live => {
-                let rows = self.pulse_live_rows();
-                match rows.get(self.selected) {
-                    Some(PulseLiveRow::Match(idx)) => self.matches.get(*idx).map(|m| m.id.clone()),
+                let rows = self.pulse_live_rows_ref();
+                match rows.get(self.selected).copied() {
+                    Some(PulseLiveRow::Match(idx)) => self.matches.get(idx).map(|m| m.id.clone()),
                     Some(PulseLiveRow::Upcoming(idx)) => {
-                        self.upcoming.get(*idx).map(|u| u.id.clone())
+                        self.upcoming.get(idx).map(|u| u.id.clone())
                     }
                     None => None,
                 }
@@ -554,14 +671,14 @@ impl AppState {
                 if self.pulse_view != PulseView::Live {
                     return None;
                 }
-                let rows = self.pulse_live_rows();
-                match rows.get(self.selected) {
-                    Some(PulseLiveRow::Match(idx)) => self.matches.get(*idx),
+                let rows = self.pulse_live_rows_ref();
+                match rows.get(self.selected).copied() {
+                    Some(PulseLiveRow::Match(idx)) => self.matches.get(idx),
                     _ => None,
                 }
             }
             _ => {
-                let filtered = self.filtered_indices();
+                let filtered = self.filtered_indices_ref();
                 filtered
                     .get(self.selected)
                     .and_then(|idx| self.matches.get(*idx))
@@ -606,13 +723,17 @@ impl AppState {
         self.rankings_dirty = false;
         self.rankings_fetched_at = None;
         self.predictions_dirty = false;
+        self.prediction_compute_generation = 0;
         self.win_prob_history.clear();
         self.prematch_win.clear();
         self.prematch_locked.clear();
         self.placeholder_match_enabled = false;
         self.matches.clear();
+        self.bump_matches_version();
         self.match_detail.clear();
         self.match_detail_cached_at.clear();
+        self.upcoming.clear();
+        self.bump_upcoming_version();
         self.squad.clear();
         self.squad_selected = 0;
         self.squad_loading = false;
@@ -631,6 +752,7 @@ impl AppState {
         self.terminal_focus = TerminalFocus::MatchList;
         self.terminal_detail = None;
         self.terminal_detail_scroll = 0;
+        *self.pulse_cache.borrow_mut() = PulseDerivedCache::default();
         self.push_log(format!(
             "[INFO] League mode: {}",
             league_label(self.league_mode)
@@ -690,15 +812,22 @@ impl AppState {
             }),
         }
 
+        self.bump_matches_version();
+
         if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
             if let Some(id) = selected_id {
-                let rows = self.pulse_live_rows();
-                if let Some(pos) = rows.iter().position(|row| match row {
-                    PulseLiveRow::Match(idx) => self.matches.get(*idx).is_some_and(|m| m.id == id),
-                    PulseLiveRow::Upcoming(idx) => {
-                        self.upcoming.get(*idx).is_some_and(|u| u.id == id)
-                    }
-                }) {
+                let pos = {
+                    let rows = self.pulse_live_rows_ref();
+                    rows.iter().position(|row| match row {
+                        PulseLiveRow::Match(idx) => {
+                            self.matches.get(*idx).is_some_and(|m| m.id == id)
+                        }
+                        PulseLiveRow::Upcoming(idx) => {
+                            self.upcoming.get(*idx).is_some_and(|u| u.id == id)
+                        }
+                    })
+                };
+                if let Some(pos) = pos {
                     self.selected = pos;
                     return;
                 }
@@ -708,8 +837,11 @@ impl AppState {
         }
 
         if let Some(id) = selected_id {
-            let filtered = self.filtered_indices();
-            if let Some(pos) = filtered.iter().position(|idx| self.matches[*idx].id == id) {
+            let pos = {
+                let filtered = self.filtered_indices_ref();
+                filtered.iter().position(|idx| self.matches[*idx].id == id)
+            };
+            if let Some(pos) = pos {
                 self.selected = pos;
                 return;
             }
@@ -723,9 +855,9 @@ impl AppState {
             return;
         }
         let total = if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
-            self.pulse_live_rows().len()
+            self.pulse_live_rows_ref().len()
         } else {
-            self.filtered_indices().len()
+            self.filtered_indices_ref().len()
         };
         if total == 0 {
             self.selected = 0;
@@ -740,9 +872,9 @@ impl AppState {
             return;
         }
         let total = if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
-            self.pulse_live_rows().len()
+            self.pulse_live_rows_ref().len()
         } else {
-            self.filtered_indices().len()
+            self.filtered_indices_ref().len()
         };
         if total == 0 {
             self.selected = 0;
@@ -757,9 +889,9 @@ impl AppState {
 
     pub fn clamp_selection(&mut self) {
         let total = if matches!(self.screen, Screen::Pulse) && self.pulse_view == PulseView::Live {
-            self.pulse_live_rows().len()
+            self.pulse_live_rows_ref().len()
         } else {
-            self.filtered_indices().len()
+            self.filtered_indices_ref().len()
         };
         if total == 0 {
             self.selected = 0;
@@ -769,67 +901,20 @@ impl AppState {
     }
 
     pub fn filtered_indices(&self) -> Vec<usize> {
-        self.matches
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| self.matches_mode(m))
-            .map(|(idx, _)| idx)
-            .collect()
+        self.filtered_indices_ref().clone()
     }
 
     pub fn filtered_matches(&self) -> Vec<&MatchSummary> {
-        let indices = self.filtered_indices();
+        let indices = self.filtered_indices_ref();
         indices
-            .into_iter()
+            .iter()
+            .copied()
             .filter_map(|idx| self.matches.get(idx))
             .collect()
     }
 
     pub fn pulse_live_rows(&self) -> Vec<PulseLiveRow> {
-        use std::collections::HashSet;
-
-        // Keep match ordering as already sorted by `self.sort`.
-        let match_indices = self.filtered_indices();
-        let mut seen_ids: HashSet<&str> = HashSet::new();
-        let mut rows = Vec::new();
-        for idx in match_indices {
-            if let Some(m) = self.matches.get(idx) {
-                seen_ids.insert(m.id.as_str());
-                rows.push(PulseLiveRow::Match(idx));
-            }
-        }
-
-        // Upcoming appended (sorted by kickoff text), de-duped by fixture id.
-        let mut upcoming_indices: Vec<usize> = self
-            .upcoming
-            .iter()
-            .enumerate()
-            .filter(|(_, u)| self.upcoming_matches_mode(u) && !seen_ids.contains(u.id.as_str()))
-            .map(|(idx, _)| idx)
-            .collect();
-        upcoming_indices.sort_by(|a, b| {
-            let ka = self
-                .upcoming
-                .get(*a)
-                .map(|u| u.kickoff.as_str())
-                .unwrap_or("");
-            let kb = self
-                .upcoming
-                .get(*b)
-                .map(|u| u.kickoff.as_str())
-                .unwrap_or("");
-            ka.cmp(kb)
-        });
-        for idx in upcoming_indices {
-            if let Some(u) = self.upcoming.get(idx) {
-                if !seen_ids.insert(u.id.as_str()) {
-                    continue;
-                }
-            }
-            rows.push(PulseLiveRow::Upcoming(idx));
-        }
-
-        rows
+        self.pulse_live_rows_ref().clone()
     }
 
     pub fn filtered_upcoming(&self) -> Vec<&UpcomingMatch> {
@@ -1478,6 +1563,21 @@ pub enum EventKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct ComputedWin {
+    pub id: String,
+    pub win: WinProbRow,
+    pub extras: Option<PredictionExtras>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComputedPrematch {
+    pub id: String,
+    pub win: WinProbRow,
+    pub extras: Option<PredictionExtras>,
+    pub lock: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum Delta {
     SetMatches(Vec<MatchSummary>),
     SetMatchDetails {
@@ -1547,6 +1647,11 @@ pub enum Delta {
         recent_matches: usize,
         errors: usize,
     },
+    ComputedPredictions {
+        generation: u64,
+        wins: Vec<ComputedWin>,
+        prematch: Vec<ComputedPrematch>,
+    },
     Log(String),
 }
 
@@ -1607,83 +1712,20 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 && state.pulse_view == PulseView::Live
                 && selected_id.is_none();
             let preserved_selected = state.selected;
+
+            // Preserve previously computed win-prob rows/extras where possible; heavy recompute
+            // happens in the background prediction worker.
+            let mut prev_by_id: HashMap<&str, &MatchSummary> =
+                HashMap::with_capacity(state.matches.len());
+            for m in &state.matches {
+                prev_by_id.insert(m.id.as_str(), m);
+            }
             for summary in &mut matches {
-                if !state.prematch_locked.contains(&summary.id) {
-                    // If this match just flipped from not-started into live, freeze the pre-match
-                    // snapshot for later reference.
-                    if let Some(prev) = state.matches.iter().find(|m| m.id == summary.id)
-                        && !prev.is_live
-                        && prev.minute == 0
-                        && (summary.is_live || summary.minute > 0)
-                    {
-                        state
-                            .prematch_win
-                            .entry(summary.id.clone())
-                            .or_insert_with(|| prev.win.clone());
-                        state.prematch_locked.insert(summary.id.clone());
-                    }
-                }
-
-                let detail = state.match_detail.get(&summary.id);
-                let league_id = summary.league_id.unwrap_or(0);
-                let params = state.league_params.get(&league_id);
-                let elo = state.elo_by_league.get(&league_id);
-                let (win, extras) = win_prob::compute_win_prob_explainable(
-                    summary,
-                    detail,
-                    &state.combined_player_cache,
-                    &state.rankings_cache_squads,
-                    &state.analysis,
-                    params,
-                    elo,
-                );
-                summary.win = win;
-                if let Some(extras) = extras {
-                    state.prediction_extras.insert(summary.id.clone(), extras);
-                }
-                if let Some(existing) = state.matches.iter().find(|m| m.id == summary.id) {
-                    summary.win.delta_home = summary.win.p_home - existing.win.p_home;
-                } else {
-                    summary.win.delta_home = 0.0;
-                }
-
-                // Keep updating the "pre-match" preview until kickoff, then freeze it.
-                if !state.prematch_locked.contains(&summary.id)
-                    && !summary.is_live
-                    && summary.minute == 0
-                {
-                    state
-                        .prematch_win
-                        .insert(summary.id.clone(), summary.win.clone());
-                } else if (summary.is_live || summary.minute > 0)
-                    && !state.prematch_locked.contains(&summary.id)
-                {
-                    // If we missed the not-started window, synthesize a pre-match snapshot once.
-                    let mut pre = summary.clone();
-                    pre.is_live = false;
-                    pre.minute = 0;
-                    pre.score_home = 0;
-                    pre.score_away = 0;
-                    let detail = state.match_detail.get(&pre.id);
-                    let league_id = pre.league_id.unwrap_or(0);
-                    let params = state.league_params.get(&league_id);
-                    let elo = state.elo_by_league.get(&league_id);
-                    let (prematch, extras) = win_prob::compute_win_prob_explainable(
-                        &pre,
-                        detail,
-                        &state.combined_player_cache,
-                        &state.rankings_cache_squads,
-                        &state.analysis,
-                        params,
-                        elo,
-                    );
-                    if let Some(extras) = extras {
-                        state.prediction_extras.insert(pre.id.clone(), extras);
-                    }
-                    state.prematch_win.entry(pre.id.clone()).or_insert(prematch);
-                    state.prematch_locked.insert(pre.id);
+                if let Some(prev) = prev_by_id.get(summary.id.as_str()) {
+                    summary.win = prev.win.clone();
                 }
             }
+
             if state.placeholder_match_enabled
                 && !matches.iter().any(|m| m.id == PLACEHOLDER_MATCH_ID)
             {
@@ -1702,12 +1744,12 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.matches = matches;
             state.sort_matches_with_selected_id(selected_id);
             if preserve_index {
-                state.selected =
-                    preserved_selected.min(state.pulse_live_rows().len().saturating_sub(1));
+                let total = state.pulse_live_rows_ref().len();
+                state.selected = preserved_selected.min(total.saturating_sub(1));
             }
+            state.predictions_dirty = true;
         }
         Delta::SetMatchDetails { id, detail } => {
-            let match_id = id.clone();
             state.match_detail.insert(id.clone(), detail);
             state
                 .match_detail_cached_at
@@ -1720,48 +1762,9 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 ids.truncate(22);
                 queue_player_prefetch(&mut state.squad_prefetch_pending, ids);
             }
-
-            // Update prediction immediately when details (stats/lineups) arrive.
-            if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
-                let prev_p_home = existing.win.p_home;
-                let detail_ref = state.match_detail.get(&id);
-                let league_id = existing.league_id.unwrap_or(0);
-                let params = state.league_params.get(&league_id);
-                let elo = state.elo_by_league.get(&league_id);
-                let (win, extras) = win_prob::compute_win_prob_explainable(
-                    existing,
-                    detail_ref,
-                    &state.combined_player_cache,
-                    &state.rankings_cache_squads,
-                    &state.analysis,
-                    params,
-                    elo,
-                );
-                existing.win = win;
-                if let Some(extras) = extras {
-                    state.prediction_extras.insert(id.clone(), extras);
-                }
-                existing.win.delta_home = existing.win.p_home - prev_p_home;
-
-                let entry = state.win_prob_history.entry(id).or_default();
-                entry.push(existing.win.p_home);
-                if entry.len() > 40 {
-                    let drain_count = entry.len() - 40;
-                    entry.drain(..drain_count);
-                }
-            }
-
-            // Update pre-match preview if not started and not locked yet.
-            if let Some(m) = state.matches.iter().find(|m| m.id == match_id)
-                && !state.prematch_locked.contains(&match_id)
-                && !m.is_live
-                && m.minute == 0
-            {
-                state.prematch_win.insert(match_id, m.win.clone());
-            }
+            state.predictions_dirty = true;
         }
         Delta::SetMatchDetailsBasic { id, detail } => {
-            let match_id = id.clone();
             let mut detail = detail;
             if let Some(existing) = state.match_detail.get(&id) {
                 // Basic fetches should not clobber commentary a user explicitly fetched.
@@ -1807,67 +1810,12 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 ids.truncate(22);
                 queue_player_prefetch(&mut state.squad_prefetch_pending, ids);
             }
-
-            // Update prediction immediately when details (stats/lineups) arrive.
-            if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
-                let prev_p_home = existing.win.p_home;
-                let detail_ref = state.match_detail.get(&id);
-                let league_id = existing.league_id.unwrap_or(0);
-                let params = state.league_params.get(&league_id);
-                let elo = state.elo_by_league.get(&league_id);
-                let (win, extras) = win_prob::compute_win_prob_explainable(
-                    existing,
-                    detail_ref,
-                    &state.combined_player_cache,
-                    &state.rankings_cache_squads,
-                    &state.analysis,
-                    params,
-                    elo,
-                );
-                existing.win = win;
-                if let Some(extras) = extras {
-                    state.prediction_extras.insert(id.clone(), extras);
-                }
-                existing.win.delta_home = existing.win.p_home - prev_p_home;
-
-                let entry = state.win_prob_history.entry(id).or_default();
-                entry.push(existing.win.p_home);
-                if entry.len() > 40 {
-                    let drain_count = entry.len() - 40;
-                    entry.drain(..drain_count);
-                }
-            }
-
-            // Update pre-match preview if not started and not locked yet.
-            if let Some(m) = state.matches.iter().find(|m| m.id == match_id)
-                && !state.prematch_locked.contains(&match_id)
-                && !m.is_live
-                && m.minute == 0
-            {
-                state.prematch_win.insert(match_id, m.win.clone());
-            }
+            state.predictions_dirty = true;
         }
-        Delta::UpsertMatch(mut summary) => {
+        Delta::UpsertMatch(summary) => {
             let match_id = summary.id.clone();
-            let detail = state.match_detail.get(&match_id);
-            let league_id = summary.league_id.unwrap_or(0);
-            let params = state.league_params.get(&league_id);
-            let elo = state.elo_by_league.get(&league_id);
-            let (win, extras) = win_prob::compute_win_prob_explainable(
-                &summary,
-                detail,
-                &state.combined_player_cache,
-                &state.rankings_cache_squads,
-                &state.analysis,
-                params,
-                elo,
-            );
-            summary.win = win;
-            if let Some(extras) = extras {
-                state.prediction_extras.insert(match_id.clone(), extras);
-            }
-            let home_prob = summary.win.p_home;
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == summary.id) {
+                let prev_win = existing.win.clone();
                 // Freeze pre-match snapshot when the match starts.
                 if !state.prematch_locked.contains(&match_id)
                     && !existing.is_live
@@ -1877,111 +1825,26 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     state
                         .prematch_win
                         .entry(match_id.clone())
-                        .or_insert_with(|| existing.win.clone());
+                        .or_insert_with(|| prev_win.clone());
                     state.prematch_locked.insert(match_id.clone());
                 }
-                summary.win.delta_home = summary.win.p_home - existing.win.p_home;
                 *existing = summary;
+                existing.win = prev_win;
+                existing.win.delta_home = 0.0;
             } else {
-                summary.win.delta_home = 0.0;
                 state.matches.push(summary);
             }
-
-            // Keep updating the "pre-match" preview until kickoff, then freeze it.
-            if let Some(m) = state.matches.iter().find(|m| m.id == match_id) {
-                if !state.prematch_locked.contains(&match_id) && !m.is_live && m.minute == 0 {
-                    state.prematch_win.insert(match_id.clone(), m.win.clone());
-                } else if (m.is_live || m.minute > 0) && !state.prematch_locked.contains(&match_id)
-                {
-                    // If we missed the not-started window, synthesize a pre-match snapshot once.
-                    let mut pre = m.clone();
-                    pre.is_live = false;
-                    pre.minute = 0;
-                    pre.score_home = 0;
-                    pre.score_away = 0;
-                    let detail = state.match_detail.get(&match_id);
-                    let league_id = pre.league_id.unwrap_or(0);
-                    let params = state.league_params.get(&league_id);
-                    let elo = state.elo_by_league.get(&league_id);
-                    let (prematch, extras) = win_prob::compute_win_prob_explainable(
-                        &pre,
-                        detail,
-                        &state.combined_player_cache,
-                        &state.rankings_cache_squads,
-                        &state.analysis,
-                        params,
-                        elo,
-                    );
-                    if let Some(extras) = extras {
-                        state.prediction_extras.insert(match_id.clone(), extras);
-                    }
-                    state
-                        .prematch_win
-                        .entry(match_id.clone())
-                        .or_insert(prematch);
-                    state.prematch_locked.insert(match_id.clone());
-                }
-            }
-
-            let entry = state.win_prob_history.entry(match_id).or_default();
-            entry.push(home_prob);
-            if entry.len() > 40 {
-                let drain_count = entry.len() - 40;
-                entry.drain(..drain_count);
-            }
+            state.bump_matches_version();
             state.clamp_selection();
+            state.predictions_dirty = true;
         }
         Delta::SetUpcoming(fixtures) => {
             state.upcoming = fixtures;
+            state.bump_upcoming_version();
             state.upcoming_cached_at = Some(SystemTime::now());
             // Always reset scroll so new data is immediately visible when the user visits Upcoming.
             state.upcoming_scroll = 0;
-
-            // Seed/refresh pre-match previews for upcoming fixtures (until kickoff).
-            // These will be replaced with richer predictions once matchDetails are fetched.
-            for u in &state.upcoming {
-                if state.prematch_locked.contains(&u.id) {
-                    continue;
-                }
-                let summary = MatchSummary {
-                    id: u.id.clone(),
-                    league_id: u.league_id,
-                    league_name: u.league_name.clone(),
-                    home_team_id: u.home_team_id,
-                    away_team_id: u.away_team_id,
-                    home: u.home.clone(),
-                    away: u.away.clone(),
-                    minute: 0,
-                    score_home: 0,
-                    score_away: 0,
-                    win: WinProbRow {
-                        p_home: 0.0,
-                        p_draw: 0.0,
-                        p_away: 0.0,
-                        delta_home: 0.0,
-                        quality: ModelQuality::Basic,
-                        confidence: 0,
-                    },
-                    is_live: false,
-                };
-                let detail = state.match_detail.get(&u.id);
-                let league_id = summary.league_id.unwrap_or(0);
-                let params = state.league_params.get(&league_id);
-                let elo = state.elo_by_league.get(&league_id);
-                let (prematch, extras) = win_prob::compute_win_prob_explainable(
-                    &summary,
-                    detail,
-                    &state.combined_player_cache,
-                    &state.rankings_cache_squads,
-                    &state.analysis,
-                    params,
-                    elo,
-                );
-                if let Some(extras) = extras {
-                    state.prediction_extras.insert(u.id.clone(), extras);
-                }
-                state.prematch_win.insert(u.id.clone(), prematch);
-            }
+            state.predictions_dirty = true;
         }
         Delta::AddEvent { id, event } => {
             let entry = state.match_detail.entry(id).or_insert_with(|| MatchDetail {
@@ -2178,6 +2041,58 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.export.last_updated = Some(std::time::Instant::now());
             state.push_log(format!("[INFO] Export finished ({errors} errors)"));
         }
+        Delta::ComputedPredictions {
+            generation,
+            wins,
+            prematch,
+        } => {
+            if generation != state.prediction_compute_generation {
+                return;
+            }
+            let selected_id = state.selected_match_id();
+
+            for update in wins {
+                if let Some(existing) = state.matches.iter_mut().find(|m| m.id == update.id) {
+                    let prev_p_home = existing.win.p_home;
+                    existing.win = update.win;
+                    existing.win.delta_home = existing.win.p_home - prev_p_home;
+
+                    if existing.is_live {
+                        let entry = state
+                            .win_prob_history
+                            .entry(existing.id.clone())
+                            .or_default();
+                        entry.push(existing.win.p_home);
+                        if entry.len() > 40 {
+                            let drain_count = entry.len() - 40;
+                            entry.drain(..drain_count);
+                        }
+                    }
+                }
+                if let Some(extras) = update.extras {
+                    state.prediction_extras.insert(update.id, extras);
+                }
+            }
+
+            for pre in prematch {
+                if let Some(extras) = pre.extras {
+                    state.prediction_extras.insert(pre.id.clone(), extras);
+                }
+                if pre.lock {
+                    // Freeze pre-match snapshot when the match starts.
+                    state.prematch_locked.insert(pre.id.clone());
+                    state.prematch_win.entry(pre.id).or_insert(pre.win);
+                } else if !state.prematch_locked.contains(&pre.id) {
+                    // Keep updating pre-match preview until kickoff.
+                    state.prematch_win.insert(pre.id, pre.win);
+                }
+            }
+
+            // If sort depends on win-prob rows, refresh ordering after applying new predictions.
+            if !matches!(state.sort, SortMode::Time) {
+                state.sort_matches_with_selected_id(selected_id);
+            }
+        }
         Delta::Log(msg) => state.push_log(msg),
     }
 }
@@ -2189,7 +2104,9 @@ fn collect_lineup_starter_ids(detail: &MatchDetail) -> Vec<u32> {
     };
     for side in &lineups.sides {
         for slot in &side.starting {
-            if let Some(id) = slot.id {
+            if let Some(id) = slot.id
+                && id != 0
+            {
                 ids.push(id);
             }
         }

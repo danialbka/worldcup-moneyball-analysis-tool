@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
@@ -25,14 +26,172 @@ use wc26_terminal::{analysis_rankings, feed, http_cache, persist, upcoming_fetch
 use wc26_terminal::state::{
     self, AppState, LeagueMode, PLACEHOLDER_MATCH_ID, PLAYER_DETAIL_SECTIONS, PlayerDetail,
     PlayerStatItem, PulseView, RoleCategory, Screen, TerminalFocus, apply_delta, confed_label,
-    league_label, metric_label, placeholder_match_detail, placeholder_match_summary,
-    recompute_predictions_after_player_cache_update, role_label,
+    league_label, metric_label, placeholder_match_detail, placeholder_match_summary, role_label,
 };
+
+#[derive(Debug, Clone)]
+struct PredictionSnapshot {
+    matches: Vec<state::MatchSummary>,
+    upcoming: Vec<state::UpcomingMatch>,
+    match_detail: HashMap<String, state::MatchDetail>,
+    combined_player_cache: HashMap<u32, state::PlayerDetail>,
+    rankings_cache_squads: HashMap<u32, Vec<state::SquadPlayer>>,
+    analysis: Vec<state::TeamAnalysis>,
+    league_params: HashMap<u32, wc26_terminal::league_params::LeagueParams>,
+    elo_by_league: HashMap<u32, HashMap<u32, f64>>,
+    prematch_locked: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+enum PredictionCommand {
+    Compute {
+        generation: u64,
+        snapshot: PredictionSnapshot,
+    },
+}
+
+fn spawn_prediction_worker(tx: mpsc::Sender<state::Delta>) -> mpsc::Sender<PredictionCommand> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<PredictionCommand>();
+    thread::spawn(move || {
+        loop {
+            let Ok(mut cmd) = cmd_rx.recv() else {
+                return;
+            };
+            while let Ok(next) = cmd_rx.try_recv() {
+                cmd = next;
+            }
+            let PredictionCommand::Compute {
+                generation,
+                snapshot,
+            } = cmd;
+
+            let mut wins: Vec<state::ComputedWin> = Vec::with_capacity(snapshot.matches.len());
+            let mut prematch: Vec<state::ComputedPrematch> =
+                Vec::with_capacity(snapshot.matches.len() + snapshot.upcoming.len());
+
+            for m in &snapshot.matches {
+                let detail = snapshot.match_detail.get(&m.id);
+                let league_id = m.league_id.unwrap_or(0);
+                let params = snapshot.league_params.get(&league_id);
+                let elo = snapshot.elo_by_league.get(&league_id);
+                let (win, extras) = wc26_terminal::win_prob::compute_win_prob_explainable(
+                    m,
+                    detail,
+                    &snapshot.combined_player_cache,
+                    &snapshot.rankings_cache_squads,
+                    &snapshot.analysis,
+                    params,
+                    elo,
+                );
+                wins.push(state::ComputedWin {
+                    id: m.id.clone(),
+                    win: win.clone(),
+                    extras: extras.clone(),
+                });
+
+                if snapshot.prematch_locked.contains(&m.id) {
+                    continue;
+                }
+                if !m.is_live && m.minute == 0 {
+                    prematch.push(state::ComputedPrematch {
+                        id: m.id.clone(),
+                        win,
+                        extras,
+                        lock: false,
+                    });
+                } else if m.is_live || m.minute > 0 {
+                    // Synthesize a pre-match snapshot once the match is underway.
+                    let mut pre = m.clone();
+                    pre.is_live = false;
+                    pre.minute = 0;
+                    pre.score_home = 0;
+                    pre.score_away = 0;
+                    let detail = snapshot.match_detail.get(&pre.id);
+                    let league_id = pre.league_id.unwrap_or(0);
+                    let params = snapshot.league_params.get(&league_id);
+                    let elo = snapshot.elo_by_league.get(&league_id);
+                    let (prematch_win, prematch_extras) =
+                        wc26_terminal::win_prob::compute_win_prob_explainable(
+                            &pre,
+                            detail,
+                            &snapshot.combined_player_cache,
+                            &snapshot.rankings_cache_squads,
+                            &snapshot.analysis,
+                            params,
+                            elo,
+                        );
+                    prematch.push(state::ComputedPrematch {
+                        id: pre.id,
+                        win: prematch_win,
+                        extras: prematch_extras,
+                        lock: true,
+                    });
+                }
+            }
+
+            for u in &snapshot.upcoming {
+                if snapshot.prematch_locked.contains(&u.id) {
+                    continue;
+                }
+                let summary = state::MatchSummary {
+                    id: u.id.clone(),
+                    league_id: u.league_id,
+                    league_name: u.league_name.clone(),
+                    home_team_id: u.home_team_id,
+                    away_team_id: u.away_team_id,
+                    home: u.home.clone(),
+                    away: u.away.clone(),
+                    minute: 0,
+                    score_home: 0,
+                    score_away: 0,
+                    win: state::WinProbRow {
+                        p_home: 0.0,
+                        p_draw: 0.0,
+                        p_away: 0.0,
+                        delta_home: 0.0,
+                        quality: state::ModelQuality::Basic,
+                        confidence: 0,
+                    },
+                    is_live: false,
+                };
+                let detail = snapshot.match_detail.get(&u.id);
+                let league_id = summary.league_id.unwrap_or(0);
+                let params = snapshot.league_params.get(&league_id);
+                let elo = snapshot.elo_by_league.get(&league_id);
+                let (prematch_win, extras) = wc26_terminal::win_prob::compute_win_prob_explainable(
+                    &summary,
+                    detail,
+                    &snapshot.combined_player_cache,
+                    &snapshot.rankings_cache_squads,
+                    &snapshot.analysis,
+                    params,
+                    elo,
+                );
+                prematch.push(state::ComputedPrematch {
+                    id: u.id.clone(),
+                    win: prematch_win,
+                    extras,
+                    lock: false,
+                });
+            }
+
+            let _ = tx.send(state::Delta::ComputedPredictions {
+                generation,
+                wins,
+                prematch,
+            });
+        }
+    });
+    cmd_tx
+}
 
 struct App {
     state: AppState,
     should_quit: bool,
     cmd_tx: Option<mpsc::Sender<state::ProviderCommand>>,
+    pred_tx: Option<mpsc::Sender<PredictionCommand>>,
+    pred_inflight: bool,
+    pred_generation: u64,
     upcoming_refresh: Duration,
     last_upcoming_refresh: Instant,
     upcoming_cache_ttl: Duration,
@@ -72,7 +231,10 @@ enum AutoWarmMode {
 }
 
 impl App {
-    fn new(cmd_tx: Option<mpsc::Sender<state::ProviderCommand>>) -> Self {
+    fn new(
+        cmd_tx: Option<mpsc::Sender<state::ProviderCommand>>,
+        pred_tx: Option<mpsc::Sender<PredictionCommand>>,
+    ) -> Self {
         let upcoming_refresh = std::env::var("UPCOMING_POLL_SECS")
             .ok()
             .and_then(|val| val.parse::<u64>().ok())
@@ -152,6 +314,9 @@ impl App {
             state: AppState::new(),
             should_quit: false,
             cmd_tx,
+            pred_tx,
+            pred_inflight: false,
+            pred_generation: 0,
             upcoming_refresh: Duration::from_secs(upcoming_refresh),
             last_upcoming_refresh: Instant::now(),
             upcoming_cache_ttl: Duration::from_secs(upcoming_cache_ttl),
@@ -1622,9 +1787,10 @@ fn main() -> io::Result<()> {
 
     let (tx, rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    feed::spawn_provider(tx, cmd_rx);
+    feed::spawn_provider(tx.clone(), cmd_rx);
+    let pred_tx = spawn_prediction_worker(tx.clone());
 
-    let mut app = App::new(Some(cmd_tx));
+    let mut app = App::new(Some(cmd_tx), Some(pred_tx));
     // Restore last used league mode (if any), then load its cached data.
     persist::load_last_league_mode(&mut app.state);
     persist::load_into_state(&mut app.state);
@@ -2274,7 +2440,7 @@ fn render_screenshots() -> io::Result<()> {
         height: u16,
         prep: impl FnOnce(&mut App),
     ) -> io::Result<()> {
-        let mut app = App::new(None);
+        let mut app = App::new(None, None);
         seed_demo(&mut app);
         prep(&mut app);
 
@@ -2453,6 +2619,23 @@ fn run_app<B: Backend>(
 
     loop {
         let mut changed = false;
+        // Avoid long stalls when a background warm/prefetch streams lots of deltas.
+        // Bound per-tick work so navigation/input stays responsive.
+        let max_deltas_per_tick = std::env::var("UI_MAX_DELTAS_PER_TICK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(250)
+            .clamp(25, 50_000);
+        let delta_time_budget = Duration::from_millis(
+            std::env::var("UI_DELTA_BUDGET_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(12)
+                .clamp(2, 200),
+        );
+
+        let drain_started = Instant::now();
+        let mut drained = 0usize;
         while let Ok(delta) = rx.try_recv() {
             // Cache-warm and prefetch can stream lots of updates; track them so we can debounce
             // expensive recomputes while keeping the UI responsive.
@@ -2462,10 +2645,23 @@ fn run_app<B: Backend>(
                 | state::Delta::SetAnalysis { .. } => {
                     app.rankings_update_counter = app.rankings_update_counter.saturating_add(1);
                 }
+                state::Delta::ComputedPredictions { generation, .. } => {
+                    if *generation == app.state.prediction_compute_generation {
+                        app.pred_inflight = false;
+                    }
+                }
                 _ => {}
             }
             apply_delta(&mut app.state, delta);
             changed = true;
+
+            drained = drained.saturating_add(1);
+            if drained >= max_deltas_per_tick || drain_started.elapsed() >= delta_time_budget {
+                // Still more work waiting in the channel; render and poll input instead of
+                // freezing until the backlog is drained.
+                needs_redraw = true;
+                break;
+            }
         }
         if let Some(ids) = app.state.squad_prefetch_pending.take() {
             app.prefetch_players(ids);
@@ -2507,10 +2703,35 @@ fn run_app<B: Backend>(
                 if now.duration_since(app.predictions_last_recompute)
                     >= app.predictions_recompute_interval
                 {
-                    recompute_predictions_after_player_cache_update(&mut app.state);
-                    app.state.predictions_dirty = false;
-                    app.predictions_last_recompute = now;
-                    changed = true;
+                    if let Some(tx) = app.pred_tx.as_ref() {
+                        if !app.pred_inflight {
+                            app.pred_generation = app.pred_generation.wrapping_add(1).max(1);
+                            let generation = app.pred_generation;
+                            app.state.prediction_compute_generation = generation;
+                            let snapshot = PredictionSnapshot {
+                                matches: app.state.matches.clone(),
+                                upcoming: app.state.upcoming.clone(),
+                                match_detail: app.state.match_detail.clone(),
+                                combined_player_cache: app.state.combined_player_cache.clone(),
+                                rankings_cache_squads: app.state.rankings_cache_squads.clone(),
+                                analysis: app.state.analysis.clone(),
+                                league_params: app.state.league_params.clone(),
+                                elo_by_league: app.state.elo_by_league.clone(),
+                                prematch_locked: app.state.prematch_locked.clone(),
+                            };
+                            let _ = tx.send(PredictionCommand::Compute {
+                                generation,
+                                snapshot,
+                            });
+                            app.pred_inflight = true;
+                            app.state.predictions_dirty = false;
+                            app.predictions_last_recompute = now;
+                        }
+                    } else {
+                        // No worker (e.g. screenshot mode): skip background compute.
+                        app.state.predictions_dirty = false;
+                        app.predictions_last_recompute = now;
+                    }
                 }
             }
         }
@@ -2873,7 +3094,7 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     render_pulse_header(frame, sections[0], &widths);
 
     let list_area = sections[1];
-    let rows = state.pulse_live_rows();
+    let rows = state.pulse_live_rows_ref();
     if rows.is_empty() {
         let empty_style = Style::default()
             .fg(THEME_MUTED)
@@ -2905,6 +3126,8 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     let (start, end) = visible_range(state.selected, rows.len(), visible);
 
     let now = Utc::now();
+    let upcoming_by_id: std::collections::HashMap<&str, &state::UpcomingMatch> =
+        state.upcoming.iter().map(|u| (u.id.as_str(), u)).collect();
     for (i, idx) in (start..end).enumerate() {
         let row_area = Rect {
             x: list_area.x,
@@ -2949,10 +3172,8 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                 } else if is_finished {
                     "FT".to_string()
                 } else {
-                    state
-                        .upcoming
-                        .iter()
-                        .find(|u| u.id == m.id)
+                    upcoming_by_id
+                        .get(m.id.as_str())
                         .map(|u| format_countdown_short(&u.kickoff, now))
                         .unwrap_or_else(|| "KO".to_string())
                 };

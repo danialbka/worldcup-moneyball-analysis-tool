@@ -991,7 +991,10 @@ fn fetch_player_detail_with_opts(player_id: u32, revalidate: bool) -> Result<Pla
     let mut last_err = None;
     let mut parsed: Option<PlayerDetail> = None;
     for attempt in 0..3 {
-        let resp = if revalidate {
+        // If we get a poisoned/partial cached response (e.g. upstream served non-JSON temporarily),
+        // retry with a forced revalidation to avoid repeatedly parsing the same cached body.
+        let use_revalidate = revalidate || attempt > 0;
+        let resp = if use_revalidate {
             fetch_json_cached_revalidate(client, &url, &[("Accept-Language", "en-GB,en;q=0.9")])
         } else {
             fetch_json_cached(client, &url, &[("Accept-Language", "en-GB,en;q=0.9")])

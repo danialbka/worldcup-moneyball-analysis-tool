@@ -810,10 +810,34 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                             });
                             let errors = errors.into_inner().unwrap_or_default();
                             if !errors.is_empty() {
-                                let _ = tx.send(Delta::Log(format!(
-                                    "[WARN] Player prefetch: {} errors",
-                                    errors.len()
-                                )));
+                                let sample_count = std::env::var("PREFETCH_ERROR_SAMPLES")
+                                    .ok()
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                    .unwrap_or(3)
+                                    .clamp(0, 10);
+                                let mut msg =
+                                    format!("[WARN] Player prefetch: {} errors", errors.len());
+                                if sample_count > 0 {
+                                    msg.push_str(". Sample: ");
+                                    let mut first = true;
+                                    for err in errors.iter().take(sample_count) {
+                                        if !first {
+                                            msg.push_str(" ; ");
+                                        }
+                                        first = false;
+                                        let cleaned = err.replace('\n', " ").replace('\r', " ");
+                                        // Prevent huge HTML bodies (or long serde errors) from
+                                        // spamming the log view.
+                                        const MAX: usize = 220;
+                                        if cleaned.len() > MAX {
+                                            msg.push_str(&cleaned[..MAX]);
+                                            msg.push_str("...");
+                                        } else {
+                                            msg.push_str(&cleaned);
+                                        }
+                                    }
+                                }
+                                let _ = tx.send(Delta::Log(format!("{msg}")));
                             }
                         });
                     }
