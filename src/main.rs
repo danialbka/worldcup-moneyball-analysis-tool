@@ -16,7 +16,9 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Gauge, Padding, Paragraph, Sparkline, Wrap,
+};
 
 use wc26_terminal::{analysis_rankings, feed, http_cache, persist, upcoming_fetch};
 
@@ -330,6 +332,14 @@ impl App {
                     }
                 }
                 Screen::Terminal { .. } => {
+                    // Expanding Ticker/Commentary should pull fresh match details immediately so
+                    // the overlay updates in-place as new commentary arrives.
+                    if matches!(
+                        self.state.terminal_focus,
+                        TerminalFocus::EventTape | TerminalFocus::Commentary
+                    ) {
+                        self.request_match_details_with_opts(false, true, false);
+                    }
                     self.state.terminal_detail = Some(self.state.terminal_focus);
                     self.state.terminal_detail_scroll = 0;
                 }
@@ -678,13 +688,24 @@ impl App {
     }
 
     fn request_match_details(&mut self, announce: bool) {
+        // Default: when requesting "details", prefer the full payload (includes commentary when
+        // available). Background refreshes use the basic endpoint separately.
+        self.request_match_details_with_opts(announce, true, true);
+    }
+
+    fn request_match_details_with_opts(
+        &mut self,
+        announce: bool,
+        require_commentary: bool,
+        respect_throttle: bool,
+    ) {
         let Some(match_id) = self.state.selected_match_id() else {
             if announce {
                 self.state.push_log("[INFO] No match selected for details");
             }
             return;
         };
-        self.request_match_details_for(&match_id, announce);
+        self.request_match_details_for(&match_id, announce, require_commentary, respect_throttle);
     }
 
     fn request_match_details_basic_for(&mut self, match_id: &str) {
@@ -730,7 +751,13 @@ impl App {
             .insert(match_id.to_string(), Instant::now());
     }
 
-    fn request_match_details_for(&mut self, match_id: &str, announce: bool) {
+    fn request_match_details_for(
+        &mut self,
+        match_id: &str,
+        announce: bool,
+        require_commentary: bool,
+        respect_throttle: bool,
+    ) {
         if match_id == PLACEHOLDER_MATCH_ID && self.state.placeholder_match_enabled {
             self.state
                 .match_detail
@@ -744,14 +771,22 @@ impl App {
             }
             return;
         }
-        if let Some(last) = self.last_detail_refresh.get(match_id) {
-            if last.elapsed() < self.detail_request_throttle {
-                if announce {
-                    self.state.push_log(format!(
-                        "[INFO] Match details throttled ({}s)",
-                        self.detail_request_throttle.as_secs()
-                    ));
+        if respect_throttle {
+            if let Some(last) = self.last_detail_refresh.get(match_id) {
+                if last.elapsed() < self.detail_request_throttle {
+                    if announce {
+                        self.state.push_log(format!(
+                            "[INFO] Match details throttled ({}s)",
+                            self.detail_request_throttle.as_secs()
+                        ));
+                    }
+                    return;
                 }
+            }
+        } else if let Some(last) = self.last_detail_refresh.get(match_id) {
+            // User-triggered requests can bypass throttling, but avoid bursting duplicate requests
+            // within a single render/poll cycle (and while a provider job is likely inflight).
+            if last.elapsed() < Duration::from_millis(800) {
                 return;
             }
         }
@@ -773,7 +808,7 @@ impl App {
         if !is_live
             && has_cached
             && cache_fresh(cached_at, self.detail_cache_ttl)
-            && (!announce || has_commentary)
+            && (!require_commentary || has_commentary)
         {
             if announce {
                 self.state
@@ -1241,25 +1276,26 @@ impl App {
         const PREFETCH_LIMIT: usize = 3;
         let mut sent = 0usize;
 
-        // If the user is actively looking at commentary, refresh full match details for the
-        // selected live match. Background refreshes otherwise use the basic endpoint to reduce
-        // load.
-        let wants_commentary = matches!(self.state.screen, Screen::Terminal { .. })
+        // If the user has expanded either Commentary or Ticker, refresh full match details for the
+        // selected live match (commentary lives behind the full endpoint). Otherwise, background
+        // refreshes use the basic endpoint to reduce load.
+        let wants_full_details = matches!(self.state.screen, Screen::Terminal { .. })
             && (self.state.terminal_focus == TerminalFocus::Commentary
-                || self.state.terminal_detail == Some(TerminalFocus::Commentary));
+                || self.state.terminal_detail == Some(TerminalFocus::Commentary)
+                || self.state.terminal_detail == Some(TerminalFocus::EventTape));
         let selected_live_id = self
             .state
             .selected_match()
             .filter(|m| m.is_live && m.id != PLACEHOLDER_MATCH_ID)
             .map(|m| m.id.clone());
-        if wants_commentary {
+        if wants_full_details {
             if let Some(match_id) = selected_live_id.as_deref() {
                 let last = self.last_detail_refresh.get(match_id);
                 let should_fetch = last
                     .map(|t| t.elapsed() >= self.commentary_refresh)
                     .unwrap_or(true);
                 if should_fetch {
-                    self.request_match_details_for(match_id, false);
+                    self.request_match_details_for(match_id, false, true, true);
                     sent += 1;
                 }
             }
@@ -1279,7 +1315,7 @@ impl App {
             if sent >= PREFETCH_LIMIT {
                 return;
             }
-            if wants_commentary && selected_live_id.as_deref() == Some(match_id.as_str()) {
+            if wants_full_details && selected_live_id.as_deref() == Some(match_id.as_str()) {
                 continue;
             }
             let last = self.last_detail_refresh.get(&match_id);
@@ -1407,6 +1443,9 @@ fn main() -> io::Result<()> {
     // Lightweight debug mode to inspect FotMob match details without launching the TUI.
     // Example: `cargo run -- --dump-match-details 4837312`
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(|s| s.as_str()) == Some("--render-screenshots") {
+        return render_screenshots();
+    }
     if args.first().map(|s| s.as_str()) == Some("--dump-match-details") {
         let match_id = args.get(1).cloned().unwrap_or_default();
         if match_id.trim().is_empty() {
@@ -1472,6 +1511,797 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn render_screenshots() -> io::Result<()> {
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    fn html_escape(mut s: String) -> String {
+        s = s.replace('&', "&amp;");
+        s = s.replace('<', "&lt;");
+        s = s.replace('>', "&gt;");
+        s
+    }
+
+    fn xterm_16_rgb(idx: u8) -> (u8, u8, u8) {
+        match idx {
+            0 => (0x00, 0x00, 0x00),
+            1 => (0x80, 0x00, 0x00),
+            2 => (0x00, 0x80, 0x00),
+            3 => (0x80, 0x80, 0x00),
+            4 => (0x00, 0x00, 0x80),
+            5 => (0x80, 0x00, 0x80),
+            6 => (0x00, 0x80, 0x80),
+            7 => (0xc0, 0xc0, 0xc0),
+            8 => (0x80, 0x80, 0x80),
+            9 => (0xff, 0x00, 0x00),
+            10 => (0x00, 0xff, 0x00),
+            11 => (0xff, 0xff, 0x00),
+            12 => (0x00, 0x00, 0xff),
+            13 => (0xff, 0x00, 0xff),
+            14 => (0x00, 0xff, 0xff),
+            _ => (0xff, 0xff, 0xff),
+        }
+    }
+
+    fn xterm_256_rgb(idx: u8) -> (u8, u8, u8) {
+        if idx < 16 {
+            return xterm_16_rgb(idx);
+        }
+        if (16..=231).contains(&idx) {
+            let i = idx - 16;
+            let r = i / 36;
+            let g = (i % 36) / 6;
+            let b = i % 6;
+            let map = |v: u8| -> u8 {
+                match v {
+                    0 => 0,
+                    1 => 95,
+                    2 => 135,
+                    3 => 175,
+                    4 => 215,
+                    _ => 255,
+                }
+            };
+            return (map(r), map(g), map(b));
+        }
+        let v = 8u8.saturating_add(10u8.saturating_mul(idx.saturating_sub(232)));
+        (v, v, v)
+    }
+
+    fn color_to_css(color: Color) -> Option<String> {
+        let (r, g, b) = match color {
+            Color::Reset => return None,
+            Color::Black => (0x00, 0x00, 0x00),
+            Color::Red => (0xcd, 0x31, 0x31),
+            Color::Green => (0x0d, 0xbc, 0x79),
+            Color::Yellow => (0xe5, 0xe5, 0x10),
+            Color::Blue => (0x24, 0x71, 0xdb),
+            Color::Magenta => (0xbc, 0x3f, 0xbc),
+            Color::Cyan => (0x11, 0xa8, 0xcd),
+            Color::Gray => (0xe5, 0xe5, 0xe5),
+            Color::DarkGray => (0x66, 0x66, 0x66),
+            Color::LightRed => (0xf1, 0x4c, 0x4c),
+            Color::LightGreen => (0x23, 0xd1, 0x8b),
+            Color::LightYellow => (0xf5, 0xf5, 0x43),
+            Color::LightBlue => (0x3b, 0x8e, 0xea),
+            Color::LightMagenta => (0xd6, 0x70, 0xd6),
+            Color::LightCyan => (0x29, 0xb8, 0xdb),
+            Color::White => (0xff, 0xff, 0xff),
+            Color::Indexed(idx) => xterm_256_rgb(idx),
+            Color::Rgb(r, g, b) => (r, g, b),
+        };
+        Some(format!("rgb({r},{g},{b})"))
+    }
+
+    fn buffer_to_html(buf: &Buffer, title: &str) -> String {
+        let area = buf.area;
+        let mut out = String::with_capacity((area.width as usize) * (area.height as usize) * 32);
+        out.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+        out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+        out.push_str("<style>");
+        out.push_str(
+            r#"
+            :root { --bg: rgb(6,9,14); --fg: rgb(228,234,244); }
+            html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); }
+            .screen {
+              display: inline-block;
+              background: var(--bg);
+              font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+              font-variant-ligatures: none;
+              font-size: 16px;
+              line-height: 16px;
+              white-space: pre;
+            }
+            .row { height: 16px; }
+            .cell {
+              display: inline-block;
+              width: 1ch;
+              height: 16px;
+              overflow: hidden;
+              vertical-align: top;
+            }
+            "#,
+        );
+        out.push_str("</style>");
+        out.push_str("<title>");
+        out.push_str(&html_escape(title.to_string()));
+        out.push_str("</title></head><body>");
+        out.push_str("<div class=\"screen\" role=\"img\" aria-label=\"");
+        out.push_str(&html_escape(title.to_string()));
+        out.push_str("\">");
+
+        for y in 0..area.height {
+            out.push_str("<div class=\"row\">");
+            for x in 0..area.width {
+                let cell = buf.get(x, y);
+                let symbol = cell.symbol();
+                let symbol = if symbol.is_empty() { " " } else { symbol };
+
+                let mut style = String::new();
+                if let Some(fg) = color_to_css(cell.fg) {
+                    style.push_str("color:");
+                    style.push_str(&fg);
+                    style.push(';');
+                }
+                if let Some(bg) = color_to_css(cell.bg) {
+                    style.push_str("background:");
+                    style.push_str(&bg);
+                    style.push(';');
+                }
+                if cell.modifier.contains(Modifier::BOLD) {
+                    style.push_str("font-weight:700;");
+                }
+                if cell.modifier.contains(Modifier::ITALIC) {
+                    style.push_str("font-style:italic;");
+                }
+                if cell.modifier.contains(Modifier::UNDERLINED) {
+                    style.push_str("text-decoration:underline;");
+                }
+                if cell.modifier.contains(Modifier::DIM) {
+                    style.push_str("opacity:0.8;");
+                }
+
+                out.push_str("<span class=\"cell\"");
+                if !style.is_empty() {
+                    out.push_str(" style=\"");
+                    out.push_str(&style);
+                    out.push('"');
+                }
+                out.push('>');
+                out.push_str(&html_escape(symbol.to_string()));
+                out.push_str("</span>");
+            }
+            out.push_str("</div>");
+        }
+
+        out.push_str("</div></body></html>");
+        out
+    }
+
+    fn seed_demo(app: &mut App) {
+        app.enable_placeholder_match();
+
+        app.state.upcoming = vec![
+            state::UpcomingMatch {
+                id: "up-1".to_string(),
+                league_id: None,
+                league_name: "Premier League".to_string(),
+                round: "Matchday 24".to_string(),
+                kickoff: "Sat 12:30".to_string(),
+                home_team_id: None,
+                away_team_id: None,
+                home: "Northbridge".to_string(),
+                away: "Southport".to_string(),
+            },
+            state::UpcomingMatch {
+                id: "up-2".to_string(),
+                league_id: None,
+                league_name: "Premier League".to_string(),
+                round: "Matchday 24".to_string(),
+                kickoff: "Sat 15:00".to_string(),
+                home_team_id: None,
+                away_team_id: None,
+                home: "Kings FC".to_string(),
+                away: "Harbor City".to_string(),
+            },
+            state::UpcomingMatch {
+                id: "up-3".to_string(),
+                league_id: None,
+                league_name: "Premier League".to_string(),
+                round: "Matchday 24".to_string(),
+                kickoff: "Sun 16:30".to_string(),
+                home_team_id: None,
+                away_team_id: None,
+                home: "Rovers".to_string(),
+                away: "United".to_string(),
+            },
+        ];
+
+        app.state
+            .push_log("boot: offline demo seed (placeholder match)".to_string());
+        app.state
+            .push_log("hint: press ? for keys, p to toggle placeholder".to_string());
+        app.state
+            .push_log("provider: disabled (no network)".to_string());
+
+        // Populate additional screens so UI iteration doesn't require network access.
+        app.state.analysis = vec![
+            state::TeamAnalysis {
+                id: 1,
+                name: "Argentina".to_string(),
+                confed: state::Confederation::CONMEBOL,
+                host: false,
+                fifa_rank: Some(1),
+                fifa_points: Some(1860),
+                fifa_updated: Some("2025-12-19".to_string()),
+            },
+            state::TeamAnalysis {
+                id: 2,
+                name: "France".to_string(),
+                confed: state::Confederation::UEFA,
+                host: false,
+                fifa_rank: Some(2),
+                fifa_points: Some(1840),
+                fifa_updated: Some("2025-12-19".to_string()),
+            },
+            state::TeamAnalysis {
+                id: 3,
+                name: "USA".to_string(),
+                confed: state::Confederation::CONCACAF,
+                host: true,
+                fifa_rank: Some(11),
+                fifa_points: Some(1675),
+                fifa_updated: Some("2025-12-19".to_string()),
+            },
+            state::TeamAnalysis {
+                id: 4,
+                name: "Japan".to_string(),
+                confed: state::Confederation::AFC,
+                host: false,
+                fifa_rank: Some(19),
+                fifa_points: Some(1612),
+                fifa_updated: Some("2025-12-19".to_string()),
+            },
+            state::TeamAnalysis {
+                id: 5,
+                name: "Nigeria".to_string(),
+                confed: state::Confederation::CAF,
+                host: false,
+                fifa_rank: Some(28),
+                fifa_points: Some(1540),
+                fifa_updated: Some("2025-12-19".to_string()),
+            },
+            state::TeamAnalysis {
+                id: 6,
+                name: "New Zealand".to_string(),
+                confed: state::Confederation::OFC,
+                host: false,
+                fifa_rank: Some(101),
+                fifa_points: Some(1202),
+                fifa_updated: Some("2025-12-19".to_string()),
+            },
+        ];
+
+        app.state.rankings = vec![
+            state::RoleRankingEntry {
+                role: RoleCategory::Attacker,
+                player_id: 1001,
+                player_name: "K. Rook".to_string(),
+                team_id: 3,
+                team_name: "USA".to_string(),
+                club: "Northbridge".to_string(),
+                attack_score: 2.43,
+                defense_score: 0.12,
+                rating: Some(7.42),
+                attack_factors: vec![
+                    state::RankFactor {
+                        label: "xG".to_string(),
+                        z: 1.40,
+                        weight: 0.55,
+                        raw: Some(0.62),
+                        pct: Some(88.0),
+                        source: "All comps".to_string(),
+                    },
+                    state::RankFactor {
+                        label: "Shots".to_string(),
+                        z: 1.05,
+                        weight: 0.30,
+                        raw: Some(3.1),
+                        pct: Some(81.0),
+                        source: "Per 90".to_string(),
+                    },
+                ],
+                defense_factors: vec![],
+            },
+            state::RoleRankingEntry {
+                role: RoleCategory::Midfielder,
+                player_id: 1002,
+                player_name: "T. Vale".to_string(),
+                team_id: 2,
+                team_name: "France".to_string(),
+                club: "Harbor City".to_string(),
+                attack_score: 1.02,
+                defense_score: 1.88,
+                rating: Some(7.11),
+                attack_factors: vec![],
+                defense_factors: vec![
+                    state::RankFactor {
+                        label: "Tackles".to_string(),
+                        z: 1.22,
+                        weight: 0.45,
+                        raw: Some(2.6),
+                        pct: Some(84.0),
+                        source: "Per 90".to_string(),
+                    },
+                    state::RankFactor {
+                        label: "Interceptions".to_string(),
+                        z: 0.92,
+                        weight: 0.35,
+                        raw: Some(1.8),
+                        pct: Some(76.0),
+                        source: "Per 90".to_string(),
+                    },
+                ],
+            },
+            state::RoleRankingEntry {
+                role: RoleCategory::Defender,
+                player_id: 1003,
+                player_name: "M. Holt".to_string(),
+                team_id: 1,
+                team_name: "Argentina".to_string(),
+                club: "Rovers".to_string(),
+                attack_score: 0.44,
+                defense_score: 2.05,
+                rating: Some(7.29),
+                attack_factors: vec![],
+                defense_factors: vec![state::RankFactor {
+                    label: "Duels won".to_string(),
+                    z: 1.10,
+                    weight: 0.55,
+                    raw: Some(7.2),
+                    pct: Some(83.0),
+                    source: "All comps".to_string(),
+                }],
+            },
+            state::RoleRankingEntry {
+                role: RoleCategory::Goalkeeper,
+                player_id: 1004,
+                player_name: "A. Stone".to_string(),
+                team_id: 4,
+                team_name: "Japan".to_string(),
+                club: "United".to_string(),
+                attack_score: 0.05,
+                defense_score: 1.52,
+                rating: Some(7.05),
+                attack_factors: vec![],
+                defense_factors: vec![state::RankFactor {
+                    label: "Save %".to_string(),
+                    z: 0.95,
+                    weight: 0.60,
+                    raw: Some(74.0),
+                    pct: Some(79.0),
+                    source: "All comps".to_string(),
+                }],
+            },
+        ];
+
+        app.state.squad_team = Some("USA".to_string());
+        app.state.squad_team_id = Some(3);
+        app.state.squad = vec![
+            state::SquadPlayer {
+                id: 1001,
+                name: "K. Rook".to_string(),
+                role: "FW".to_string(),
+                club: "Northbridge".to_string(),
+                age: Some(24),
+                height: Some(182),
+                shirt_number: Some(9),
+                market_value: Some(38_000_000),
+            },
+            state::SquadPlayer {
+                id: 1002,
+                name: "T. Vale".to_string(),
+                role: "MF".to_string(),
+                club: "Harbor City".to_string(),
+                age: Some(27),
+                height: Some(176),
+                shirt_number: Some(8),
+                market_value: Some(24_000_000),
+            },
+            state::SquadPlayer {
+                id: 1003,
+                name: "M. Holt".to_string(),
+                role: "DF".to_string(),
+                club: "Rovers".to_string(),
+                age: Some(29),
+                height: Some(188),
+                shirt_number: Some(4),
+                market_value: Some(18_500_000),
+            },
+            state::SquadPlayer {
+                id: 1004,
+                name: "A. Stone".to_string(),
+                role: "GK".to_string(),
+                club: "United".to_string(),
+                age: Some(31),
+                height: Some(191),
+                shirt_number: Some(1),
+                market_value: Some(6_000_000),
+            },
+        ];
+
+        // Player detail demo (enough for the screen layout to look realistic).
+        let player = state::PlayerDetail {
+            id: 1001,
+            name: "K. Rook".to_string(),
+            team: Some("USA".to_string()),
+            position: Some("Forward".to_string()),
+            age: Some("24".to_string()),
+            country: Some("USA".to_string()),
+            height: Some("182 cm".to_string()),
+            preferred_foot: Some("Right".to_string()),
+            shirt: Some("9".to_string()),
+            market_value: Some("EUR 38.0M".to_string()),
+            contract_end: Some("2028-06-30".to_string()),
+            birth_date: Some("2001-03-04".to_string()),
+            status: Some("Available".to_string()),
+            injury_info: None,
+            international_duty: Some("Not called up".to_string()),
+            positions: vec!["FW".to_string(), "RW".to_string()],
+            all_competitions: vec![
+                state::PlayerStatItem {
+                    title: "Minutes".to_string(),
+                    value: "1450".to_string(),
+                    percentile_rank: Some(62.0),
+                    percentile_rank_per90: None,
+                },
+                state::PlayerStatItem {
+                    title: "Goals".to_string(),
+                    value: "12".to_string(),
+                    percentile_rank: Some(90.0),
+                    percentile_rank_per90: Some(92.0),
+                },
+                state::PlayerStatItem {
+                    title: "Assists".to_string(),
+                    value: "5".to_string(),
+                    percentile_rank: Some(72.0),
+                    percentile_rank_per90: Some(70.0),
+                },
+                state::PlayerStatItem {
+                    title: "xG".to_string(),
+                    value: "10.1".to_string(),
+                    percentile_rank: Some(88.0),
+                    percentile_rank_per90: Some(89.0),
+                },
+            ],
+            all_competitions_season: Some("2025/26".to_string()),
+            main_league: Some(state::PlayerLeagueStats {
+                league_name: "Premier League".to_string(),
+                season: "2025/26".to_string(),
+                stats: vec![
+                    state::PlayerStatItem {
+                        title: "Minutes".to_string(),
+                        value: "1450".to_string(),
+                        percentile_rank: None,
+                        percentile_rank_per90: None,
+                    },
+                    state::PlayerStatItem {
+                        title: "Goals".to_string(),
+                        value: "10".to_string(),
+                        percentile_rank: None,
+                        percentile_rank_per90: None,
+                    },
+                    state::PlayerStatItem {
+                        title: "Shots".to_string(),
+                        value: "68".to_string(),
+                        percentile_rank: None,
+                        percentile_rank_per90: None,
+                    },
+                ],
+            }),
+            top_stats: vec![
+                state::PlayerStatItem {
+                    title: "Shots on target %".to_string(),
+                    value: "46.0".to_string(),
+                    percentile_rank: Some(74.0),
+                    percentile_rank_per90: None,
+                },
+                state::PlayerStatItem {
+                    title: "Goals per 90".to_string(),
+                    value: "0.74".to_string(),
+                    percentile_rank: Some(91.0),
+                    percentile_rank_per90: Some(91.0),
+                },
+            ],
+            season_groups: vec![state::PlayerStatGroup {
+                title: "Passing".to_string(),
+                items: vec![state::PlayerStatItem {
+                    title: "Accurate passes %".to_string(),
+                    value: "79.0".to_string(),
+                    percentile_rank: Some(58.0),
+                    percentile_rank_per90: None,
+                }],
+            }],
+            season_performance: vec![state::PlayerSeasonPerformanceGroup {
+                title: "Shooting".to_string(),
+                items: vec![
+                    state::PlayerSeasonPerformanceItem {
+                        title: "Shots".to_string(),
+                        total: "68".to_string(),
+                        per90: Some("3.1".to_string()),
+                        percentile_rank: Some(81.0),
+                        percentile_rank_per90: Some(77.0),
+                    },
+                    state::PlayerSeasonPerformanceItem {
+                        title: "xG".to_string(),
+                        total: "10.1".to_string(),
+                        per90: Some("0.62".to_string()),
+                        percentile_rank: Some(88.0),
+                        percentile_rank_per90: Some(89.0),
+                    },
+                ],
+            }],
+            traits: Some(state::PlayerTraitGroup {
+                title: "Traits".to_string(),
+                items: vec![
+                    state::PlayerTraitItem {
+                        title: "Finishing".to_string(),
+                        value: 0.86,
+                    },
+                    state::PlayerTraitItem {
+                        title: "Positioning".to_string(),
+                        value: 0.74,
+                    },
+                ],
+            }),
+            recent_matches: vec![
+                state::PlayerMatchStat {
+                    opponent: "OMEGA".to_string(),
+                    league: "PL".to_string(),
+                    date: "2026-02-01".to_string(),
+                    goals: 1,
+                    assists: 0,
+                    rating: Some("7.8".to_string()),
+                },
+                state::PlayerMatchStat {
+                    opponent: "Rovers".to_string(),
+                    league: "PL".to_string(),
+                    date: "2026-01-25".to_string(),
+                    goals: 0,
+                    assists: 1,
+                    rating: Some("7.1".to_string()),
+                },
+            ],
+            season_breakdown: vec![
+                state::PlayerSeasonTournamentStat {
+                    league: "Premier League".to_string(),
+                    season: "2025/26".to_string(),
+                    appearances: "21".to_string(),
+                    goals: "10".to_string(),
+                    assists: "5".to_string(),
+                    rating: "7.42".to_string(),
+                },
+                state::PlayerSeasonTournamentStat {
+                    league: "Cup".to_string(),
+                    season: "2025/26".to_string(),
+                    appearances: "4".to_string(),
+                    goals: "2".to_string(),
+                    assists: "0".to_string(),
+                    rating: "7.11".to_string(),
+                },
+            ],
+            career_sections: vec![state::PlayerCareerSection {
+                title: "club career".to_string(),
+                entries: vec![state::PlayerCareerEntry {
+                    team: "Northbridge".to_string(),
+                    start_date: Some("2022-07-01".to_string()),
+                    end_date: None,
+                    appearances: Some("84".to_string()),
+                    goals: Some("37".to_string()),
+                    assists: Some("18".to_string()),
+                }],
+            }],
+            trophies: vec![state::PlayerTrophyEntry {
+                team: "Northbridge".to_string(),
+                league: "Cup".to_string(),
+                seasons_won: vec!["2024/25".to_string()],
+                seasons_runner_up: vec![],
+            }],
+        };
+        app.state.player_detail = Some(player.clone());
+        app.state.player_last_id = Some(player.id);
+        app.state.player_last_name = Some(player.name.clone());
+        app.state
+            .combined_player_cache
+            .insert(player.id, player.clone());
+        for i in 0..8u32 {
+            let mut other = player.clone();
+            other.id = 2000 + i;
+            other.name = format!("Demo Player {i}");
+            if let Some(item) = other
+                .all_competitions
+                .iter_mut()
+                .find(|s| s.title == "Goals")
+            {
+                item.value = format!("{}", 5 + (i % 6));
+            }
+            app.state.combined_player_cache.insert(other.id, other);
+        }
+    }
+
+    fn render_shot(
+        name: &str,
+        width: u16,
+        height: u16,
+        prep: impl FnOnce(&mut App),
+    ) -> io::Result<()> {
+        let mut app = App::new(None);
+        seed_demo(&mut app);
+        prep(&mut app);
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        terminal
+            .draw(|f| ui(f, &mut app))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let buf = terminal.backend().buffer().clone();
+        let html = buffer_to_html(&buf, name);
+        let dir = std::path::Path::new("target/screenshots");
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("{name}.html"));
+        std::fs::write(&path, html)?;
+        eprintln!("wrote {}", path.display());
+        Ok(())
+    }
+
+    let width = 140;
+    let height = 44;
+
+    render_shot("pulse_live", width, height, |app| {
+        app.state.screen = Screen::Pulse;
+        app.state.pulse_view = PulseView::Live;
+        app.state.selected = 0;
+    })?;
+
+    render_shot("pulse_live_select_upcoming", width, height, |app| {
+        app.state.screen = Screen::Pulse;
+        app.state.pulse_view = PulseView::Live;
+        app.state.selected = 1;
+    })?;
+
+    render_shot("pulse_upcoming", width, height, |app| {
+        app.state.screen = Screen::Pulse;
+        app.state.pulse_view = PulseView::Upcoming;
+        app.state.upcoming_scroll = 0;
+    })?;
+
+    render_shot("pulse_help", width, height, |app| {
+        app.state.screen = Screen::Pulse;
+        app.state.pulse_view = PulseView::Live;
+        app.state.selected = 0;
+        app.state.help_overlay = true;
+    })?;
+
+    render_shot("terminal_matchlist", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::MatchList;
+    })?;
+
+    render_shot("terminal_pitch", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::Pitch;
+    })?;
+
+    render_shot("terminal_ticker", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::EventTape;
+    })?;
+
+    render_shot("terminal_commentary", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::Commentary;
+    })?;
+
+    render_shot("terminal_stats", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::Stats;
+    })?;
+
+    render_shot("terminal_lineups", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::Lineups;
+    })?;
+
+    render_shot("terminal_prediction", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::Prediction;
+    })?;
+
+    render_shot("terminal_console", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::Console;
+    })?;
+
+    render_shot("terminal_detail_overlay", width, height, |app| {
+        app.state.screen = Screen::Terminal {
+            match_id: Some(PLACEHOLDER_MATCH_ID.to_string()),
+        };
+        app.state.terminal_focus = TerminalFocus::Prediction;
+        app.state.terminal_detail = Some(TerminalFocus::Prediction);
+    })?;
+
+    render_shot("analysis_teams", width, height, |app| {
+        app.state.screen = Screen::Analysis;
+        app.state.analysis_tab = state::AnalysisTab::Teams;
+        app.state.analysis_selected = 0;
+    })?;
+
+    render_shot("analysis_rankings", width, height, |app| {
+        app.state.screen = Screen::Analysis;
+        app.state.analysis_tab = state::AnalysisTab::RoleRankings;
+        app.state.rankings_role = RoleCategory::Attacker;
+        app.state.rankings_metric = state::RankMetric::Attacking;
+        app.state.rankings_selected = 0;
+    })?;
+
+    render_shot("analysis_rankings_search", width, height, |app| {
+        app.state.screen = Screen::Analysis;
+        app.state.analysis_tab = state::AnalysisTab::RoleRankings;
+        app.state.rankings_role = RoleCategory::Attacker;
+        app.state.rankings_metric = state::RankMetric::Attacking;
+        app.state.rankings_selected = 0;
+        app.state.rankings_search_active = true;
+        app.state.rankings_search = "rook".to_string();
+    })?;
+
+    render_shot("squad_table", width, height, |app| {
+        app.state.screen = Screen::Squad;
+        app.state.squad_selected = 0;
+    })?;
+
+    render_shot("player_detail", width, height, |app| {
+        app.state.screen = Screen::PlayerDetail;
+        app.state.player_detail_section = 0;
+        app.state.player_detail_expanded = false;
+    })?;
+
+    render_shot("player_detail_expanded", width, height, |app| {
+        app.state.screen = Screen::PlayerDetail;
+        app.state.player_detail_section = 1;
+        app.state.player_detail_expanded = true;
+    })?;
+
+    render_shot("analysis_empty", width, height, |app| {
+        app.state.screen = Screen::Analysis;
+        app.state.analysis_tab = state::AnalysisTab::Teams;
+        app.state.analysis.clear();
+    })?;
+
+    render_shot("squad_empty", width, height, |app| {
+        app.state.screen = Screen::Squad;
+        app.state.squad.clear();
+    })?;
+
+    Ok(())
+}
+
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -1530,9 +2360,9 @@ fn run_app<B: Backend>(
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
-    // Force black background across the entire frame.
+    // Force a consistent dark background across the entire frame.
     frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
+        Block::default().style(Style::default().bg(THEME_BG)),
         frame.size(),
     );
 
@@ -1545,7 +2375,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.size());
 
-    let header = Paragraph::new(header_styled(&app.state)).style(Style::default().bg(Color::Black));
+    let header =
+        Paragraph::new(header_styled(&app.state)).style(Style::default().bg(THEME_CHROME_BG));
     frame.render_widget(header, chunks[0]);
 
     match app.state.screen {
@@ -1557,11 +2388,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
     }
 
     let footer = Paragraph::new(footer_styled(&app.state))
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(THEME_CHROME_BG))
         .block(
             Block::default()
                 .borders(Borders::TOP)
-                .style(Style::default().bg(Color::Black)),
+                .border_style(Style::default().fg(THEME_BORDER_DIM))
+                .style(Style::default().bg(THEME_CHROME_BG)),
         );
     frame.render_widget(footer, chunks[2]);
 
@@ -1577,42 +2409,38 @@ fn ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn header_styled(state: &AppState) -> Line<'static> {
-    let sep = Span::styled(" | ", on_black(Style::default().fg(Color::DarkGray)));
+    let sep = Span::styled(" | ", Style::default().fg(THEME_BORDER_DIM));
 
     match state.screen {
         Screen::Pulse => Line::from(vec![
             Span::styled(
                 "WC26 PULSE",
-                on_black(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Style::default()
+                    .fg(THEME_ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
             sep.clone(),
             Span::styled(
                 league_label(state.league_mode).to_string(),
-                on_black(Style::default().fg(Color::Yellow)),
+                Style::default().fg(THEME_ACCENT_2),
             ),
             sep.clone(),
             Span::styled(
                 pulse_view_label(state.pulse_view).to_string(),
-                on_black(Style::default().fg(Color::Magenta)),
+                Style::default().fg(Color::LightMagenta),
             ),
             sep.clone(),
-            Span::styled("Sort: ", on_black(Style::default().fg(Color::DarkGray))),
+            Span::styled("Sort: ", Style::default().fg(THEME_MUTED)),
             Span::styled(
                 sort_label(state.sort).to_string(),
-                on_black(Style::default().fg(Color::Green)),
+                Style::default().fg(Color::LightGreen),
             ),
         ]),
         Screen::Terminal { .. } => Line::from(Span::styled(
             "WC26 TERMINAL",
-            on_black(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Style::default()
+                .fg(THEME_ACCENT)
+                .add_modifier(Modifier::BOLD),
         )),
         Screen::Analysis => {
             let updated = state.analysis_updated.as_deref().unwrap_or("-");
@@ -1637,42 +2465,40 @@ fn header_styled(state: &AppState) -> Line<'static> {
             Line::from(vec![
                 Span::styled(
                     "WC26 ANALYSIS",
-                    on_black(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Style::default()
+                        .fg(THEME_ACCENT)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 sep.clone(),
                 Span::styled(
                     league_label(state.league_mode).to_string(),
-                    on_black(Style::default().fg(Color::Yellow)),
+                    Style::default().fg(THEME_ACCENT_2),
                 ),
                 sep.clone(),
-                Span::styled("Tab: ", on_black(Style::default().fg(Color::DarkGray))),
-                Span::styled(
-                    tab.to_string(),
-                    on_black(Style::default().fg(Color::Magenta)),
-                ),
+                Span::styled("Tab: ", Style::default().fg(THEME_MUTED)),
+                Span::styled(tab.to_string(), Style::default().fg(Color::LightMagenta)),
                 sep.clone(),
                 Span::styled(
                     format!("Teams: {}", state.analysis.len()),
-                    on_black(Style::default().fg(Color::White)),
+                    Style::default().fg(THEME_TEXT),
                 ),
                 sep.clone(),
-                Span::styled(
-                    format!("FIFA: {updated}"),
-                    on_black(Style::default().fg(Color::White)),
-                ),
+                Span::styled(format!("FIFA: {updated}"), Style::default().fg(THEME_TEXT)),
                 sep.clone(),
                 Span::styled(
                     format!("Fetched: {fetched}"),
-                    on_black(Style::default().fg(Color::DarkGray)),
+                    Style::default().fg(THEME_MUTED),
                 ),
                 sep.clone(),
                 Span::styled(
                     status_label.to_string(),
-                    on_black(Style::default().fg(status_color)),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(if state.analysis_loading {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                 ),
             ])
         }
@@ -1691,36 +2517,35 @@ fn header_styled(state: &AppState) -> Line<'static> {
             Line::from(vec![
                 Span::styled(
                     "WC26 SQUAD",
-                    on_black(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Style::default()
+                        .fg(THEME_ACCENT)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 sep.clone(),
-                Span::styled(
-                    format!("Team: {team}"),
-                    on_black(Style::default().fg(Color::Yellow)),
-                ),
+                Span::styled(format!("Team: {team}"), Style::default().fg(THEME_ACCENT_2)),
                 sep.clone(),
                 Span::styled(
                     format!("Players: {}", state.squad.len()),
-                    on_black(Style::default().fg(Color::White)),
+                    Style::default().fg(THEME_TEXT),
                 ),
                 sep.clone(),
                 Span::styled(
                     status_label.to_string(),
-                    on_black(Style::default().fg(status_color)),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(if state.squad_loading {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                 ),
             ])
         }
         Screen::PlayerDetail => Line::from(Span::styled(
             "WC26 PLAYER",
-            on_black(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Style::default()
+                .fg(THEME_ACCENT)
+                .add_modifier(Modifier::BOLD),
         )),
     }
 }
@@ -1816,22 +2641,17 @@ fn footer_styled(state: &AppState) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     for (i, (key, desc)) in bindings.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(
-                " │ ",
-                on_black(Style::default().fg(Color::DarkGray)),
-            ));
+            spans.push(Span::styled(" │ ", Style::default().fg(THEME_BORDER_DIM)));
         }
         spans.push(Span::styled(
             key.to_string(),
-            on_black(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Style::default()
+                .fg(THEME_ACCENT)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(" {desc}"),
-            on_black(Style::default().fg(Color::Gray)),
+            Style::default().fg(THEME_MUTED),
         ));
     }
     Line::from(spans)
@@ -1845,10 +2665,20 @@ fn render_pulse(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (main_area, sidebar_area) = if area.width >= 110 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(72), Constraint::Length(36)])
+            .split(area);
+        (cols[0], cols[1])
+    } else {
+        (area, Rect::new(0, 0, 0, 0))
+    };
+
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
+        .split(main_area);
 
     let widths = pulse_columns();
     render_pulse_header(frame, sections[0], &widths);
@@ -1857,13 +2687,13 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     let rows = state.pulse_live_rows();
     if rows.is_empty() {
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(
             "No matches for this league",
             on_black(empty_style),
         ))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(THEME_BG));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -1871,13 +2701,13 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     const ROW_HEIGHT: u16 = 3;
     if list_area.height < ROW_HEIGHT {
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(
             "Pulse list needs more height",
             on_black(empty_style),
         ))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(THEME_BG));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -1895,6 +2725,14 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.selected;
+        let base_bg = if selected {
+            THEME_FOCUS_BG
+        } else if idx % 2 == 0 {
+            THEME_PANEL_BG
+        } else {
+            THEME_BG
+        };
+        let base_style = Style::default().fg(THEME_TEXT).bg(base_bg);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(widths)
@@ -1909,20 +2747,13 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                 let is_finished = !m.is_live && m.minute >= 90;
 
                 let row_style = if is_not_started {
-                    if selected {
-                        Style::default().fg(Color::Gray).bg(Color::Rgb(30, 30, 46))
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    }
-                } else if selected {
-                    Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 46))
+                    base_style.fg(THEME_MUTED)
+                } else if is_finished {
+                    base_style.fg(THEME_MUTED)
                 } else {
-                    Style::default()
+                    base_style
                 };
-
-                if selected {
-                    frame.render_widget(Block::default().style(row_style), row_area);
-                }
+                frame.render_widget(Block::default().style(row_style), row_area);
 
                 let time = if m.is_live {
                     format!("{}'", m.minute)
@@ -1936,7 +2767,8 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                         .map(|u| format_countdown_short(&u.kickoff, now))
                         .unwrap_or_else(|| "KO".to_string())
                 };
-                let match_name = format!("{}-{}", m.home, m.away);
+                let time = format!("{}{}", if selected { "▸" } else { " " }, time);
+                let match_name = format!("{} vs {}", m.home, m.away);
                 let score = if is_not_started {
                     "--".to_string()
                 } else {
@@ -1945,9 +2777,9 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
 
                 // Time cell: green for live, dim for finished
                 let time_style = if m.is_live {
-                    row_style.fg(Color::Green)
+                    row_style.fg(Color::LightGreen)
                 } else if is_finished {
-                    row_style.fg(Color::DarkGray)
+                    row_style.fg(THEME_MUTED)
                 } else {
                     row_style
                 };
@@ -1980,55 +2812,38 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                     let conf = format!("{}%", m.win.confidence);
 
                     let values = win_prob_values(state.win_prob_history.get(&m.id), m.win.p_home);
-                    let chart = win_line_chart(&values, selected);
+                    let chart = win_line_chart(&values, row_style, selected);
                     frame.render_widget(chart, cols[3]);
 
                     render_cell_text(frame, cols[4], &hda, row_style);
 
                     // Delta: green for positive (home gaining), red for negative
                     let delta_color = if delta_val > 1.0 {
-                        Color::Green
+                        Color::LightGreen
                     } else if delta_val < -1.0 {
-                        Color::Red
+                        Color::LightRed
                     } else {
-                        Color::Gray
+                        THEME_MUTED
                     };
-                    let bg = if selected {
-                        Some(Color::DarkGray)
-                    } else {
-                        None
-                    };
-                    let mut delta_style = Style::default().fg(delta_color);
-                    if let Some(bg_color) = bg {
-                        delta_style = delta_style.bg(bg_color);
-                    }
-                    render_cell_text(frame, cols[5], &delta, delta_style);
+                    render_cell_text(frame, cols[5], &delta, row_style.fg(delta_color));
 
                     // Quality badge: colored by model tier
                     let quality_color = match m.win.quality {
-                        state::ModelQuality::Track => Color::Green,
+                        state::ModelQuality::Track => Color::LightGreen,
                         state::ModelQuality::Event => Color::Yellow,
-                        state::ModelQuality::Basic => Color::DarkGray,
+                        state::ModelQuality::Basic => THEME_MUTED,
                     };
-                    let mut quality_style = Style::default().fg(quality_color);
-                    if let Some(bg_color) = bg {
-                        quality_style = quality_style.bg(bg_color);
-                    }
-                    render_cell_text(frame, cols[6], &quality, quality_style);
+                    render_cell_text(frame, cols[6], &quality, row_style.fg(quality_color));
 
                     // Confidence: dim when low
                     let conf_color = if m.win.confidence >= 70 {
-                        Color::Green
+                        Color::LightGreen
                     } else if m.win.confidence >= 40 {
                         Color::Yellow
                     } else {
-                        Color::DarkGray
+                        THEME_MUTED
                     };
-                    let mut conf_style = Style::default().fg(conf_color);
-                    if let Some(bg_color) = bg {
-                        conf_style = conf_style.bg(bg_color);
-                    }
-                    render_cell_text(frame, cols[7], &conf, conf_style);
+                    render_cell_text(frame, cols[7], &conf, row_style.fg(conf_color));
                 }
             }
             state::PulseLiveRow::Upcoming(upcoming_idx) => {
@@ -2036,18 +2851,12 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                     continue;
                 };
 
-                let row_style = if selected {
-                    Style::default().fg(Color::Gray).bg(Color::Rgb(30, 30, 46))
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-
-                if selected {
-                    frame.render_widget(Block::default().style(row_style), row_area);
-                }
+                let row_style = base_style.fg(THEME_MUTED);
+                frame.render_widget(Block::default().style(row_style), row_area);
 
                 let time = format_countdown_short(&u.kickoff, now);
-                let match_name = format!("{}-{}", u.home, u.away);
+                let time = format!("{}{}", if selected { "▸" } else { " " }, time);
+                let match_name = format!("{} vs {}", u.home, u.away);
 
                 render_cell_text(frame, cols[0], &time, row_style);
                 render_cell_text(frame, cols[1], &match_name, row_style);
@@ -2060,6 +2869,103 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
             }
         }
     }
+
+    if sidebar_area.width > 0 && sidebar_area.height > 0 {
+        render_pulse_live_sidebar(frame, sidebar_area, state);
+    }
+}
+
+fn render_pulse_live_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = terminal_block("Selected", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(6)])
+        .split(inner);
+
+    let base = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+
+    let mut lines: Vec<String> = Vec::new();
+    let selected_id = state.selected_match_id();
+    if let Some(m) = state.selected_match() {
+        let time = if m.is_live {
+            format!("{}'", m.minute)
+        } else if m.minute >= 90 {
+            "FT".to_string()
+        } else {
+            "KO".to_string()
+        };
+        lines.push(format!("{} vs {}", m.home, m.away));
+        lines.push(format!("Score: {}-{}", m.score_home, m.score_away));
+        lines.push(format!("Time: {time}"));
+        lines.push(String::new());
+        lines.push(format!(
+            "Win: H{:.0} D{:.0} A{:.0}",
+            m.win.p_home, m.win.p_draw, m.win.p_away
+        ));
+        lines.push(format!("Δ Home: {:+.1}", m.win.delta_home));
+        lines.push(format!(
+            "Model: {}   Conf: {}%",
+            quality_label(m.win.quality),
+            m.win.confidence
+        ));
+        lines.push(String::new());
+        lines.push("Enter: Terminal   i: Details".to_string());
+
+        let values = win_prob_values(state.win_prob_history.get(&m.id), m.win.p_home);
+        let chart_style = Style::default().fg(Color::LightGreen).bg(THEME_PANEL_BG);
+        let chart = Sparkline::default()
+            .data(&values)
+            .max(100)
+            .style(chart_style);
+        frame.render_widget(chart, chunks[1]);
+    } else if let Some(id) = selected_id.as_deref()
+        && let Some(u) = state.upcoming.iter().find(|u| u.id == id)
+    {
+        lines.push(format!("{} vs {}", u.home, u.away));
+        lines.push("Score: --".to_string());
+        lines.push(format!("Kickoff: {}", u.kickoff));
+        lines.push(format!(
+            "League: {}",
+            if u.league_name.is_empty() {
+                "-"
+            } else {
+                u.league_name.as_str()
+            }
+        ));
+        lines.push(format!(
+            "Round: {}",
+            if u.round.is_empty() {
+                "-"
+            } else {
+                u.round.as_str()
+            }
+        ));
+        lines.push(String::new());
+        lines.push("Enter: Terminal (pins fixture)".to_string());
+        let hint = Paragraph::new(lines.join("\n"))
+            .style(base)
+            .wrap(Wrap { trim: true });
+        frame.render_widget(hint, chunks[0]);
+        return;
+    } else {
+        lines.push("No selection".to_string());
+        lines.push(String::new());
+        lines.push("j/k or arrows to move".to_string());
+        lines.push("u to toggle Upcoming".to_string());
+        lines.push("l to change league".to_string());
+        lines.push("? for help".to_string());
+    }
+
+    let hint = Paragraph::new(lines.join("\n"))
+        .style(base)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(hint, chunks[0]);
 }
 
 fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -2075,13 +2981,13 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
     let upcoming = state.filtered_upcoming();
     if upcoming.is_empty() {
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(
             "No upcoming matches for this league",
             on_black(empty_style),
         ))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(THEME_BG));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2104,6 +3010,13 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
             width: list_area.width,
             height: 1,
         };
+        let row_bg = if idx % 2 == 0 {
+            THEME_PANEL_BG
+        } else {
+            THEME_BG
+        };
+        let row_style = Style::default().fg(THEME_TEXT).bg(row_bg);
+        frame.render_widget(Block::default().style(row_style), row_area);
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -2124,21 +3037,21 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
             m.round.clone()
         };
 
-        let sep_style = Style::default().fg(Color::DarkGray);
-        render_cell_text(frame, cols[0], &kickoff, Style::default());
+        let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(row_bg);
+        render_cell_text(frame, cols[0], &kickoff, row_style.fg(THEME_MUTED));
         render_vseparator(frame, cols[1], sep_style);
-        render_cell_text(frame, cols[2], &match_name, Style::default());
+        render_cell_text(frame, cols[2], &match_name, row_style);
         render_vseparator(frame, cols[3], sep_style);
-        render_cell_text(frame, cols[4], &league, Style::default());
+        render_cell_text(frame, cols[4], &league, row_style.fg(THEME_MUTED));
         render_vseparator(frame, cols[5], sep_style);
-        render_cell_text(frame, cols[6], &round, Style::default());
+        render_cell_text(frame, cols[6], &round, row_style.fg(THEME_MUTED));
     }
 }
 
 fn pulse_columns() -> [Constraint; 8] {
     [
         Constraint::Length(6),
-        Constraint::Length(11),
+        Constraint::Length(22),
         Constraint::Length(7),
         Constraint::Min(20),
         Constraint::Length(13),
@@ -2200,8 +3113,9 @@ fn render_pulse_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        .fg(THEME_ACCENT)
+        .bg(THEME_CHROME_BG)
+        .add_modifier(Modifier::BOLD);
 
     render_cell_text(frame, cols[0], "Time", style);
     render_cell_text(frame, cols[1], "Match", style);
@@ -2219,9 +3133,10 @@ fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let sep_style = Style::default().fg(Color::DarkGray);
+        .fg(THEME_ACCENT)
+        .bg(THEME_CHROME_BG)
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(THEME_CHROME_BG);
 
     render_cell_text(frame, cols[0], "Starts In", style);
     render_vseparator(frame, cols[1], sep_style);
@@ -2240,10 +3155,20 @@ fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (main_area, sidebar_area) = if area.width >= 110 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(78), Constraint::Length(32)])
+            .split(area);
+        (cols[0], cols[1])
+    } else {
+        (area, Rect::new(0, 0, 0, 0))
+    };
+
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
+        .split(main_area);
 
     let widths = analysis_columns();
     render_analysis_header(frame, sections[0], &widths);
@@ -2256,10 +3181,10 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
             "No analysis data yet"
         };
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(THEME_BG));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2281,14 +3206,15 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.analysis_selected;
-        let row_style = if selected {
-            Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 46))
+        let base_bg = if selected {
+            THEME_FOCUS_BG
+        } else if idx % 2 == 0 {
+            THEME_PANEL_BG
         } else {
-            Style::default()
+            THEME_BG
         };
-        if selected {
-            frame.render_widget(Block::default().style(row_style), row_area);
-        }
+        let row_style = Style::default().fg(THEME_TEXT).bg(base_bg);
+        frame.render_widget(Block::default().style(row_style), row_area);
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -2310,19 +3236,15 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
 
         // Confederation colored by region
         let confed_color = confed_color_for(row.confed);
-        let confed_style = if selected {
-            Style::default().fg(confed_color).bg(Color::Rgb(30, 30, 46))
-        } else {
-            Style::default().fg(confed_color)
-        };
-        let sep_style = Style::default().fg(Color::DarkGray);
+        let confed_style = row_style.fg(confed_color);
+        let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(base_bg);
         render_cell_text(frame, cols[0], confed, confed_style);
         render_vseparator(frame, cols[1], sep_style);
         render_cell_text(frame, cols[2], &row.name, row_style);
         render_vseparator(frame, cols[3], sep_style);
         // Rank: highlight top 10
         let rank_style = if row.fifa_rank.map(|r| r <= 10).unwrap_or(false) {
-            row_style.fg(Color::Yellow)
+            row_style.fg(THEME_ACCENT_2).add_modifier(Modifier::BOLD)
         } else {
             row_style
         };
@@ -2330,16 +3252,69 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
         render_vseparator(frame, cols[5], sep_style);
         render_cell_text(frame, cols[6], &points, row_style);
         render_vseparator(frame, cols[7], sep_style);
-        render_cell_text(frame, cols[8], &updated, row_style.fg(Color::DarkGray));
+        render_cell_text(frame, cols[8], &updated, row_style.fg(THEME_MUTED));
         render_vseparator(frame, cols[9], sep_style);
         // Host badge: green
         let host_style = if row.host {
-            row_style.fg(Color::Green)
+            row_style.fg(Color::LightGreen).add_modifier(Modifier::BOLD)
         } else {
-            row_style.fg(Color::DarkGray)
+            row_style.fg(THEME_MUTED)
         };
         render_cell_text(frame, cols[10], host, host_style);
     }
+
+    if sidebar_area.width > 0 && sidebar_area.height > 0 {
+        render_analysis_team_sidebar(frame, sidebar_area, state);
+    }
+}
+
+fn render_analysis_team_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = terminal_block("Team", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let base = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+    let mut lines: Vec<String> = Vec::new();
+
+    let Some(team) = state.selected_analysis() else {
+        lines.push("No team selected".to_string());
+        let p = Paragraph::new(lines.join("\n")).style(base);
+        frame.render_widget(p, inner);
+        return;
+    };
+
+    lines.push(team.name.clone());
+    lines.push(String::new());
+    lines.push(format!("Confed: {}", confed_label(team.confed)));
+    lines.push(format!("Host: {}", if team.host { "yes" } else { "no" }));
+    lines.push(String::new());
+    lines.push(format!(
+        "FIFA rank: {}",
+        team.fifa_rank
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    lines.push(format!(
+        "Points: {}",
+        team.fifa_points
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    lines.push(format!(
+        "Updated: {}",
+        team.fifa_updated.as_deref().unwrap_or("-")
+    ));
+    lines.push(String::new());
+    lines.push("Enter: Squad".to_string());
+    lines.push("Tab: Rankings".to_string());
+
+    let p = Paragraph::new(lines.join("\n"))
+        .style(base)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(p, inner);
 }
 
 fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -2368,40 +3343,34 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let role = role_label(state.rankings_role);
     let metric = metric_label(state.rankings_metric);
-    let sep = Span::styled(" | ", on_black(Style::default().fg(Color::DarkGray)));
+    let sep = Span::styled(" | ", Style::default().fg(THEME_BORDER_DIM));
     let mut header_spans = vec![
         Span::styled(
             "Role Rankings",
-            on_black(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Style::default()
+                .fg(THEME_ACCENT)
+                .add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
-        Span::styled("Role: ", on_black(Style::default().fg(Color::DarkGray))),
+        Span::styled("Role: ", Style::default().fg(THEME_MUTED)),
         Span::styled(
             role.to_string(),
-            on_black(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Style::default()
+                .fg(THEME_ACCENT_2)
+                .add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
-        Span::styled("Metric: ", on_black(Style::default().fg(Color::DarkGray))),
+        Span::styled("Metric: ", Style::default().fg(THEME_MUTED)),
         Span::styled(
             metric.to_string(),
-            on_black(
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Style::default()
+                .fg(THEME_ACCENT)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if state.rankings_loading {
         header_spans.push(sep.clone());
-        let progress_color = Color::Yellow;
+        let progress_color = THEME_ACCENT_2;
         if state.rankings_progress_total > 0 {
             header_spans.push(Span::styled(
                 format!(
@@ -2410,51 +3379,61 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
                     state.rankings_progress_current,
                     state.rankings_progress_total
                 ),
-                Style::default().fg(progress_color),
+                Style::default()
+                    .fg(progress_color)
+                    .add_modifier(Modifier::BOLD),
             ));
         } else {
             header_spans.push(Span::styled(
                 state.rankings_progress_message.clone(),
-                on_black(Style::default().fg(progress_color)),
+                Style::default()
+                    .fg(progress_color)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(header_spans)), sections[0]);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(THEME_CHROME_BG)),
+        sections[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(header_spans)).style(Style::default().bg(THEME_CHROME_BG)),
+        sections[0],
+    );
 
     let search_line = if state.rankings_search_active {
         Line::from(vec![
             Span::styled(
                 "Search [/]: ",
-                on_black(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Style::default()
+                    .fg(THEME_ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 state.rankings_search.clone(),
-                on_black(Style::default().fg(Color::Yellow)),
+                Style::default().fg(THEME_ACCENT_2),
             ),
-            Span::styled("▌", on_black(Style::default().fg(Color::Yellow))),
+            Span::styled("▌", Style::default().fg(THEME_ACCENT_2)),
         ])
     } else if state.rankings_search.is_empty() {
-        Line::from(Span::styled(
-            "Search [/]",
-            on_black(Style::default().fg(Color::DarkGray)),
-        ))
+        Line::from(Span::styled("Search [/]", Style::default().fg(THEME_MUTED)))
     } else {
         Line::from(vec![
-            Span::styled(
-                "Search [/]: ",
-                on_black(Style::default().fg(Color::DarkGray)),
-            ),
+            Span::styled("Search [/]: ", Style::default().fg(THEME_MUTED)),
             Span::styled(
                 state.rankings_search.clone(),
-                on_black(Style::default().fg(Color::Gray)),
+                Style::default().fg(THEME_TEXT),
             ),
         ])
     };
-    frame.render_widget(Paragraph::new(search_line), sections[1]);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(THEME_CHROME_BG)),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new(search_line).style(Style::default().bg(THEME_CHROME_BG)),
+        sections[1],
+    );
 
     let list_area = sections[2];
     if list_area.height == 0 {
@@ -2468,10 +3447,10 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             "No role ranking data yet (press r to warm cache)"
         };
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(THEME_BG));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2496,10 +3475,10 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             "No players match the current search"
         };
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(THEME_BG));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2514,14 +3493,15 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.rankings_selected;
-        let row_style = if selected {
-            Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 46))
+        let base_bg = if selected {
+            THEME_FOCUS_BG
+        } else if idx % 2 == 0 {
+            THEME_PANEL_BG
         } else {
-            Style::default()
+            THEME_BG
         };
-        if selected {
-            frame.render_widget(Block::default().style(row_style), row_area);
-        }
+        let row_style = Style::default().fg(THEME_TEXT).bg(base_bg);
+        frame.render_widget(Block::default().style(row_style), row_area);
 
         let entry = rows[idx];
         let rank = idx + 1;
@@ -2575,49 +3555,39 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled("Selected: ", on_black(Style::default().fg(Color::DarkGray))),
+            Span::styled("Selected: ", Style::default().fg(THEME_MUTED)),
             Span::styled(
                 truncate(&selected.player_name, 28),
-                on_black(
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" ({})", truncate(&selected.team_name, 22)),
-                on_black(Style::default().fg(Color::Gray)),
+                Style::default().fg(THEME_MUTED),
             ),
-            Span::styled("  Score ", on_black(Style::default().fg(Color::DarkGray))),
+            Span::styled("  Score ", Style::default().fg(THEME_MUTED)),
             Span::styled(
                 score_text,
-                on_black(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Style::default()
+                    .fg(THEME_ACCENT_2)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  R ", on_black(Style::default().fg(Color::DarkGray))),
-            Span::styled(rating_text, on_black(Style::default().fg(Color::Magenta))),
+            Span::styled("  R ", Style::default().fg(THEME_MUTED)),
+            Span::styled(rating_text, Style::default().fg(Color::LightMagenta)),
         ]));
 
         lines.push(Line::from(Span::styled(
             "Top contributors",
-            on_black(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Style::default()
+                .fg(THEME_ACCENT)
+                .add_modifier(Modifier::BOLD),
         )));
 
         if factors.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No breakdown available (warm cache / insufficient stat coverage)",
-                on_black(
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
+                Style::default()
+                    .fg(THEME_MUTED)
+                    .add_modifier(Modifier::ITALIC),
             )));
         } else {
             for f in factors
@@ -2626,9 +3596,9 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             {
                 let impact = f.weight * f.z;
                 let impact_style = if impact >= 0.0 {
-                    on_black(Style::default().fg(Color::Green))
+                    Style::default().fg(Color::LightGreen)
                 } else {
-                    on_black(Style::default().fg(Color::Red))
+                    Style::default().fg(Color::LightRed)
                 };
                 let mut tail = String::new();
                 if let Some(pct) = f.pct {
@@ -2639,17 +3609,14 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
                 tail.push_str(&format!(" ({}, w={:.2}, z={:.2})", f.source, f.weight, f.z));
                 lines.push(Line::from(vec![
                     Span::styled(format!("{impact:+.2} "), impact_style),
-                    Span::styled(
-                        truncate(&f.label, 20),
-                        on_black(Style::default().fg(Color::White)),
-                    ),
-                    Span::styled(tail, on_black(Style::default().fg(Color::DarkGray))),
+                    Span::styled(truncate(&f.label, 20), Style::default().fg(THEME_TEXT)),
+                    Span::styled(tail, Style::default().fg(THEME_MUTED)),
                 ]));
             }
         }
 
         let detail = Paragraph::new(lines)
-            .style(Style::default().bg(Color::Black))
+            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, detail_area);
     }
@@ -2668,9 +3635,10 @@ fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let sep_style = Style::default().fg(Color::DarkGray);
+        .fg(THEME_ACCENT)
+        .bg(THEME_CHROME_BG)
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(THEME_CHROME_BG);
 
     render_cell_text(frame, cols[0], "Confed", style);
     render_vseparator(frame, cols[1], sep_style);
@@ -2686,10 +3654,20 @@ fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
 }
 
 fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (main_area, sidebar_area) = if area.width >= 110 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(80), Constraint::Length(30)])
+            .split(area);
+        (cols[0], cols[1])
+    } else {
+        (area, Rect::new(0, 0, 0, 0))
+    };
+
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
+        .split(main_area);
 
     let widths = squad_columns();
     render_squad_header(frame, sections[0], &widths);
@@ -2702,10 +3680,10 @@ fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
             "No squad data yet"
         };
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(THEME_BG));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -2727,14 +3705,15 @@ fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.squad_selected;
-        let row_style = if selected {
-            Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 46))
+        let base_bg = if selected {
+            THEME_FOCUS_BG
+        } else if idx % 2 == 0 {
+            THEME_PANEL_BG
         } else {
-            Style::default()
+            THEME_BG
         };
-        if selected {
-            frame.render_widget(Block::default().style(row_style), row_area);
-        }
+        let row_style = Style::default().fg(THEME_TEXT).bg(base_bg);
+        frame.render_widget(Block::default().style(row_style), row_area);
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -2759,21 +3738,95 @@ fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
             .map(|v| format!("€{:.1}M", v as f64 / 1_000_000.0))
             .unwrap_or_else(|| "-".to_string());
 
-        let sep_style = Style::default().fg(Color::DarkGray);
+        let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(base_bg);
         render_cell_text(frame, cols[0], &player.name, row_style);
         render_vseparator(frame, cols[1], sep_style);
         render_cell_text(frame, cols[2], &number, row_style);
         render_vseparator(frame, cols[3], sep_style);
-        render_cell_text(frame, cols[4], &player.role, row_style);
+        render_cell_text(frame, cols[4], &player.role, row_style.fg(THEME_MUTED));
         render_vseparator(frame, cols[5], sep_style);
         render_cell_text(frame, cols[6], &player.club, row_style);
         render_vseparator(frame, cols[7], sep_style);
-        render_cell_text(frame, cols[8], &age, row_style);
+        render_cell_text(frame, cols[8], &age, row_style.fg(THEME_MUTED));
         render_vseparator(frame, cols[9], sep_style);
-        render_cell_text(frame, cols[10], &height, row_style);
+        render_cell_text(frame, cols[10], &height, row_style.fg(THEME_MUTED));
         render_vseparator(frame, cols[11], sep_style);
-        render_cell_text(frame, cols[12], &value, row_style);
+        render_cell_text(frame, cols[12], &value, row_style.fg(THEME_ACCENT_2));
     }
+
+    if sidebar_area.width > 0 && sidebar_area.height > 0 {
+        render_squad_sidebar(frame, sidebar_area, state);
+    }
+}
+
+fn render_squad_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = terminal_block("Player", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let base = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+    let mut lines: Vec<String> = Vec::new();
+
+    let Some(p) = state.selected_squad_player() else {
+        lines.push("No player selected".to_string());
+        let para = Paragraph::new(lines.join("\n")).style(base);
+        frame.render_widget(para, inner);
+        return;
+    };
+
+    lines.push(p.name.clone());
+    lines.push(String::new());
+    lines.push(format!(
+        "Role: {}",
+        if p.role.is_empty() {
+            "-"
+        } else {
+            p.role.as_str()
+        }
+    ));
+    lines.push(format!(
+        "Club: {}",
+        if p.club.is_empty() {
+            "-"
+        } else {
+            p.club.as_str()
+        }
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "Age: {}",
+        p.age
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    lines.push(format!(
+        "Height: {}",
+        p.height
+            .map(|v| format!("{v} cm"))
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    lines.push(format!(
+        "Shirt: {}",
+        p.shirt_number
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    lines.push(format!(
+        "Value: {}",
+        p.market_value
+            .map(|v| format!("EUR {:.1}M", v as f64 / 1_000_000.0))
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    lines.push(String::new());
+    lines.push("Enter: Player detail".to_string());
+
+    let para = Paragraph::new(lines.join("\n"))
+        .style(base)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(para, inner);
 }
 
 fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
@@ -2782,9 +3835,10 @@ fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let sep_style = Style::default().fg(Color::DarkGray);
+        .fg(THEME_ACCENT)
+        .bg(THEME_CHROME_BG)
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(THEME_CHROME_BG);
 
     render_cell_text(frame, cols[0], "Player", style);
     render_vseparator(frame, cols[1], sep_style);
@@ -2807,11 +3861,14 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         .title(Span::styled(
             " Player Detail ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(THEME_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(THEME_BORDER))
+        .style(Style::default().bg(THEME_PANEL_BG))
+        .padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2821,30 +3878,29 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
 
     if state.player_loading {
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
-        let text = Paragraph::new(Text::styled(
-            "Loading player details...",
-            on_black(empty_style),
-        ))
-        .style(Style::default().bg(Color::Black));
+        let text = Paragraph::new(Text::styled("Loading player details...", empty_style))
+            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
         frame.render_widget(text, inner);
         return;
     }
 
     let Some(detail) = state.player_detail.as_ref() else {
         let empty_style = Style::default()
-            .fg(Color::DarkGray)
+            .fg(THEME_MUTED)
             .add_modifier(Modifier::ITALIC);
-        let text = Paragraph::new(Text::styled("No player data yet", on_black(empty_style)))
-            .style(Style::default().bg(Color::Black));
+        let text = Paragraph::new(Text::styled("No player data yet", empty_style))
+            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
         frame.render_widget(text, inner);
         return;
     };
 
     if inner.height < 8 {
         let text = player_detail_text(detail);
-        let paragraph = Paragraph::new(text).scroll((state.player_detail_scroll, 0));
+        let paragraph = Paragraph::new(text)
+            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
+            .scroll((state.player_detail_scroll, 0));
         frame.render_widget(paragraph, inner);
         return;
     }
@@ -3790,20 +4846,22 @@ fn render_detail_section(
     let total = max_scroll + 1;
     let (border_style, title_style) = if active {
         (
-            Style::default().fg(Color::Yellow),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(THEME_ACCENT_2)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(THEME_ACCENT_2)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         (
-            Style::default().fg(Color::Rgb(60, 60, 80)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME_BORDER_DIM),
+            Style::default().fg(THEME_MUTED),
         )
     };
     let scroll_indicator = Span::styled(
         format!("  {current}/{total}"),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(THEME_MUTED),
     );
     let block = Block::default()
         .title(Line::from(vec![
@@ -3811,13 +4869,22 @@ fn render_detail_section(
             scroll_indicator,
         ]))
         .borders(Borders::ALL)
-        .border_style(border_style);
+        .border_type(if active {
+            BorderType::Double
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(border_style)
+        .style(Style::default().bg(THEME_PANEL_BG))
+        .padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    let paragraph = Paragraph::new(body).scroll((scroll, 0));
+    let paragraph = Paragraph::new(body)
+        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
+        .scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
 }
 
@@ -3866,13 +4933,25 @@ fn player_detail_section_max_scroll(detail: &PlayerDetail, section: usize) -> u1
     text_line_count(&lines).saturating_sub(1)
 }
 
+// Visual system: keep the app cohesive and screenshot-friendly across terminal themes.
+const THEME_BG: Color = Color::Rgb(6, 9, 14);
+const THEME_PANEL_BG: Color = Color::Rgb(10, 14, 22);
+const THEME_FOCUS_BG: Color = Color::Rgb(24, 31, 45);
+const THEME_CHROME_BG: Color = Color::Rgb(9, 12, 18);
+const THEME_BORDER: Color = Color::Rgb(46, 58, 78);
+const THEME_BORDER_DIM: Color = Color::Rgb(30, 38, 52);
+const THEME_TEXT: Color = Color::Rgb(228, 234, 244);
+const THEME_MUTED: Color = Color::Rgb(138, 148, 170);
+const THEME_ACCENT: Color = Color::Rgb(0, 214, 255);
+const THEME_ACCENT_2: Color = Color::Rgb(255, 196, 61);
+
 fn on_black(mut style: Style) -> Style {
     // Ratatui widgets often overwrite the entire cell style.
     // If a widget style doesn't specify a bg, that cell's bg becomes "reset",
     // which can show up as white in light-themed terminals (especially on loading/empty screens).
-    // Force a black background unless a caller explicitly chose another bg.
+    // Force a consistent background unless a caller explicitly chose another bg.
     match style.bg {
-        None | Some(Color::Reset) => style.bg = Some(Color::Black),
+        None | Some(Color::Reset) => style.bg = Some(THEME_BG),
         _ => {}
     }
     style
@@ -3923,10 +5002,10 @@ fn win_prob_values(history: Option<&Vec<f32>>, fallback: f32) -> Vec<u64> {
     values
 }
 
-fn win_line_chart(values: &[u64], selected: bool) -> Sparkline<'_> {
-    let mut style = Style::default().fg(Color::Green);
+fn win_line_chart(values: &[u64], row_style: Style, selected: bool) -> Sparkline<'_> {
+    let mut style = row_style.fg(Color::LightGreen);
     if selected {
-        style = style.bg(Color::DarkGray);
+        style = style.add_modifier(Modifier::BOLD);
     }
     Sparkline::default().data(values).max(100).style(style)
 }
@@ -3947,31 +5026,26 @@ fn visible_range(selected: usize, total: usize, visible: usize) -> (usize, usize
 }
 
 fn terminal_block(title: &str, focused: bool) -> Block<'_> {
-    if focused {
-        Block::default()
-            .title(Span::styled(
-                title,
-                on_black(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ))
-            .borders(Borders::ALL)
-            .border_style(on_black(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ))
+    let (border_color, title_color, border_type) = if focused {
+        (THEME_ACCENT_2, THEME_ACCENT_2, BorderType::Double)
     } else {
-        Block::default()
-            .title(Span::styled(
-                title,
-                on_black(Style::default().fg(Color::DarkGray)),
-            ))
-            .borders(Borders::ALL)
-            .border_style(on_black(Style::default().fg(Color::Rgb(60, 60, 80))))
-    }
+        (THEME_BORDER, THEME_MUTED, BorderType::Rounded)
+    };
+    let marker = if focused { "◆ " } else { "  " };
+    Block::default()
+        .title(Span::styled(
+            format!("{marker}{title}"),
+            Style::default().fg(title_color).add_modifier(if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        ))
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(THEME_PANEL_BG))
+        .padding(Padding::new(1, 1, 0, 0))
 }
 
 fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -4008,15 +5082,20 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(columns[2]);
 
+    let base_panel = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+
     let match_list = match_list_text(state);
-    let left_match = Paragraph::new(match_list).block(terminal_block(
-        "Match List",
-        state.terminal_focus == TerminalFocus::MatchList,
-    ));
+    let left_match = Paragraph::new(match_list)
+        .style(base_panel)
+        .block(terminal_block(
+            "Match List",
+            state.terminal_focus == TerminalFocus::MatchList,
+        ));
     frame.render_widget(left_match, left_chunks[0]);
 
-    let standings =
-        Paragraph::new("Standings placeholder").block(terminal_block("Group Mini", false));
+    let standings = Paragraph::new("Standings placeholder")
+        .style(base_panel.fg(THEME_MUTED))
+        .block(terminal_block("Group Mini", false));
     frame.render_widget(standings, left_chunks[1]);
 
     render_pitch(frame, middle_chunks[0], state);
@@ -4030,28 +5109,35 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         ),
     };
     let tape = Paragraph::new(tape_text).block(terminal_block(tape_title, tape_focus));
+    let tape = tape.style(base_panel);
     frame.render_widget(tape, middle_chunks[1]);
 
     let stats_text = stats_text(state);
-    let stats = Paragraph::new(stats_text).block(terminal_block(
-        "Stats",
-        state.terminal_focus == TerminalFocus::Stats,
-    ));
+    let stats = Paragraph::new(stats_text)
+        .style(base_panel)
+        .block(terminal_block(
+            "Stats",
+            state.terminal_focus == TerminalFocus::Stats,
+        ));
     frame.render_widget(stats, right_chunks[0]);
 
     render_lineups(frame, right_chunks[1], state);
 
     let preds_text = prediction_text(state);
-    let preds = Paragraph::new(preds_text).block(terminal_block(
-        "Prediction",
-        state.terminal_focus == TerminalFocus::Prediction,
-    ));
+    let preds = Paragraph::new(preds_text)
+        .style(base_panel)
+        .block(terminal_block(
+            "Prediction",
+            state.terminal_focus == TerminalFocus::Prediction,
+        ));
     frame.render_widget(preds, right_chunks[2]);
 
-    let console = Paragraph::new(console_text(state)).block(terminal_block(
-        "Console",
-        state.terminal_focus == TerminalFocus::Console,
-    ));
+    let console = Paragraph::new(console_text(state))
+        .style(base_panel)
+        .block(terminal_block(
+            "Console",
+            state.terminal_focus == TerminalFocus::Console,
+        ));
     frame.render_widget(console, rows[1]);
 }
 
@@ -4070,14 +5156,27 @@ fn match_list_text(state: &AppState) -> String {
     let mut lines = Vec::new();
     for m in filtered.iter() {
         let prefix = if active_id == Some(m.id.as_str()) {
-            "> "
+            "▸"
         } else {
-            "  "
+            " "
         };
-        let line = format!(
-            "{prefix}{}-{} {}-{}",
-            m.home, m.away, m.score_home, m.score_away
-        );
+        let status = if m.is_live {
+            format!("{}'", m.minute.min(99))
+        } else if m.minute >= 90 {
+            "FT".to_string()
+        } else if m.minute == 0 {
+            "KO".to_string()
+        } else {
+            format!("{}'", m.minute.min(99))
+        };
+        let home = truncate(&m.home, 5);
+        let away = truncate(&m.away, 5);
+        let score = if !m.is_live && m.minute == 0 {
+            "  -  ".to_string()
+        } else {
+            format!("{}-{}", m.score_home, m.score_away)
+        };
+        let line = format!("{prefix}{status:>3} {home:<5} {score:^5} {away:<5}");
         lines.push(line);
     }
     lines.join("\n")
@@ -4208,19 +5307,22 @@ fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let Some(match_id) = state.selected_match_id() else {
-        let empty = Paragraph::new("No match selected");
+        let empty = Paragraph::new("No match selected")
+            .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
         frame.render_widget(empty, inner);
         return;
     };
 
     let Some(detail) = state.match_detail.get(&match_id) else {
-        let empty = Paragraph::new("No lineups yet");
+        let empty = Paragraph::new("No lineups yet")
+            .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
         frame.render_widget(empty, inner);
         return;
     };
 
     let Some(lineups) = &detail.lineups else {
-        let empty = Paragraph::new("No lineups yet");
+        let empty = Paragraph::new("No lineups yet")
+            .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
         frame.render_widget(empty, inner);
         return;
     };
@@ -4249,7 +5351,10 @@ fn render_pitch(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let text = pitch_text(state, inner.width as usize, inner.height as usize);
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG)),
+        inner,
+    );
 }
 
 fn pitch_text(state: &AppState, width: usize, height: usize) -> String {
@@ -4352,7 +5457,7 @@ fn render_lineup_side(frame: &mut Frame, area: Rect, side: Option<&state::Lineup
     } else {
         "No lineup".to_string()
     };
-    let paragraph = Paragraph::new(text);
+    let paragraph = Paragraph::new(text).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
     frame.render_widget(paragraph, area);
 }
 
@@ -4658,6 +5763,22 @@ fn prediction_detail_text(state: &AppState) -> String {
         if !ex.explain.signals.is_empty() {
             lines.push(format!("Signals: {}", ex.explain.signals.join(", ")));
         }
+
+        if let (Some(dh), Some(da)) = (ex.disc_home, ex.disc_away) {
+            let cov_h = ex
+                .disc_cov_home
+                .map(|v| (v * 11.0).round().clamp(0.0, 11.0) as u8)
+                .unwrap_or(0);
+            let cov_a = ex
+                .disc_cov_away
+                .map(|v| (v * 11.0).round().clamp(0.0, 11.0) as u8)
+                .unwrap_or(0);
+            let mh = ex.disc_mult_home.unwrap_or(1.0);
+            let ma = ex.disc_mult_away.unwrap_or(1.0);
+            lines.push(format!(
+                "Discipline (pct, higher=worse): home={dh:.0} away={da:.0} cov={cov_h}/11 {cov_a}/11 mult={mh:.2}/{ma:.2}"
+            ));
+        }
     }
 
     if let Some(history) = state.win_prob_history.get(&m.id)
@@ -4816,9 +5937,17 @@ fn prediction_text(state: &AppState) -> String {
                 );
                 if state.prediction_show_why {
                     if let Some(ex) = state.prediction_extras.get(&m.id) {
+                        let disc = if ex.disc_home.is_some() && ex.disc_away.is_some() {
+                            " DISC"
+                        } else {
+                            ""
+                        };
                         out.push_str(&format!(
-                            "\nWhy: HA{:+.1} ANA{:+.1} LU{:+.1}",
-                            ex.explain.pp_home_adv, ex.explain.pp_analysis, ex.explain.pp_lineup
+                            "\nWhy: HA{:+.1} ANA{:+.1} LU{:+.1}{}",
+                            ex.explain.pp_home_adv,
+                            ex.explain.pp_analysis,
+                            ex.explain.pp_lineup,
+                            disc
                         ));
                     }
                 }
@@ -4973,9 +6102,9 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(Clear, popup_area);
 
     let (title, title_color) = if state.export.done {
-        ("Export complete", Color::Green)
+        ("Export complete", Color::LightGreen)
     } else {
-        ("Exporting...", Color::Yellow)
+        ("Exporting...", THEME_ACCENT_2)
     };
 
     let block = Block::default()
@@ -4986,7 +6115,10 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(THEME_BORDER))
+        .style(Style::default().bg(THEME_PANEL_BG))
+        .padding(Padding::new(1, 1, 0, 0));
     frame.render_widget(block.clone(), popup_area);
 
     let inner = block.inner(popup_area);
@@ -5015,7 +6147,10 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         )
     };
 
-    frame.render_widget(Paragraph::new(status), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG)),
+        chunks[0],
+    );
 
     let ratio = if state.export.total == 0 {
         0.0
@@ -5026,8 +6161,14 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let gauge = Gauge::default()
         .ratio(ratio)
         .label(format!("{:.0}%", ratio * 100.0))
-        .gauge_style(Style::default().fg(Color::LightGreen))
-        .block(Block::default().borders(Borders::ALL));
+        .gauge_style(Style::default().fg(Color::LightGreen).bg(THEME_PANEL_BG))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(THEME_BORDER_DIM))
+                .style(Style::default().bg(THEME_PANEL_BG)),
+        );
 
     frame.render_widget(gauge, chunks[1]);
 
@@ -5037,7 +6178,10 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         "Please wait"
     };
 
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG)),
+        chunks[2],
+    );
 }
 
 fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -5063,11 +6207,14 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
         .title(Span::styled(
             format!(" {title} "),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(THEME_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(THEME_BORDER))
+        .style(Style::default().bg(THEME_PANEL_BG))
+        .padding(Padding::new(1, 1, 0, 0));
     frame.render_widget(block.clone(), popup_area);
 
     let inner = block.inner(popup_area);
@@ -5092,11 +6239,16 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
 
     let (content, line_count) = if matches!(focus, TerminalFocus::Pitch) {
         let count = text.lines().count().max(1);
-        (Paragraph::new(text), count)
+        (
+            Paragraph::new(text).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG)),
+            count,
+        )
     } else {
         let count = wrapped_line_count(&text, chunks[0].width);
         (
-            Paragraph::new(text).wrap(Wrap { trim: false }),
+            Paragraph::new(text)
+                .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
+                .wrap(Wrap { trim: false }),
             count.max(1),
         )
     };
@@ -5108,7 +6260,7 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
     frame.render_widget(content, chunks[0]);
 
     let footer = Paragraph::new("Arrows scroll | Enter/Esc/b close")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
     frame.render_widget(footer, chunks[1]);
 }
 
@@ -5128,13 +6280,13 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     let section_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(THEME_ACCENT_2)
         .add_modifier(Modifier::BOLD);
     let key_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(THEME_ACCENT)
         .add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(Color::Gray);
-    let dim = Style::default().fg(Color::DarkGray);
+    let desc_style = Style::default().fg(THEME_TEXT);
+    let dim = Style::default().fg(THEME_MUTED);
 
     let help_bindings: &[(&str, &[(&str, &str)])] = &[
         (
@@ -5187,7 +6339,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     lines.push(Line::from(Span::styled(
         "WC26 Terminal — Help",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(THEME_ACCENT)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
@@ -5215,13 +6367,16 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
                 .title(Span::styled(
                     " Help ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(THEME_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(THEME_BORDER))
+                .style(Style::default().bg(THEME_PANEL_BG))
+                .padding(Padding::new(1, 1, 0, 0)),
         )
-        .style(Style::default());
+        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
     frame.render_widget(help, popup_area);
 }
 

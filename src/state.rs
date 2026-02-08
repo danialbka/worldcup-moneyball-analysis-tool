@@ -45,6 +45,15 @@ pub struct PredictionExtras {
     pub lineup_coverage_away: Option<f32>,
     pub blend_w_lineup: f32,
 
+    // Discipline (historical) proxy signal, 0..=100 where higher means more undisciplined.
+    pub disc_home: Option<f32>,
+    pub disc_away: Option<f32>,
+    pub disc_cov_home: Option<f32>,
+    pub disc_cov_away: Option<f32>,
+    // Multipliers applied to pre-match lambdas due to discipline (1.0 means no effect).
+    pub disc_mult_home: Option<f32>,
+    pub disc_mult_away: Option<f32>,
+
     pub explain: PredictionExplain,
 }
 
@@ -87,6 +96,8 @@ pub fn placeholder_match_summary(mode: LeagueMode) -> MatchSummary {
         id: PLACEHOLDER_MATCH_ID.to_string(),
         league_id: None,
         league_name: league_name.to_string(),
+        home_team_id: None,
+        away_team_id: None,
         home: PLACEHOLDER_HOME.to_string(),
         away: PLACEHOLDER_AWAY.to_string(),
         minute: 54,
@@ -1170,6 +1181,8 @@ pub struct MatchSummary {
     pub id: String,
     pub league_id: Option<u32>,
     pub league_name: String,
+    pub home_team_id: Option<u32>,
+    pub away_team_id: Option<u32>,
     pub home: String,
     pub away: String,
     pub minute: u16,
@@ -1212,6 +1225,10 @@ pub struct UpcomingMatch {
     pub league_name: String,
     pub round: String,
     pub kickoff: String,
+    #[serde(default)]
+    pub home_team_id: Option<u32>,
+    #[serde(default)]
+    pub away_team_id: Option<u32>,
     pub home: String,
     pub away: String,
 }
@@ -1586,6 +1603,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     summary,
                     detail,
                     &state.combined_player_cache,
+                    &state.rankings_cache_squads,
                     &state.analysis,
                 );
                 summary.win = win;
@@ -1620,6 +1638,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                         &pre,
                         detail,
                         &state.combined_player_cache,
+                        &state.rankings_cache_squads,
                         &state.analysis,
                     );
                     if let Some(extras) = extras {
@@ -1658,6 +1677,14 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 .match_detail_cached_at
                 .insert(id.clone(), SystemTime::now());
 
+            // When lineups arrive, opportunistically prefetch starter player details so
+            // prediction features can incorporate player history.
+            if let Some(detail_ref) = state.match_detail.get(&id) {
+                let mut ids = collect_lineup_starter_ids(detail_ref);
+                ids.truncate(22);
+                queue_player_prefetch(&mut state.squad_prefetch_pending, ids);
+            }
+
             // Update prediction immediately when details (stats/lineups) arrive.
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
                 let prev_p_home = existing.win.p_home;
@@ -1666,6 +1693,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     existing,
                     detail_ref,
                     &state.combined_player_cache,
+                    &state.rankings_cache_squads,
                     &state.analysis,
                 );
                 existing.win = win;
@@ -1733,6 +1761,12 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 .match_detail_cached_at
                 .insert(id.clone(), SystemTime::now());
 
+            if let Some(detail_ref) = state.match_detail.get(&id) {
+                let mut ids = collect_lineup_starter_ids(detail_ref);
+                ids.truncate(22);
+                queue_player_prefetch(&mut state.squad_prefetch_pending, ids);
+            }
+
             // Update prediction immediately when details (stats/lineups) arrive.
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
                 let prev_p_home = existing.win.p_home;
@@ -1741,6 +1775,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     existing,
                     detail_ref,
                     &state.combined_player_cache,
+                    &state.rankings_cache_squads,
                     &state.analysis,
                 );
                 existing.win = win;
@@ -1773,6 +1808,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 &summary,
                 detail,
                 &state.combined_player_cache,
+                &state.rankings_cache_squads,
                 &state.analysis,
             );
             summary.win = win;
@@ -1817,6 +1853,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                         &pre,
                         detail,
                         &state.combined_player_cache,
+                        &state.rankings_cache_squads,
                         &state.analysis,
                     );
                     if let Some(extras) = extras {
@@ -1854,6 +1891,8 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     id: u.id.clone(),
                     league_id: u.league_id,
                     league_name: u.league_name.clone(),
+                    home_team_id: u.home_team_id,
+                    away_team_id: u.away_team_id,
                     home: u.home.clone(),
                     away: u.away.clone(),
                     minute: 0,
@@ -1874,6 +1913,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     &summary,
                     detail,
                     &state.combined_player_cache,
+                    &state.rankings_cache_squads,
                     &state.analysis,
                 );
                 if let Some(extras) = extras {
@@ -1924,6 +1964,10 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 .rankings_cache_players_at
                 .insert(detail_id, SystemTime::now());
             state.rankings_dirty = true;
+
+            // Player history arriving can change lineup-derived prediction signals; refresh any
+            // match predictions that depend on cached player data.
+            recompute_predictions_after_player_cache_update(state);
         }
         Delta::RankCacheProgress {
             mode,
@@ -2056,6 +2100,76 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.push_log(format!("[INFO] Export finished ({errors} errors)"));
         }
         Delta::Log(msg) => state.push_log(msg),
+    }
+}
+
+fn collect_lineup_starter_ids(detail: &MatchDetail) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let Some(lineups) = detail.lineups.as_ref() else {
+        return ids;
+    };
+    for side in &lineups.sides {
+        for slot in &side.starting {
+            if let Some(id) = slot.id {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn queue_player_prefetch(pending: &mut Option<Vec<u32>>, mut ids: Vec<u32>) {
+    if ids.is_empty() {
+        return;
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if let Some(existing) = pending.as_mut() {
+        existing.extend(ids);
+        existing.sort_unstable();
+        existing.dedup();
+    } else {
+        *pending = Some(ids);
+    }
+}
+
+fn recompute_predictions_after_player_cache_update(state: &mut AppState) {
+    let details = &state.match_detail;
+    let players = &state.combined_player_cache;
+    let squads = &state.rankings_cache_squads;
+    let analysis = &state.analysis;
+
+    let matches = &mut state.matches;
+    let prediction_extras = &mut state.prediction_extras;
+    let win_prob_history = &mut state.win_prob_history;
+    let prematch_win = &mut state.prematch_win;
+    let prematch_locked = &state.prematch_locked;
+
+    for m in matches.iter_mut() {
+        let prev_p_home = m.win.p_home;
+        let detail = details.get(&m.id);
+        let (win, extras) =
+            win_prob::compute_win_prob_explainable(m, detail, players, squads, analysis);
+        m.win = win;
+        if let Some(extras) = extras {
+            prediction_extras.insert(m.id.clone(), extras);
+        }
+        m.win.delta_home = m.win.p_home - prev_p_home;
+
+        if m.is_live {
+            let entry = win_prob_history.entry(m.id.clone()).or_default();
+            entry.push(m.win.p_home);
+            if entry.len() > 40 {
+                let drain_count = entry.len() - 40;
+                entry.drain(..drain_count);
+            }
+        }
+
+        if !prematch_locked.contains(&m.id) && !m.is_live && m.minute == 0 {
+            prematch_win.insert(m.id.clone(), m.win.clone());
+        }
     }
 }
 

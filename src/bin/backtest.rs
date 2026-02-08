@@ -37,6 +37,8 @@ fn main() -> anyhow::Result<()> {
         id: case.id.unwrap_or_else(|| "backtest".to_string()),
         league_id: case.league_id,
         league_name: case.league_name.unwrap_or_else(|| "Backtest".to_string()),
+        home_team_id: None,
+        away_team_id: None,
         home: case.home,
         away: case.away,
         minute: case.minute,
@@ -58,6 +60,7 @@ fn main() -> anyhow::Result<()> {
     let win = win_prob::compute_win_prob(
         &summary,
         case.detail.as_ref(),
+        &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &case.analysis,
     );

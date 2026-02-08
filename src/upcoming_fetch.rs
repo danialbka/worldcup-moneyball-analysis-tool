@@ -16,6 +16,8 @@ pub struct FotmobMatchRow {
     pub id: String,
     pub league_id: u32,
     pub league_name: String,
+    pub home_team_id: u32,
+    pub away_team_id: u32,
     pub home: String,
     pub away: String,
     pub home_score: u8,
@@ -71,6 +73,7 @@ fn fetch_fotmob_response(date: Option<&str>) -> Result<FotmobResponse> {
     let client = http_client()?;
 
     let url = if let Some(date) = date.and_then(non_empty) {
+        let date = normalize_fotmob_date_param(date).unwrap_or_else(|| date.to_string());
         format!("{FOTMOB_MATCHES_URL}?date={date}")
     } else {
         FOTMOB_MATCHES_URL.to_string()
@@ -320,6 +323,8 @@ fn build_upcoming_from_response(data: FotmobResponse) -> Vec<UpcomingMatch> {
                 league_name: league.name.clone(),
                 round: fixture.tournament_stage.unwrap_or_default(),
                 kickoff,
+                home_team_id: (fixture.home.id > 0).then_some(fixture.home.id),
+                away_team_id: (fixture.away.id > 0).then_some(fixture.away.id),
                 home,
                 away,
             });
@@ -349,6 +354,8 @@ fn build_matches_from_response(data: FotmobResponse) -> Vec<FotmobMatchRow> {
                 id: fixture.id.to_string(),
                 league_id,
                 league_name: league.name.clone(),
+                home_team_id: fixture.home.id,
+                away_team_id: fixture.away.id,
                 home,
                 away,
                 home_score,
@@ -367,6 +374,8 @@ fn build_matches_from_response(data: FotmobResponse) -> Vec<FotmobMatchRow> {
 
 #[derive(Debug, Deserialize)]
 struct FotmobTeam {
+    #[serde(default)]
+    id: u32,
     name: String,
     #[serde(rename = "shortName")]
     short_name: Option<String>,
@@ -427,6 +436,37 @@ fn live_minute_from_status(status: &FotmobStatus) -> Option<u16> {
         }
     }
     lt.base_period
+}
+
+fn normalize_fotmob_date_param(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 8 {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_fotmob_date_param;
+
+    #[test]
+    fn normalize_fotmob_date_param_accepts_yyyymmdd_and_yyyy_mm_dd() {
+        assert_eq!(
+            normalize_fotmob_date_param("2026-02-07").as_deref(),
+            Some("20260207")
+        );
+        assert_eq!(
+            normalize_fotmob_date_param("20260207").as_deref(),
+            Some("20260207")
+        );
+        assert!(normalize_fotmob_date_param("bad").is_none());
+    }
 }
 
 fn non_empty(value: &str) -> Option<&str> {

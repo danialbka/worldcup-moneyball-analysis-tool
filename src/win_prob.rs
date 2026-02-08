@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use crate::state::{
     LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, PlayerSlot,
-    PredictionExplain, PredictionExtras, RoleCategory, TeamAnalysis, WinProbRow,
+    PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis, WinProbRow,
+    player_detail_is_stub,
 };
 
 const GOALS_TOTAL_BASE: f64 = 2.60;
@@ -14,19 +15,25 @@ const RATING_STDDEV: f64 = 0.60;
 const SEASON_BLEND: f64 = 0.70;
 const FORM_BLEND: f64 = 0.30;
 
+const DISC_COVERAGE_MIN: f32 = 0.40;
+const K_DISC: f64 = 0.08;
+const DISC_MULT_MAX: f64 = 1.06;
+
 pub fn compute_win_prob(
     summary: &MatchSummary,
     detail: Option<&MatchDetail>,
     players: &HashMap<u32, PlayerDetail>,
+    squads: &HashMap<u32, Vec<SquadPlayer>>,
     analysis: &[TeamAnalysis],
 ) -> WinProbRow {
-    compute_win_prob_explainable(summary, detail, players, analysis).0
+    compute_win_prob_explainable(summary, detail, players, squads, analysis).0
 }
 
 pub fn compute_win_prob_explainable(
     summary: &MatchSummary,
     detail: Option<&MatchDetail>,
     players: &HashMap<u32, PlayerDetail>,
+    squads: &HashMap<u32, Vec<SquadPlayer>>,
     analysis: &[TeamAnalysis],
 ) -> (WinProbRow, Option<PredictionExtras>) {
     // If the match is effectively final, just reflect the result.
@@ -57,65 +64,67 @@ pub fn compute_win_prob_explainable(
         && summary.score_away == 0;
 
     let lineup = detail.and_then(|d| d.lineups.as_ref());
-    let (lineup_home, lineup_away) = if let Some(lineups) = lineup {
-        if lineups.sides.is_empty() {
-            (None, None)
+    let (home_side, away_side): (Option<&LineupSide>, Option<&LineupSide>) =
+        if let Some(lineups) = lineup {
+            if lineups.sides.is_empty() {
+                (None, None)
+            } else {
+                // Prefer mapping by explicit home/away team name from match details.
+                let home_name = detail
+                    .and_then(|d| d.home_team.as_deref())
+                    .unwrap_or_default();
+                let away_name = detail
+                    .and_then(|d| d.away_team.as_deref())
+                    .unwrap_or_default();
+
+                let home_key = normalize_team_key(home_name);
+                let away_key = normalize_team_key(away_name);
+
+                let mut home_side: Option<&LineupSide> = None;
+                let mut away_side: Option<&LineupSide> = None;
+
+                if !home_key.is_empty() || !away_key.is_empty() {
+                    for side in &lineups.sides {
+                        let team_key = normalize_team_key(&side.team);
+                        if home_side.is_none() && !home_key.is_empty() && team_key == home_key {
+                            home_side = Some(side);
+                        }
+                        if away_side.is_none() && !away_key.is_empty() && team_key == away_key {
+                            away_side = Some(side);
+                        }
+                    }
+                }
+
+                // Fallback: match by abbreviation against match summary labels.
+                let home_abbr = normalize_team_key(&summary.home);
+                let away_abbr = normalize_team_key(&summary.away);
+                if home_side.is_none() || away_side.is_none() {
+                    for side in &lineups.sides {
+                        let abbr = normalize_team_key(&side.team_abbr);
+                        if home_side.is_none() && !home_abbr.is_empty() && abbr == home_abbr {
+                            home_side = Some(side);
+                        }
+                        if away_side.is_none() && !away_abbr.is_empty() && abbr == away_abbr {
+                            away_side = Some(side);
+                        }
+                    }
+                }
+
+                // Final fallback: ordering from `upcoming_fetch::parse_lineups` (homeTeam then awayTeam).
+                (
+                    home_side.or_else(|| lineups.sides.first()),
+                    away_side.or_else(|| lineups.sides.get(1)),
+                )
+            }
         } else {
-            // Prefer mapping by explicit home/away team name from match details.
-            let home_name = detail
-                .and_then(|d| d.home_team.as_deref())
-                .unwrap_or_default();
-            let away_name = detail
-                .and_then(|d| d.away_team.as_deref())
-                .unwrap_or_default();
+            (None, None)
+        };
 
-            let home_key = normalize_team_key(home_name);
-            let away_key = normalize_team_key(away_name);
+    let lineup_home = home_side.and_then(|h| lineup_strength_and_coverage(h, players));
+    let lineup_away = away_side.and_then(|a| lineup_strength_and_coverage(a, players));
 
-            let mut home_side: Option<&LineupSide> = None;
-            let mut away_side: Option<&LineupSide> = None;
-
-            if !home_key.is_empty() || !away_key.is_empty() {
-                for side in &lineups.sides {
-                    let team_key = normalize_team_key(&side.team);
-                    if home_side.is_none() && !home_key.is_empty() && team_key == home_key {
-                        home_side = Some(side);
-                    }
-                    if away_side.is_none() && !away_key.is_empty() && team_key == away_key {
-                        away_side = Some(side);
-                    }
-                }
-            }
-
-            // Fallback: match by abbreviation against match summary labels.
-            let home_abbr = normalize_team_key(&summary.home);
-            let away_abbr = normalize_team_key(&summary.away);
-            if home_side.is_none() || away_side.is_none() {
-                for side in &lineups.sides {
-                    let abbr = normalize_team_key(&side.team_abbr);
-                    if home_side.is_none() && !home_abbr.is_empty() && abbr == home_abbr {
-                        home_side = Some(side);
-                    }
-                    if away_side.is_none() && !away_abbr.is_empty() && abbr == away_abbr {
-                        away_side = Some(side);
-                    }
-                }
-            }
-
-            // Final fallback: ordering from `upcoming_fetch::parse_lineups` (homeTeam then awayTeam).
-            let home_side = home_side.or_else(|| lineups.sides.first());
-            let away_side = away_side.or_else(|| lineups.sides.get(1));
-            match (home_side, away_side) {
-                (Some(h), Some(a)) => (
-                    lineup_strength_and_coverage(h, players),
-                    lineup_strength_and_coverage(a, players),
-                ),
-                _ => (None, None),
-            }
-        }
-    } else {
-        (None, None)
-    };
+    let disc_home_lineup = home_side.and_then(|h| discipline_from_slots(&h.starting, players));
+    let disc_away_lineup = away_side.and_then(|a| discipline_from_slots(&a.starting, players));
 
     let home_label = detail
         .and_then(|d| d.home_team.as_deref())
@@ -175,8 +184,46 @@ pub fn compute_win_prob_explainable(
     };
 
     let diff = HOME_ADV_GOALS + K_STRENGTH * (s_home - s_away);
-    let lambda_home_pre = clamp((GOALS_TOTAL_BASE / 2.0) + (diff / 2.0), 0.20, 3.80);
-    let lambda_away_pre = clamp((GOALS_TOTAL_BASE / 2.0) - (diff / 2.0), 0.20, 3.80);
+    let mut lambda_home_pre = clamp((GOALS_TOTAL_BASE / 2.0) + (diff / 2.0), 0.20, 3.80);
+    let mut lambda_away_pre = clamp((GOALS_TOTAL_BASE / 2.0) - (diff / 2.0), 0.20, 3.80);
+
+    // Historical discipline proxy (fouls/cards) slightly boosts the opponent's scoring expectation.
+    let (disc_home, disc_cov_home) = disc_home_lineup
+        .filter(|(_, cov)| *cov >= DISC_COVERAGE_MIN)
+        .or_else(|| {
+            summary
+                .home_team_id
+                .and_then(|id| discipline_from_squad(id, squads, players))
+                .filter(|(_, cov)| *cov >= DISC_COVERAGE_MIN)
+        })
+        .unwrap_or((None, 0.0));
+    let (disc_away, disc_cov_away) = disc_away_lineup
+        .filter(|(_, cov)| *cov >= DISC_COVERAGE_MIN)
+        .or_else(|| {
+            summary
+                .away_team_id
+                .and_then(|id| discipline_from_squad(id, squads, players))
+                .filter(|(_, cov)| *cov >= DISC_COVERAGE_MIN)
+        })
+        .unwrap_or((None, 0.0));
+
+    let mut disc_mult_home: f32 = 1.0;
+    let mut disc_mult_away: f32 = 1.0;
+    if let (Some(dh), Some(da)) = (disc_home, disc_away) {
+        let delta = ((dh - da) as f64 / 100.0).clamp(-1.0, 1.0);
+        if delta.abs() > 0.001 {
+            let mult = clamp(1.0 + K_DISC * delta.abs(), 1.0, DISC_MULT_MAX);
+            if delta > 0.0 {
+                // Home is more undisciplined -> boost away scoring.
+                lambda_away_pre = clamp(lambda_away_pre * mult, 0.20, 3.80);
+                disc_mult_away = mult as f32;
+            } else {
+                // Away is more undisciplined -> boost home scoring.
+                lambda_home_pre = clamp(lambda_home_pre * mult, 0.20, 3.80);
+                disc_mult_home = mult as f32;
+            }
+        }
+    }
 
     let effective_total = estimate_total_minutes(summary, detail);
     let minute_raw = summary.minute as f64;
@@ -325,6 +372,7 @@ pub fn compute_win_prob_explainable(
     };
 
     let extras = if is_prematch {
+        let have_disc = disc_home.is_some() && disc_away.is_some();
         Some(build_prematch_extras(
             lambda_home_pre,
             lambda_away_pre,
@@ -337,6 +385,28 @@ pub fn compute_win_prob_explainable(
             lineup_cov_home,
             lineup_cov_away,
             blend_w_lineup,
+            disc_home,
+            disc_away,
+            if disc_cov_home > 0.0 {
+                Some(disc_cov_home)
+            } else {
+                None
+            },
+            if disc_cov_away > 0.0 {
+                Some(disc_cov_away)
+            } else {
+                None
+            },
+            if have_disc {
+                Some(disc_mult_home)
+            } else {
+                None
+            },
+            if have_disc {
+                Some(disc_mult_away)
+            } else {
+                None
+            },
             win.p_home,
             win.p_draw,
             win.p_away,
@@ -380,6 +450,12 @@ fn build_prematch_extras(
     cov_home: Option<f32>,
     cov_away: Option<f32>,
     blend_w_lineup: f32,
+    disc_home: Option<f32>,
+    disc_away: Option<f32>,
+    disc_cov_home: Option<f32>,
+    disc_cov_away: Option<f32>,
+    disc_mult_home: Option<f32>,
+    disc_mult_away: Option<f32>,
     p_home_final: f32,
     p_draw_final: f32,
     p_away_final: f32,
@@ -409,6 +485,18 @@ fn build_prematch_extras(
         let n_a = (ca * 11.0).round().clamp(0.0, 11.0) as u8;
         signals.push(format!("LINEUP_{n_h}/11_{n_a}/11"));
     }
+    if let (Some(dh), Some(da), Some(ch), Some(ca)) =
+        (disc_home, disc_away, disc_cov_home, disc_cov_away)
+    {
+        let n_h = (ch * 11.0).round().clamp(0.0, 11.0) as u8;
+        let n_a = (ca * 11.0).round().clamp(0.0, 11.0) as u8;
+        let mh = disc_mult_home.unwrap_or(1.0);
+        let ma = disc_mult_away.unwrap_or(1.0);
+        signals.push(format!(
+            "DISC_H{:.0}_A{:.0}_COV{}/{}_M{:.2}/{:.2}",
+            dh, da, n_h, n_a, mh, ma
+        ));
+    }
 
     let pp_home_adv = p_home_ha - p_home_baseline;
     let pp_analysis = p_home_analysis_p - p_home_ha;
@@ -425,6 +513,12 @@ fn build_prematch_extras(
         lineup_coverage_home: cov_home,
         lineup_coverage_away: cov_away,
         blend_w_lineup,
+        disc_home,
+        disc_away,
+        disc_cov_home,
+        disc_cov_away,
+        disc_mult_home,
+        disc_mult_away,
         explain: PredictionExplain {
             p_home_baseline,
             p_draw_baseline,
@@ -1280,6 +1374,103 @@ fn iter_all_stats<'a>(detail: &'a PlayerDetail) -> impl Iterator<Item = StatCand
     perf.chain(all_comp).chain(top).chain(main).chain(groups)
 }
 
+fn player_discipline_score(detail: &PlayerDetail) -> Option<f32> {
+    if player_detail_is_stub(detail) {
+        return None;
+    }
+    let fouls = find_stat_pct(detail, &["fouls committed"], &[]);
+    let yellow = find_stat_pct(detail, &["yellow cards"], &[]);
+    let red = find_stat_pct(detail, &["red cards"], &[]);
+
+    let mut sum = 0.0;
+    let mut w = 0.0;
+    let mut n = 0u8;
+
+    if let Some(v) = fouls {
+        sum += 0.50 * v;
+        w += 0.50;
+        n += 1;
+    }
+    if let Some(v) = yellow {
+        sum += 0.35 * v;
+        w += 0.35;
+        n += 1;
+    }
+    if let Some(v) = red {
+        sum += 0.15 * v;
+        w += 0.15;
+        n += 1;
+    }
+
+    if n < 2 || w <= 0.0 {
+        return None;
+    }
+    Some((sum / w).clamp(0.0, 100.0) as f32)
+}
+
+fn discipline_from_slots(
+    slots: &[PlayerSlot],
+    players: &HashMap<u32, PlayerDetail>,
+) -> Option<(Option<f32>, f32)> {
+    let mut sum = 0.0f32;
+    let mut used = 0usize;
+
+    for slot in slots {
+        let Some(id) = slot.id else {
+            continue;
+        };
+        let Some(p) = players.get(&id) else {
+            continue;
+        };
+        let Some(score) = player_discipline_score(p) else {
+            continue;
+        };
+        sum += score;
+        used += 1;
+    }
+
+    if used == 0 {
+        return None;
+    }
+    let cov = (used as f32 / 11.0).clamp(0.0, 1.0);
+    let score = if used >= 3 {
+        Some((sum / used as f32).clamp(0.0, 100.0))
+    } else {
+        None
+    };
+    Some((score, cov))
+}
+
+fn discipline_from_squad(
+    team_id: u32,
+    squads: &HashMap<u32, Vec<SquadPlayer>>,
+    players: &HashMap<u32, PlayerDetail>,
+) -> Option<(Option<f32>, f32)> {
+    let squad = squads.get(&team_id)?;
+    let mut sum = 0.0f32;
+    let mut used = 0usize;
+    for sp in squad {
+        let Some(p) = players.get(&sp.id) else {
+            continue;
+        };
+        let Some(score) = player_discipline_score(p) else {
+            continue;
+        };
+        sum += score;
+        used += 1;
+    }
+    if used == 0 {
+        return None;
+    }
+    let cov = (used as f32 / 11.0).clamp(0.0, 1.0);
+    let score = if used >= 3 {
+        Some((sum / used as f32).clamp(0.0, 100.0))
+    } else {
+        None
+    };
+    Some((score, cov))
+}
+
 fn lineup_strength_and_coverage(
     lineup: &LineupSide,
     players: &HashMap<u32, PlayerDetail>,
@@ -1537,6 +1728,8 @@ mod tests {
             id: "m".to_string(),
             league_id: None,
             league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
             home: "H".to_string(),
             away: "A".to_string(),
             minute: 1,
@@ -1552,7 +1745,7 @@ mod tests {
             },
             is_live: true,
         };
-        let win = compute_win_prob(&summary, None, &HashMap::new(), &[]);
+        let win = compute_win_prob(&summary, None, &HashMap::new(), &HashMap::new(), &[]);
         let sum = win.p_home + win.p_draw + win.p_away;
         assert!((sum - 100.0).abs() < 0.01);
     }
@@ -1563,6 +1756,8 @@ mod tests {
             id: "m".to_string(),
             league_id: None,
             league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
             home: "H".to_string(),
             away: "A".to_string(),
             minute: 80,
@@ -1578,7 +1773,7 @@ mod tests {
             },
             is_live: true,
         };
-        let win = compute_win_prob(&summary, None, &HashMap::new(), &[]);
+        let win = compute_win_prob(&summary, None, &HashMap::new(), &HashMap::new(), &[]);
         assert!(win.p_home > 95.0);
     }
 
@@ -1588,6 +1783,8 @@ mod tests {
             id: "m".to_string(),
             league_id: None,
             league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
             home: "H".to_string(),
             away: "A".to_string(),
             minute: 45,
@@ -1650,7 +1847,7 @@ mod tests {
         cache.insert(1, stub_player(1, &["7.2", "7.0", "6.9"]));
         cache.insert(2, stub_player(2, &["6.8", "6.7", "6.6"]));
 
-        let win = compute_win_prob(&summary, Some(&detail), &cache, &[]);
+        let win = compute_win_prob(&summary, Some(&detail), &cache, &HashMap::new(), &[]);
         // With heavy xG edge at HT, home should be favored.
         assert!(win.p_home > win.p_away);
     }
@@ -1661,6 +1858,8 @@ mod tests {
             id: "m".to_string(),
             league_id: None,
             league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
             home: "Home".to_string(),
             away: "Away".to_string(),
             minute: 0,
@@ -1751,7 +1950,7 @@ mod tests {
             );
         }
 
-        let win = compute_win_prob(&summary, Some(&detail), &cache, &[]);
+        let win = compute_win_prob(&summary, Some(&detail), &cache, &HashMap::new(), &[]);
         assert_eq!(win.quality, ModelQuality::Track);
         assert!(win.p_home > win.p_away);
     }
@@ -1762,6 +1961,8 @@ mod tests {
             id: "m".to_string(),
             league_id: None,
             league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
             home: "Home".to_string(),
             away: "Away".to_string(),
             minute: 0,
@@ -1853,7 +2054,7 @@ mod tests {
             );
         }
 
-        let win = compute_win_prob(&summary, Some(&detail), &cache, &[]);
+        let win = compute_win_prob(&summary, Some(&detail), &cache, &HashMap::new(), &[]);
         assert_eq!(win.quality, ModelQuality::Track);
         assert!(win.p_away > win.p_home);
     }
@@ -1864,6 +2065,8 @@ mod tests {
             id: "m".to_string(),
             league_id: None,
             league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
             home: "Home".to_string(),
             away: "Away".to_string(),
             minute: 0,
@@ -1951,8 +2154,9 @@ mod tests {
             },
         ];
 
-        let win_with_lineups = compute_win_prob(&summary, Some(&detail), &cache, &analysis);
-        let win_no_lineups = compute_win_prob(&summary, None, &cache, &analysis);
+        let win_with_lineups =
+            compute_win_prob(&summary, Some(&detail), &cache, &HashMap::new(), &analysis);
+        let win_no_lineups = compute_win_prob(&summary, None, &cache, &HashMap::new(), &analysis);
 
         assert_eq!(win_with_lineups.quality, ModelQuality::Basic);
         assert_eq!(win_no_lineups.quality, ModelQuality::Basic);
@@ -1962,11 +2166,114 @@ mod tests {
     }
 
     #[test]
+    fn discipline_history_boosts_opponent_lambda() {
+        let summary = MatchSummary {
+            id: "m".to_string(),
+            league_id: None,
+            league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
+            home: "Home".to_string(),
+            away: "Away".to_string(),
+            minute: 0,
+            score_home: 0,
+            score_away: 0,
+            win: WinProbRow {
+                p_home: 0.0,
+                p_draw: 0.0,
+                p_away: 0.0,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 0,
+            },
+            is_live: false,
+        };
+
+        let lineup_home = LineupSide {
+            team: "Home".to_string(),
+            team_abbr: "HOM".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (1..=5)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("H{id}"),
+                    number: None,
+                    pos: None,
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+        let lineup_away = LineupSide {
+            team: "Away".to_string(),
+            team_abbr: "AWY".to_string(),
+            formation: "4-3-3".to_string(),
+            starting: (101..=105)
+                .map(|id| PlayerSlot {
+                    id: Some(id),
+                    name: format!("A{id}"),
+                    number: None,
+                    pos: None,
+                })
+                .collect(),
+            subs: Vec::new(),
+        };
+
+        let detail = MatchDetail {
+            home_team: Some("Home".to_string()),
+            away_team: Some("Away".to_string()),
+            events: Vec::new(),
+            commentary: Vec::new(),
+            commentary_error: None,
+            lineups: Some(MatchLineups {
+                sides: vec![lineup_home, lineup_away],
+            }),
+            stats: Vec::new(),
+        };
+
+        let home_disc = &[
+            ("Fouls committed", 90.0),
+            ("Yellow cards", 90.0),
+            ("Red cards", 90.0),
+        ];
+        let away_disc = &[
+            ("Fouls committed", 10.0),
+            ("Yellow cards", 10.0),
+            ("Red cards", 10.0),
+        ];
+
+        let mut cache: HashMap<u32, PlayerDetail> = HashMap::new();
+        for id in 1..=5 {
+            cache.insert(
+                id,
+                stub_player_with_percentiles(id, &format!("H{id}"), home_disc, &[]),
+            );
+        }
+        for id in 101..=105 {
+            cache.insert(
+                id,
+                stub_player_with_percentiles(id, &format!("A{id}"), away_disc, &[]),
+            );
+        }
+
+        let (win, extras) =
+            compute_win_prob_explainable(&summary, Some(&detail), &cache, &HashMap::new(), &[]);
+        let extras = extras.expect("prematch extras");
+        assert!(win.p_home > 0.0);
+        assert!(extras.disc_home.is_some());
+        assert!(extras.disc_away.is_some());
+        // With home more undisciplined, away lambda should be boosted.
+        assert!(extras.disc_mult_away.unwrap_or(1.0) > 1.0);
+        assert!(extras.lambda_away_pre > 1.225);
+    }
+
+    #[test]
     fn prematch_extras_explainability_is_consistent() {
         let summary = MatchSummary {
             id: "m".to_string(),
             league_id: None,
             league_name: "L".to_string(),
+            home_team_id: None,
+            away_team_id: None,
             home: "Home".to_string(),
             away: "Away".to_string(),
             minute: 0,
@@ -2004,8 +2311,13 @@ mod tests {
             },
         ];
 
-        let (win, extras) =
-            compute_win_prob_explainable(&summary, None, &HashMap::new(), &analysis);
+        let (win, extras) = compute_win_prob_explainable(
+            &summary,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &analysis,
+        );
         let extras = extras.expect("prematch extras");
 
         assert!((extras.explain.p_home_final - win.p_home).abs() < 0.01);
