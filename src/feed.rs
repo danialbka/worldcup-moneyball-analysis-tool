@@ -418,6 +418,10 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                 }
                             };
                             let errors = std::sync::Mutex::new(analysis.errors);
+                            // Persist analysis too, otherwise on next restart rankings can't be
+                            // computed from cached squads/players without re-fetching teams.
+                            let teams = analysis.teams.clone();
+                            let _ = tx.send(Delta::SetAnalysis { mode, teams });
                             let total = AtomicUsize::new(analysis.teams.len());
                             let current = AtomicUsize::new(0);
                             let pool = build_fetch_pool();
@@ -678,10 +682,71 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                             }
                         }
                     }
+                    ProviderCommand::FetchSquadRevalidate { team_id, team_name } => {
+                        match analysis_fetch::fetch_team_squad_revalidate(team_id) {
+                            Ok(squad) => {
+                                let _ = tx.send(Delta::SetSquad {
+                                    team_name: squad.team_name,
+                                    team_id,
+                                    players: squad.players,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(Delta::Log(format!("[WARN] Squad fetch failed: {err}")));
+                                let _ = tx.send(Delta::SetSquad {
+                                    team_name,
+                                    team_id,
+                                    players: Vec::new(),
+                                });
+                            }
+                        }
+                    }
                     ProviderCommand::FetchPlayer {
                         player_id,
                         player_name,
                     } => match analysis_fetch::fetch_player_detail(player_id) {
+                        Ok(detail) => {
+                            let _ = tx.send(Delta::SetPlayerDetail(detail));
+                        }
+                        Err(err) => {
+                            let _ =
+                                tx.send(Delta::Log(format!("[WARN] Player fetch failed: {err}")));
+                            let _ = tx.send(Delta::SetPlayerDetail(crate::state::PlayerDetail {
+                                id: player_id,
+                                name: player_name,
+                                team: None,
+                                position: None,
+                                age: None,
+                                country: None,
+                                height: None,
+                                preferred_foot: None,
+                                shirt: None,
+                                market_value: None,
+                                contract_end: None,
+                                birth_date: None,
+                                status: None,
+                                injury_info: None,
+                                international_duty: None,
+                                positions: Vec::new(),
+                                all_competitions: Vec::new(),
+                                all_competitions_season: None,
+                                main_league: None,
+                                top_stats: Vec::new(),
+                                season_groups: Vec::new(),
+                                season_performance: Vec::new(),
+                                traits: None,
+                                recent_matches: Vec::new(),
+                                season_breakdown: Vec::new(),
+                                career_sections: Vec::new(),
+                                trophies: Vec::new(),
+                            }));
+                        }
+                    },
+                    ProviderCommand::FetchPlayerRevalidate {
+                        player_id,
+                        player_name,
+                    } => match analysis_fetch::fetch_player_detail_revalidate(player_id) {
                         Ok(detail) => {
                             let _ = tx.send(Delta::SetPlayerDetail(detail));
                         }

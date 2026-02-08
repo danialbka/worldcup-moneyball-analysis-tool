@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer};
 
-use crate::http_cache::fetch_json_cached;
+use crate::http_cache::{fetch_json_cached, fetch_json_cached_revalidate};
 use crate::http_client::http_client;
 use crate::state::{
     Confederation, PlayerDetail, PlayerLeagueStats, PlayerMatchStat, PlayerSeasonPerformanceGroup,
@@ -925,10 +925,22 @@ pub struct TeamSquad {
 }
 
 pub fn fetch_team_squad(team_id: u32) -> Result<TeamSquad> {
+    fetch_team_squad_with_opts(team_id, false)
+}
+
+pub fn fetch_team_squad_revalidate(team_id: u32) -> Result<TeamSquad> {
+    fetch_team_squad_with_opts(team_id, true)
+}
+
+fn fetch_team_squad_with_opts(team_id: u32, revalidate: bool) -> Result<TeamSquad> {
     let client = http_client()?;
 
     let url = format!("{FOTMOB_TEAM_URL}{team_id}");
-    let body = fetch_json_cached(client, &url, &[]).context("request failed")?;
+    let body = if revalidate {
+        fetch_json_cached_revalidate(client, &url, &[]).context("request failed")?
+    } else {
+        fetch_json_cached(client, &url, &[]).context("request failed")?
+    };
     let trimmed = body.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return Err(anyhow::anyhow!("empty team response"));
@@ -965,13 +977,25 @@ pub fn fetch_team_squad(team_id: u32) -> Result<TeamSquad> {
 }
 
 pub fn fetch_player_detail(player_id: u32) -> Result<PlayerDetail> {
+    fetch_player_detail_with_opts(player_id, false)
+}
+
+pub fn fetch_player_detail_revalidate(player_id: u32) -> Result<PlayerDetail> {
+    fetch_player_detail_with_opts(player_id, true)
+}
+
+fn fetch_player_detail_with_opts(player_id: u32, revalidate: bool) -> Result<PlayerDetail> {
     let client = http_client()?;
 
     let url = format!("https://www.fotmob.com/api/playerData?id={player_id}");
     let mut last_err = None;
     let mut parsed: Option<PlayerDetail> = None;
     for attempt in 0..3 {
-        let resp = fetch_json_cached(client, &url, &[("Accept-Language", "en-GB,en;q=0.9")]);
+        let resp = if revalidate {
+            fetch_json_cached_revalidate(client, &url, &[("Accept-Language", "en-GB,en;q=0.9")])
+        } else {
+            fetch_json_cached(client, &url, &[("Accept-Language", "en-GB,en;q=0.9")])
+        };
 
         match resp {
             Ok(body) => match parse_player_detail_json(&body) {

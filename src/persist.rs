@@ -17,6 +17,8 @@ const CACHE_VERSION: u32 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CacheFile {
     version: u32,
+    #[serde(default)]
+    last_league: Option<String>,
     leagues: HashMap<String, LeagueCache>,
 }
 
@@ -119,6 +121,30 @@ pub fn load_into_state(state: &mut AppState) {
         .collect();
 }
 
+/// On startup, restore the most recently used league (if present in the cache file).
+///
+/// This avoids "empty" state on launch when the user last worked in a different league mode.
+pub fn load_last_league_mode(state: &mut AppState) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(cache) = serde_json::from_str::<CacheFile>(&raw) else {
+        return;
+    };
+    if cache.version != CACHE_VERSION {
+        return;
+    }
+    let Some(key) = cache.last_league.as_deref() else {
+        return;
+    };
+    if let Some(mode) = league_mode_from_key(key) {
+        state.league_mode = mode;
+    }
+}
+
 pub fn save_from_state(state: &AppState) {
     let Some(path) = cache_path() else {
         return;
@@ -130,9 +156,11 @@ pub fn save_from_state(state: &AppState) {
 
     let mut cache = load_cache_file(&path).unwrap_or_else(|| CacheFile {
         version: CACHE_VERSION,
+        last_league: None,
         leagues: HashMap::new(),
     });
     cache.version = CACHE_VERSION;
+    cache.last_league = Some(league_key(state.league_mode).to_string());
 
     let key = league_key(state.league_mode).to_string();
     cache.leagues.insert(
@@ -214,5 +242,18 @@ fn league_key(mode: LeagueMode) -> &'static str {
         LeagueMode::Ligue1 => "ligue1",
         LeagueMode::ChampionsLeague => "champions_league",
         LeagueMode::WorldCup => "worldcup",
+    }
+}
+
+fn league_mode_from_key(key: &str) -> Option<LeagueMode> {
+    match key {
+        "premier_league" => Some(LeagueMode::PremierLeague),
+        "laliga" => Some(LeagueMode::LaLiga),
+        "bundesliga" => Some(LeagueMode::Bundesliga),
+        "serie_a" => Some(LeagueMode::SerieA),
+        "ligue1" => Some(LeagueMode::Ligue1),
+        "champions_league" => Some(LeagueMode::ChampionsLeague),
+        "worldcup" => Some(LeagueMode::WorldCup),
+        _ => None,
     }
 }

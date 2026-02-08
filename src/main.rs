@@ -25,7 +25,8 @@ use wc26_terminal::{analysis_rankings, feed, http_cache, persist, upcoming_fetch
 use wc26_terminal::state::{
     self, AppState, LeagueMode, PLACEHOLDER_MATCH_ID, PLAYER_DETAIL_SECTIONS, PlayerDetail,
     PlayerStatItem, PulseView, RoleCategory, Screen, TerminalFocus, apply_delta, confed_label,
-    league_label, metric_label, placeholder_match_detail, placeholder_match_summary, role_label,
+    league_label, metric_label, placeholder_match_detail, placeholder_match_summary,
+    recompute_predictions_after_player_cache_update, role_label,
 };
 
 struct App {
@@ -44,14 +45,20 @@ struct App {
     hover_selected_since: Instant,
     hover_prefetched_match_id: Option<String>,
     detail_cache_ttl: Duration,
-    squad_cache_ttl: Duration,
-    player_cache_ttl: Duration,
     prefetch_players_limit: usize,
     auto_warm_mode: AutoWarmMode,
     auto_warm_pending: bool,
     analysis_request_throttle: Duration,
     last_analysis_request: HashMap<LeagueMode, Instant>,
     detail_dist_cache: Option<DetailDistCache>,
+
+    rankings_last_recompute: Instant,
+    rankings_update_counter: u32,
+    rankings_recompute_interval: Duration,
+    rankings_recompute_min_updates: u32,
+
+    predictions_last_recompute: Instant,
+    predictions_recompute_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,16 +105,6 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(450)
             .max(0);
-        let squad_cache_ttl = std::env::var("SQUAD_CACHE_SECS")
-            .ok()
-            .and_then(|val| val.parse::<u64>().ok())
-            .unwrap_or(21600)
-            .max(60);
-        let player_cache_ttl = std::env::var("PLAYER_CACHE_SECS")
-            .ok()
-            .and_then(|val| val.parse::<u64>().ok())
-            .unwrap_or(21600)
-            .max(60);
         let prefetch_players_limit = std::env::var("PREFETCH_PLAYERS")
             .ok()
             .and_then(|val| val.parse::<usize>().ok())
@@ -118,6 +115,24 @@ impl App {
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(10)
             .max(1);
+        let rankings_recompute_ms = std::env::var("RANKINGS_RECOMPUTE_MS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(250)
+            .clamp(50, 5_000);
+        let rankings_recompute_min_updates = std::env::var("RANKINGS_RECOMPUTE_MIN_UPDATES")
+            .ok()
+            .and_then(|val| val.parse::<u32>().ok())
+            .unwrap_or(25)
+            .clamp(1, 5_000);
+        let predictions_recompute_ms = std::env::var("PREDICTIONS_RECOMPUTE_MS")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(500)
+            .clamp(100, 10_000);
+
+        let rankings_recompute_interval = Duration::from_millis(rankings_recompute_ms);
+        let predictions_recompute_interval = Duration::from_millis(predictions_recompute_ms);
         let auto_warm_mode = parse_auto_warm_mode();
         Self {
             state: AppState::new(),
@@ -135,14 +150,20 @@ impl App {
             hover_selected_since: Instant::now(),
             hover_prefetched_match_id: None,
             detail_cache_ttl: Duration::from_secs(detail_cache_ttl),
-            squad_cache_ttl: Duration::from_secs(squad_cache_ttl),
-            player_cache_ttl: Duration::from_secs(player_cache_ttl),
             prefetch_players_limit,
             auto_warm_pending: auto_warm_mode != AutoWarmMode::Off,
             auto_warm_mode,
             analysis_request_throttle: Duration::from_secs(analysis_request_throttle),
             last_analysis_request: HashMap::new(),
             detail_dist_cache: None,
+
+            rankings_last_recompute: Instant::now() - rankings_recompute_interval,
+            rankings_update_counter: 0,
+            rankings_recompute_interval,
+            rankings_recompute_min_updates,
+
+            predictions_last_recompute: Instant::now() - predictions_recompute_interval,
+            predictions_recompute_interval,
         }
     }
 
@@ -262,7 +283,7 @@ impl App {
                             let needs_fetch = self.state.squad_team_id != Some(team.id)
                                 || self.state.squad.is_empty();
                             if needs_fetch && !self.state.squad_loading {
-                                self.request_squad(team.id, team.name.clone(), true);
+                                self.request_squad(team.id, team.name.clone(), true, false);
                             }
                         }
                     } else {
@@ -304,6 +325,7 @@ impl App {
                                     entry.player_id,
                                     entry.player_name.clone(),
                                     true,
+                                    false,
                                 );
                             }
                         }
@@ -327,7 +349,7 @@ impl App {
                             .map(|detail| !player_detail_has_stats(detail))
                             .unwrap_or(false);
                         if (!cached || needs_stats_refresh) && !self.state.player_loading {
-                            self.request_player_detail(player.id, player.name.clone(), true);
+                            self.request_player_detail(player.id, player.name.clone(), true, false);
                         }
                     }
                 }
@@ -498,7 +520,7 @@ impl App {
                             .squad_team
                             .clone()
                             .unwrap_or_else(|| "Team".to_string());
-                        self.request_squad(team_id, team_name, true);
+                        self.request_squad(team_id, team_name, true, false);
                     }
                 } else if matches!(self.state.screen, Screen::PlayerDetail)
                     && let (Some(player_id), Some(player_name)) = (
@@ -507,7 +529,7 @@ impl App {
                     )
                 {
                     self.detail_dist_cache = None;
-                    self.request_player_detail(player_id, player_name, true);
+                    self.request_player_detail(player_id, player_name, true, false);
                 }
             }
             KeyCode::Char('p') | KeyCode::Char('P') => self.toggle_placeholder_match(),
@@ -528,7 +550,7 @@ impl App {
                             .squad_team
                             .clone()
                             .unwrap_or_else(|| "Team".to_string());
-                        self.request_squad(team_id, team_name, true);
+                        self.request_squad(team_id, team_name, true, true);
                     }
                 } else if matches!(self.state.screen, Screen::PlayerDetail)
                     && let (Some(player_id), Some(player_name)) = (
@@ -536,7 +558,7 @@ impl App {
                         self.state.player_last_name.clone(),
                     )
                 {
-                    self.request_player_detail(player_id, player_name, true);
+                    self.request_player_detail(player_id, player_name, true, true);
                 }
             }
             KeyCode::Char('i') | KeyCode::Char('I') => self.request_match_details(true),
@@ -1099,7 +1121,7 @@ impl App {
         self.state.rankings_dirty = false;
     }
 
-    fn request_squad(&mut self, team_id: u32, team_name: String, announce: bool) {
+    fn request_squad(&mut self, team_id: u32, team_name: String, announce: bool, force: bool) {
         if let Some(players) = self.state.rankings_cache_squads.get(&team_id).cloned() {
             let has_players = !players.is_empty();
             self.state.squad = players;
@@ -1109,8 +1131,7 @@ impl App {
             self.state.squad_team_id = Some(team_id);
             self.prefetch_players(self.state.squad.iter().map(|p| p.id).collect());
             if has_players {
-                let cached_at = self.state.rankings_cache_squads_at.get(&team_id).copied();
-                if cache_fresh(cached_at, self.squad_cache_ttl) {
+                if !force {
                     if announce {
                         self.state.push_log("[INFO] Squad cached (skipping fetch)");
                     }
@@ -1128,10 +1149,12 @@ impl App {
             }
             return;
         };
-        if tx
-            .send(state::ProviderCommand::FetchSquad { team_id, team_name })
-            .is_err()
-        {
+        let cmd = if force {
+            state::ProviderCommand::FetchSquadRevalidate { team_id, team_name }
+        } else {
+            state::ProviderCommand::FetchSquad { team_id, team_name }
+        };
+        if tx.send(cmd).is_err() {
             if announce {
                 self.state.push_log("[WARN] Squad request failed");
             }
@@ -1147,7 +1170,13 @@ impl App {
         }
     }
 
-    fn request_player_detail(&mut self, player_id: u32, player_name: String, announce: bool) {
+    fn request_player_detail(
+        &mut self,
+        player_id: u32,
+        player_name: String,
+        announce: bool,
+        force: bool,
+    ) {
         let Some(tx) = &self.cmd_tx else {
             if announce {
                 self.state.push_log("[INFO] Player fetch unavailable");
@@ -1158,16 +1187,11 @@ impl App {
         self.state.player_last_name = Some(player_name.clone());
         let mut cache_hit = false;
         if let Some(cached) = self.state.rankings_cache_players.get(&player_id).cloned() {
-            let cached_at = self
-                .state
-                .rankings_cache_players_at
-                .get(&player_id)
-                .copied();
             let is_stub = state::player_detail_is_stub(&cached);
             self.state.player_detail = Some(cached);
             self.state.player_loading = false;
             cache_hit = true;
-            if cache_fresh(cached_at, self.player_cache_ttl) && !is_stub {
+            if !is_stub && !force {
                 if announce {
                     self.state.push_log("[INFO] Player cached (skipping fetch)");
                 }
@@ -1182,13 +1206,18 @@ impl App {
             self.state.player_detail = None;
             self.state.player_loading = true;
         }
-        if tx
-            .send(state::ProviderCommand::FetchPlayer {
+        let cmd = if force {
+            state::ProviderCommand::FetchPlayerRevalidate {
                 player_id,
                 player_name,
-            })
-            .is_err()
-        {
+            }
+        } else {
+            state::ProviderCommand::FetchPlayer {
+                player_id,
+                player_name,
+            }
+        };
+        if tx.send(cmd).is_err() {
             if announce {
                 self.state.push_log("[WARN] Player request failed");
             }
@@ -1213,9 +1242,8 @@ impl App {
             .into_iter()
             .filter(|id| {
                 let cached = self.state.rankings_cache_players.get(id);
-                let cached_at = self.state.rankings_cache_players_at.get(id).copied();
                 let is_stub = cached.map(state::player_detail_is_stub).unwrap_or(true);
-                !cache_fresh(cached_at, self.player_cache_ttl) || is_stub
+                cached.is_none() || is_stub
             })
             .collect();
         if ids.is_empty() {
@@ -1487,7 +1515,8 @@ fn main() -> io::Result<()> {
     feed::spawn_provider(tx, cmd_rx);
 
     let mut app = App::new(Some(cmd_tx));
-    // Load cached rankings/analysis (if any) for current league.
+    // Restore last used league mode (if any), then load its cached data.
+    persist::load_last_league_mode(&mut app.state);
     persist::load_into_state(&mut app.state);
     // Keep upcoming fixtures available even while browsing Live.
     app.request_upcoming(false);
@@ -2315,18 +2344,66 @@ fn run_app<B: Backend>(
     loop {
         let mut changed = false;
         while let Ok(delta) = rx.try_recv() {
+            // Cache-warm and prefetch can stream lots of updates; track them so we can debounce
+            // expensive recomputes while keeping the UI responsive.
+            match &delta {
+                state::Delta::CacheSquad { .. }
+                | state::Delta::CachePlayerDetail(_)
+                | state::Delta::SetAnalysis { .. } => {
+                    app.rankings_update_counter = app.rankings_update_counter.saturating_add(1);
+                }
+                _ => {}
+            }
             apply_delta(&mut app.state, delta);
             changed = true;
         }
         if let Some(ids) = app.state.squad_prefetch_pending.take() {
             app.prefetch_players(ids);
         }
+
+        // Debounced rankings recompute: progressive updates during warm without freezing input.
         if matches!(app.state.screen, Screen::Analysis)
             && app.state.analysis_tab == state::AnalysisTab::RoleRankings
             && app.state.rankings_dirty
+            && !app.state.analysis.is_empty()
         {
-            app.recompute_rankings_from_cache();
-            changed = true;
+            let now = Instant::now();
+            if !app.state.rankings_loading {
+                app.recompute_rankings_from_cache();
+                app.rankings_last_recompute = now;
+                app.rankings_update_counter = 0;
+                changed = true;
+            } else {
+                let due = now.duration_since(app.rankings_last_recompute)
+                    >= app.rankings_recompute_interval;
+                let enough_updates = app.rankings_update_counter
+                    >= app.rankings_recompute_min_updates
+                    || app.state.rankings.is_empty();
+                if due && enough_updates {
+                    app.recompute_rankings_from_cache();
+                    app.rankings_last_recompute = now;
+                    app.rankings_update_counter = 0;
+                    changed = true;
+                }
+            }
+        }
+
+        // Debounced win-prob recompute: avoid per-player recompute during warm/prefetch.
+        {
+            let in_live_context = (matches!(app.state.screen, Screen::Pulse)
+                && app.state.pulse_view == PulseView::Live)
+                || matches!(app.state.screen, Screen::Terminal { .. });
+            if in_live_context && app.state.predictions_dirty {
+                let now = Instant::now();
+                if now.duration_since(app.predictions_last_recompute)
+                    >= app.predictions_recompute_interval
+                {
+                    recompute_predictions_after_player_cache_update(&mut app.state);
+                    app.state.predictions_dirty = false;
+                    app.predictions_last_recompute = now;
+                    changed = true;
+                }
+            }
         }
         let export_was_active = app.state.export.active;
         app.state.maybe_clear_export(Instant::now());
@@ -2625,7 +2702,8 @@ fn footer_styled(state: &AppState) -> Line<'static> {
             ("b/Esc", "Back"),
             ("j/k/↑/↓", "Move"),
             ("Enter", "Player"),
-            ("r", "Refresh"),
+            ("r", "Reload (cached)"),
+            ("R", "Refresh (network)"),
             ("?", "Help"),
             ("q", "Quit"),
         ],
@@ -2633,7 +2711,8 @@ fn footer_styled(state: &AppState) -> Line<'static> {
             ("1", "Pulse"),
             ("b/Esc", "Back"),
             ("j/k/↑/↓", "Scroll"),
-            ("r", "Refresh"),
+            ("r", "Reload (cached)"),
+            ("R", "Refresh (network)"),
             ("?", "Help"),
             ("q", "Quit"),
         ],
@@ -6300,7 +6379,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
                 ("u", "Upcoming view"),
                 ("i", "Fetch match details"),
                 ("e", "Export analysis to XLSX"),
-                ("r", "Refresh analysis/squad/player"),
+                ("r", "Refresh (context)"),
+                ("R", "Force refresh"),
                 ("p", "Toggle placeholder match"),
                 ("?", "Toggle help"),
                 ("q", "Quit"),

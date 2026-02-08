@@ -379,6 +379,8 @@ pub struct AppState {
     pub combined_player_cache: HashMap<u32, PlayerDetail>,
     pub rankings_dirty: bool,
     pub rankings_fetched_at: Option<SystemTime>,
+    // Set when cached player/squad/analysis changes should trigger a win-probability refresh.
+    pub predictions_dirty: bool,
     pub win_prob_history: HashMap<String, Vec<f32>>,
     pub prematch_win: HashMap<String, WinProbRow>,
     pub prematch_locked: HashSet<String>,
@@ -482,6 +484,7 @@ impl AppState {
             combined_player_cache: HashMap::with_capacity(256),
             rankings_dirty: false,
             rankings_fetched_at: None,
+            predictions_dirty: false,
             win_prob_history: HashMap::with_capacity(16),
             prematch_win: HashMap::with_capacity(16),
             prematch_locked: HashSet::new(),
@@ -587,6 +590,7 @@ impl AppState {
         self.combined_player_cache.clear();
         self.rankings_dirty = false;
         self.rankings_fetched_at = None;
+        self.predictions_dirty = false;
         self.win_prob_history.clear();
         self.prematch_win.clear();
         self.prematch_locked.clear();
@@ -985,21 +989,11 @@ impl AppState {
     }
 
     pub fn rankings_filtered(&self) -> Vec<&RoleRankingEntry> {
-        let league_team_ids: std::collections::HashSet<u32> =
-            self.analysis.iter().map(|t| t.id).collect();
-        let filter_by_team = !league_team_ids.is_empty();
         let query = self.rankings_search.trim().to_lowercase();
         let has_query = !query.is_empty();
         self.rankings
             .iter()
             .filter(|row| row.role == self.rankings_role)
-            .filter(|row| {
-                if filter_by_team {
-                    league_team_ids.contains(&row.team_id)
-                } else {
-                    true
-                }
-            })
             .filter(|row| {
                 if !has_query {
                     return true;
@@ -1552,7 +1546,15 @@ pub enum ProviderCommand {
         team_id: u32,
         team_name: String,
     },
+    FetchSquadRevalidate {
+        team_id: u32,
+        team_name: String,
+    },
     FetchPlayer {
+        player_id: u32,
+        player_name: String,
+    },
+    FetchPlayerRevalidate {
         player_id: u32,
         player_name: String,
     },
@@ -1944,6 +1946,10 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.analysis = teams;
             state.analysis_loading = false;
             state.analysis_selected = 0;
+            // Rankings depend on analysis (team IDs/names); recompute next time the Rankings tab is
+            // visible.
+            state.rankings_dirty = true;
+            state.predictions_dirty = true;
         }
         Delta::CacheSquad { team_id, players } => {
             if !players.is_empty() {
@@ -1952,6 +1958,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     .rankings_cache_squads_at
                     .insert(team_id, SystemTime::now());
                 state.rankings_dirty = true;
+                state.predictions_dirty = true;
             }
         }
         Delta::CachePlayerDetail(detail) => {
@@ -1964,10 +1971,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 .rankings_cache_players_at
                 .insert(detail_id, SystemTime::now());
             state.rankings_dirty = true;
-
-            // Player history arriving can change lineup-derived prediction signals; refresh any
-            // match predictions that depend on cached player data.
-            recompute_predictions_after_player_cache_update(state);
+            state.predictions_dirty = true;
         }
         Delta::RankCacheProgress {
             mode,
@@ -2008,6 +2012,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     .rankings_cache_squads_at
                     .insert(team_id, SystemTime::now());
                 state.rankings_dirty = true;
+                state.predictions_dirty = true;
             }
 
             // Only update the visible squad if this is still the team the user selected.
@@ -2050,6 +2055,7 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     .rankings_cache_players_at
                     .insert(detail_id, SystemTime::now());
                 state.rankings_dirty = true;
+                state.predictions_dirty = true;
             }
         }
         Delta::ExportStarted { path, total } => {
@@ -2135,7 +2141,7 @@ fn queue_player_prefetch(pending: &mut Option<Vec<u32>>, mut ids: Vec<u32>) {
     }
 }
 
-fn recompute_predictions_after_player_cache_update(state: &mut AppState) {
+pub fn recompute_predictions_after_player_cache_update(state: &mut AppState) {
     let details = &state.match_detail;
     let players = &state.combined_player_cache;
     let squads = &state.rankings_cache_squads;
