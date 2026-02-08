@@ -24,7 +24,7 @@ impl LeagueParams {
             league_id,
             sample_matches: 0,
             goals_total_base: 2.60,
-            home_adv_goals: 0.25,
+            home_adv_goals: 0.0,
             dc_rho: -0.10,
         }
     }
@@ -32,7 +32,6 @@ impl LeagueParams {
 
 pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> LeagueParams {
     let mut total_goals = 0.0;
-    let mut total_diff = 0.0;
     let mut n = 0usize;
 
     for m in fixtures {
@@ -46,7 +45,6 @@ pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> Leagu
             continue;
         }
         total_goals += (m.home_goals as f64) + (m.away_goals as f64);
-        total_diff += (m.home_goals as f64) - (m.away_goals as f64);
         n += 1;
     }
 
@@ -54,7 +52,8 @@ pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> Leagu
     out.sample_matches = n;
     if n > 0 {
         out.goals_total_base = total_goals / (n as f64);
-        out.home_adv_goals = total_diff / (n as f64);
+        // Home advantage removed — venue-neutral model.
+        out.home_adv_goals = 0.0;
     }
 
     // Shrink small samples toward defaults to avoid wild swings.
@@ -62,7 +61,7 @@ pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> Leagu
     let w = ((n as f64) / MIN_N).clamp(0.0, 1.0);
     let d = LeagueParams::defaults(league_id);
     out.goals_total_base = (1.0 - w) * d.goals_total_base + w * out.goals_total_base;
-    out.home_adv_goals = (1.0 - w) * d.home_adv_goals + w * out.home_adv_goals;
+    out.home_adv_goals = 0.0;
     out
 }
 

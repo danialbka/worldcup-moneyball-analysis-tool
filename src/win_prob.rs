@@ -2,13 +2,12 @@ use std::collections::HashMap;
 
 use crate::league_params::LeagueParams;
 use crate::state::{
-    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, PlayerSlot,
-    PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis, WinProbRow,
-    player_detail_is_stub,
+    player_detail_is_stub, LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail,
+    PlayerSlot, PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis,
+    WinProbRow,
 };
 
 const GOALS_TOTAL_BASE: f64 = 2.60;
-const HOME_ADV_GOALS_DEFAULT: f64 = 0.25;
 const K_STRENGTH: f64 = 0.45;
 
 const BASELINE_RATING: f64 = 6.80;
@@ -25,18 +24,18 @@ pub fn compute_win_prob(
     detail: Option<&MatchDetail>,
     players: &HashMap<u32, PlayerDetail>,
     squads: &HashMap<u32, Vec<SquadPlayer>>,
-    analysis: &[TeamAnalysis],
+    _analysis: &[TeamAnalysis],
     league_params: Option<&LeagueParams>,
-    elo: Option<&HashMap<u32, f64>>,
+    _elo: Option<&HashMap<u32, f64>>,
 ) -> WinProbRow {
     compute_win_prob_explainable(
         summary,
         detail,
         players,
         squads,
-        analysis,
+        _analysis,
         league_params,
-        elo,
+        _elo,
     )
     .0
 }
@@ -46,9 +45,9 @@ pub fn compute_win_prob_explainable(
     detail: Option<&MatchDetail>,
     players: &HashMap<u32, PlayerDetail>,
     squads: &HashMap<u32, Vec<SquadPlayer>>,
-    analysis: &[TeamAnalysis],
+    _analysis: &[TeamAnalysis],
     league_params: Option<&LeagueParams>,
-    elo: Option<&HashMap<u32, f64>>,
+    _elo: Option<&HashMap<u32, f64>>,
 ) -> (WinProbRow, Option<PredictionExtras>) {
     // If the match is effectively final, just reflect the result.
     if !summary.is_live && summary.minute >= 90 {
@@ -80,9 +79,7 @@ pub fn compute_win_prob_explainable(
     let goals_total_base = league_params
         .map(|p| p.goals_total_base)
         .unwrap_or(GOALS_TOTAL_BASE);
-    let home_adv_goals = league_params
-        .map(|p| p.home_adv_goals)
-        .unwrap_or(HOME_ADV_GOALS_DEFAULT);
+    // Home advantage removed — model is venue-neutral.
     let dc_rho = league_params.map(|p| p.dc_rho).unwrap_or(-0.10);
 
     let lineup = detail.and_then(|d| d.lineups.as_ref());
@@ -148,29 +145,8 @@ pub fn compute_win_prob_explainable(
     let disc_home_lineup = home_side.and_then(|h| discipline_from_slots(&h.starting, players));
     let disc_away_lineup = away_side.and_then(|a| discipline_from_slots(&a.starting, players));
 
-    let home_label = detail
-        .and_then(|d| d.home_team.as_deref())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(&summary.home);
-    let away_label = detail
-        .and_then(|d| d.away_team.as_deref())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(&summary.away);
-
-    let (s_home_analysis, src_home) = team_strength_from_analysis(home_label, analysis)
-        .map(|(s, src)| (Some(s), Some(src)))
-        .unwrap_or((None, None));
-    let (s_away_analysis, src_away) = team_strength_from_analysis(away_label, analysis)
-        .map(|(s, src)| (Some(s), Some(src)))
-        .unwrap_or((None, None));
-
-    let s_home_elo = summary
-        .home_team_id
-        .and_then(|id| elo.and_then(|m| team_strength_from_elo(id, m)));
-    let s_away_elo = summary
-        .away_team_id
-        .and_then(|id| elo.and_then(|m| team_strength_from_elo(id, m)));
-
+    // Team strength is driven purely by player-level lineup stats.
+    // FIFA rank/points and Elo signals have been removed.
     let lineup_s_home = lineup_home.map(|(s, _)| s);
     let lineup_s_away = lineup_away.map(|(s, _)| s);
     let lineup_cov_home = lineup_home.map(|(_, c)| c);
@@ -178,40 +154,18 @@ pub fn compute_win_prob_explainable(
 
     let have_lineups = lineup_s_home.is_some() && lineup_s_away.is_some();
 
-    let base_home = blend_base_strength(s_home_analysis, s_home_elo);
-    let base_away = blend_base_strength(s_away_analysis, s_away_elo);
-
-    // Pre-match: blend analysis prior with lineup prior based on usable starter coverage.
-    // Live: preserve the existing behavior (lineup if available, otherwise analysis).
-    let (s_home, s_away, blend_w_lineup) = if is_prematch {
-        let a_home = base_home;
-        let a_away = base_away;
-        if have_lineups {
-            let cov_min = lineup_cov_home
-                .unwrap_or(0.0)
-                .min(lineup_cov_away.unwrap_or(0.0));
-            let w = clamp_f32((cov_min - 0.25) / 0.50, 0.0, 1.0);
-            let l_home = lineup_s_home.unwrap_or(0.0);
-            let l_away = lineup_s_away.unwrap_or(0.0);
-            (
-                (1.0 - w as f64) * a_home + (w as f64) * l_home,
-                (1.0 - w as f64) * a_away + (w as f64) * l_away,
-                w,
-            )
-        } else {
-            (a_home, a_away, 0.0)
-        }
-    } else if have_lineups {
+    let (s_home, s_away, blend_w_lineup) = if have_lineups {
         (
             lineup_s_home.unwrap_or(0.0),
             lineup_s_away.unwrap_or(0.0),
             1.0,
         )
     } else {
-        (base_home, base_away, 0.0)
+        // No lineup data available — neutral prior.
+        (0.0, 0.0, 0.0)
     };
 
-    let diff = home_adv_goals + K_STRENGTH * (s_home - s_away);
+    let diff = K_STRENGTH * (s_home - s_away);
     let mut lambda_home_pre = clamp((goals_total_base / 2.0) + (diff / 2.0), 0.20, 3.80);
     let mut lambda_away_pre = clamp((goals_total_base / 2.0) - (diff / 2.0), 0.20, 3.80);
 
@@ -393,11 +347,7 @@ pub fn compute_win_prob_explainable(
     p_draw += residue;
 
     let confidence = if is_prematch {
-        compute_confidence_prematch(
-            (s_home_analysis.is_some() && s_away_analysis.is_some())
-                || (s_home_elo.is_some() && s_away_elo.is_some()),
-            blend_w_lineup,
-        )
+        compute_confidence_prematch(blend_w_lineup)
     } else {
         compute_confidence(t, xg_present, track_used)
     };
@@ -415,16 +365,9 @@ pub fn compute_win_prob_explainable(
         let have_disc = disc_home.is_some() && disc_away.is_some();
         Some(build_prematch_extras(
             goals_total_base,
-            home_adv_goals,
             dc_rho,
             lambda_home_pre,
             lambda_away_pre,
-            s_home_analysis,
-            s_away_analysis,
-            s_home_elo,
-            s_away_elo,
-            src_home,
-            src_away,
             lineup_s_home,
             lineup_s_away,
             lineup_cov_home,
@@ -474,27 +417,17 @@ fn compute_confidence(t: f64, xg_present: bool, track: bool) -> u8 {
     clamp(score, 5.0, 95.0).round() as u8
 }
 
-fn compute_confidence_prematch(analysis_ok: bool, blend_w_lineup: f32) -> u8 {
-    let mut score = 35.0;
-    if analysis_ok {
-        score += 20.0;
-    }
-    score += 40.0 * (blend_w_lineup as f64);
+fn compute_confidence_prematch(blend_w_lineup: f32) -> u8 {
+    // Confidence driven purely by lineup coverage.
+    let score = 35.0 + 60.0 * (blend_w_lineup as f64);
     clamp(score, 5.0, 95.0).round() as u8
 }
 
 fn build_prematch_extras(
     goals_total_base: f64,
-    home_adv_goals: f64,
     dc_rho: f64,
     lambda_home_pre: f64,
     lambda_away_pre: f64,
-    s_home_analysis: Option<f64>,
-    s_away_analysis: Option<f64>,
-    s_home_elo: Option<f64>,
-    s_away_elo: Option<f64>,
-    src_home: Option<&'static str>,
-    src_away: Option<&'static str>,
     s_home_lineup: Option<f64>,
     s_away_lineup: Option<f64>,
     cov_home: Option<f32>,
@@ -511,34 +444,9 @@ fn build_prematch_extras(
     p_away_final: f32,
 ) -> PredictionExtras {
     let (p_home_baseline, p_draw_baseline, p_away_baseline) =
-        prematch_probs_from_params(goals_total_base, 0.0, 0.0, 0.0, dc_rho);
-    let (p_home_ha, p_draw_ha, p_away_ha) =
-        prematch_probs_from_params(goals_total_base, home_adv_goals, 0.0, 0.0, dc_rho);
-    let base_home = blend_base_strength(s_home_analysis, s_home_elo);
-    let base_away = blend_base_strength(s_away_analysis, s_away_elo);
-    let (p_home_analysis_p, p_draw_analysis_p, p_away_analysis_p) = prematch_probs_from_params(
-        goals_total_base,
-        home_adv_goals,
-        base_home,
-        base_away,
-        dc_rho,
-    );
+        prematch_probs_from_params(goals_total_base, 0.0, 0.0, dc_rho);
 
     let mut signals: Vec<String> = Vec::new();
-    let fifa_ok = s_home_analysis.is_some() && s_away_analysis.is_some();
-    if fifa_ok {
-        let points =
-            matches!(src_home, Some("FIFA_POINTS")) || matches!(src_away, Some("FIFA_POINTS"));
-        signals.push(if points {
-            "FIFA_POINTS".to_string()
-        } else {
-            "FIFA_RANK".to_string()
-        });
-    }
-    let elo_ok = s_home_elo.is_some() && s_away_elo.is_some();
-    if elo_ok {
-        signals.push("ELO".to_string());
-    }
     if let (Some(ch), Some(ca)) = (cov_home, cov_away) {
         let n_h = (ch * 11.0).round().clamp(0.0, 11.0) as u8;
         let n_a = (ca * 11.0).round().clamp(0.0, 11.0) as u8;
@@ -557,21 +465,19 @@ fn build_prematch_extras(
         ));
     }
 
-    let pp_home_adv = p_home_ha - p_home_baseline;
-    let pp_analysis = p_home_analysis_p - p_home_ha;
-    let pp_lineup = p_home_final - p_home_analysis_p;
+    let pp_lineup = p_home_final - p_home_baseline;
 
     PredictionExtras {
         prematch_only: true,
         goals_total_base: Some(goals_total_base),
-        home_adv_goals: Some(home_adv_goals),
+        home_adv_goals: None,
         dc_rho: Some(dc_rho),
         lambda_home_pre,
         lambda_away_pre,
-        s_home_analysis,
-        s_away_analysis,
-        s_home_elo,
-        s_away_elo,
+        s_home_analysis: None,
+        s_away_analysis: None,
+        s_home_elo: None,
+        s_away_elo: None,
         s_home_lineup,
         s_away_lineup,
         lineup_coverage_home: cov_home,
@@ -587,17 +493,17 @@ fn build_prematch_extras(
             p_home_baseline,
             p_draw_baseline,
             p_away_baseline,
-            p_home_ha,
-            p_draw_ha,
-            p_away_ha,
-            p_home_analysis: p_home_analysis_p,
-            p_draw_analysis: p_draw_analysis_p,
-            p_away_analysis: p_away_analysis_p,
+            p_home_ha: p_home_baseline,
+            p_draw_ha: p_draw_baseline,
+            p_away_ha: p_away_baseline,
+            p_home_analysis: p_home_baseline,
+            p_draw_analysis: p_draw_baseline,
+            p_away_analysis: p_away_baseline,
             p_home_final,
             p_draw_final,
             p_away_final,
-            pp_home_adv,
-            pp_analysis,
+            pp_home_adv: 0.0,
+            pp_analysis: 0.0,
             pp_lineup,
             signals,
         },
@@ -606,12 +512,11 @@ fn build_prematch_extras(
 
 fn prematch_probs_from_params(
     goals_total_base: f64,
-    home_adv_goals: f64,
     s_home: f64,
     s_away: f64,
     dc_rho: f64,
 ) -> (f32, f32, f32) {
-    let diff = home_adv_goals + K_STRENGTH * (s_home - s_away);
+    let diff = K_STRENGTH * (s_home - s_away);
     let lambda_home = clamp((goals_total_base / 2.0) + (diff / 2.0), 0.20, 3.80);
     let lambda_away = clamp((goals_total_base / 2.0) - (diff / 2.0), 0.20, 3.80);
     probs_percent_dc(0, 0, lambda_home, lambda_away, 10, dc_rho)
@@ -1005,73 +910,6 @@ fn normalize_team_key(raw: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn team_strength_from_analysis(
-    label: &str,
-    analysis: &[TeamAnalysis],
-) -> Option<(f64, &'static str)> {
-    let key = normalize_team_key(label);
-    if key.is_empty() {
-        return None;
-    }
-    for t in analysis {
-        let name_key = normalize_team_key(&t.name);
-        if name_key == key {
-            return analysis_team_strength(t);
-        }
-        if abbreviate_team_key(&t.name) == key {
-            return analysis_team_strength(t);
-        }
-    }
-    None
-}
-
-fn analysis_team_strength(t: &TeamAnalysis) -> Option<(f64, &'static str)> {
-    if let Some(points) = t.fifa_points {
-        let s = (points as f64 - 1600.0) / 400.0;
-        return Some((clamp(s, -1.0, 1.0), "FIFA_POINTS"));
-    }
-    if let Some(rank) = t.fifa_rank {
-        let s = (100.0 - rank as f64) / 100.0;
-        return Some((clamp(s, -1.0, 1.0), "FIFA_RANK"));
-    }
-    None
-}
-
-fn team_strength_from_elo(team_id: u32, elo: &HashMap<u32, f64>) -> Option<f64> {
-    let r = *elo.get(&team_id)?;
-    Some(clamp((r - 1500.0) / 400.0, -1.0, 1.0))
-}
-
-fn blend_base_strength(s_fifa: Option<f64>, s_elo: Option<f64>) -> f64 {
-    match (s_fifa, s_elo) {
-        (Some(f), Some(e)) => 0.40 * f + 0.60 * e,
-        (Some(f), None) => f,
-        (None, Some(e)) => e,
-        (None, None) => 0.0,
-    }
-}
-
-fn abbreviate_team_key(name: &str) -> String {
-    let trimmed = normalize_team_key(name);
-    if trimmed.len() <= 3 {
-        return trimmed;
-    }
-    let mut abbr = String::new();
-    for part in trimmed.split_whitespace() {
-        if let Some(ch) = part.chars().next() {
-            abbr.push(ch);
-        }
-        if abbr.len() >= 3 {
-            break;
-        }
-    }
-    if abbr.len() >= 2 {
-        abbr
-    } else {
-        trimmed.chars().take(3).collect()
-    }
 }
 
 fn player_form_rating(p: &PlayerDetail, n: usize) -> Option<f64> {
@@ -1769,10 +1607,6 @@ fn poisson_pmf(lambda: f64, max_k: u32) -> Vec<f64> {
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
-    v.max(lo).min(hi)
-}
-
-fn clamp_f32(v: f32, lo: f32, hi: f32) -> f32 {
     v.max(lo).min(hi)
 }
 

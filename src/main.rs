@@ -6116,16 +6116,12 @@ fn prediction_detail_text(state: &AppState) -> String {
         lines.push(String::new());
         lines.push("Explain (pre-match):".to_string());
         lines.push(format!(
-            "Contrib (home win pp): Base {:+.1}, Lineup {:+.1}",
-            ex.explain.pp_analysis, ex.explain.pp_lineup
+            "Contrib (home win pp): Lineup {:+.1}",
+            ex.explain.pp_lineup
         ));
         lines.push(format!(
             "Baseline: H{:.1} D{:.1} A{:.1}",
             ex.explain.p_home_baseline, ex.explain.p_draw_baseline, ex.explain.p_away_baseline
-        ));
-        lines.push(format!(
-            "Base:     H{:.1} D{:.1} A{:.1}",
-            ex.explain.p_home_analysis, ex.explain.p_draw_analysis, ex.explain.p_away_analysis
         ));
         lines.push(format!(
             "Final:    H{:.1} D{:.1} A{:.1}",
@@ -6137,31 +6133,12 @@ fn prediction_detail_text(state: &AppState) -> String {
             "xG prior (pre): {:.2} - {:.2}",
             ex.lambda_home_pre, ex.lambda_away_pre
         ));
-        if let (Some(gt), Some(ha)) = (ex.goals_total_base, ex.home_adv_goals) {
+        if let Some(gt) = ex.goals_total_base {
             let rho = ex.dc_rho.unwrap_or(0.0);
             lines.push(format!(
-                "League params: goals={gt:.2} homeAdv={ha:+.2} dcRho={rho:+.2}"
+                "League params: goals={gt:.2} dcRho={rho:+.2}"
             ));
         }
-        let a_h = ex
-            .s_home_analysis
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "-".to_string());
-        let a_a = ex
-            .s_away_analysis
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "-".to_string());
-        lines.push(format!("FIFA strength:    home={a_h} away={a_a}"));
-
-        let e_h = ex
-            .s_home_elo
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "-".to_string());
-        let e_a = ex
-            .s_away_elo
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "-".to_string());
-        lines.push(format!("Elo strength:     home={e_h} away={e_a}"));
 
         let l_h = ex
             .s_home_lineup
