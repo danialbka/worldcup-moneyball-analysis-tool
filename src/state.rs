@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::league_params::{self, LeagueParams};
 use crate::win_prob;
 
 #[derive(Debug, Clone)]
@@ -34,11 +35,16 @@ pub struct PredictionExplain {
 #[derive(Debug, Clone)]
 pub struct PredictionExtras {
     pub prematch_only: bool,
+    pub goals_total_base: Option<f64>,
+    pub home_adv_goals: Option<f64>,
+    pub dc_rho: Option<f64>,
     pub lambda_home_pre: f64,
     pub lambda_away_pre: f64,
 
     pub s_home_analysis: Option<f64>,
     pub s_away_analysis: Option<f64>,
+    pub s_home_elo: Option<f64>,
+    pub s_away_elo: Option<f64>,
     pub s_home_lineup: Option<f64>,
     pub s_away_lineup: Option<f64>,
     pub lineup_coverage_home: Option<f32>,
@@ -381,6 +387,11 @@ pub struct AppState {
     pub rankings_fetched_at: Option<SystemTime>,
     // Set when cached player/squad/analysis changes should trigger a win-probability refresh.
     pub predictions_dirty: bool,
+    // League-specific pre-match calibration (derived from historical fixtures).
+    pub league_params: HashMap<u32, LeagueParams>,
+    // League-specific Elo ratings keyed by team id.
+    pub elo_by_league: HashMap<u32, HashMap<u32, f64>>,
+    pub prediction_model_fetched_at: HashMap<u32, SystemTime>,
     pub win_prob_history: HashMap<String, Vec<f32>>,
     pub prematch_win: HashMap<String, WinProbRow>,
     pub prematch_locked: HashSet<String>,
@@ -440,6 +451,7 @@ impl AppState {
         );
         let league_wc_ids =
             parse_ids_env_or_default("APP_LEAGUE_WORLDCUP_IDS", DEFAULT_WORLDCUP_IDS);
+        let league_params = league_params::load_cached_params();
         Self {
             screen: Screen::Pulse,
             sort: SortMode::Hot,
@@ -485,6 +497,9 @@ impl AppState {
             rankings_dirty: false,
             rankings_fetched_at: None,
             predictions_dirty: false,
+            league_params,
+            elo_by_league: HashMap::with_capacity(8),
+            prediction_model_fetched_at: HashMap::with_capacity(8),
             win_prob_history: HashMap::with_capacity(16),
             prematch_win: HashMap::with_capacity(16),
             prematch_locked: HashSet::new(),
@@ -1483,6 +1498,11 @@ pub enum Delta {
         mode: LeagueMode,
         teams: Vec<TeamAnalysis>,
     },
+    SetPredictionModel {
+        league_id: u32,
+        params: LeagueParams,
+        elo: HashMap<u32, f64>,
+    },
     CacheSquad {
         team_id: u32,
         players: Vec<SquadPlayer>,
@@ -1573,6 +1593,10 @@ pub enum ProviderCommand {
         path: String,
         mode: LeagueMode,
     },
+    WarmPredictionModel {
+        league_ids: Vec<u32>,
+        team_ids: Vec<u32>,
+    },
 }
 
 pub fn apply_delta(state: &mut AppState, delta: Delta) {
@@ -1601,12 +1625,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                 }
 
                 let detail = state.match_detail.get(&summary.id);
+                let league_id = summary.league_id.unwrap_or(0);
+                let params = state.league_params.get(&league_id);
+                let elo = state.elo_by_league.get(&league_id);
                 let (win, extras) = win_prob::compute_win_prob_explainable(
                     summary,
                     detail,
                     &state.combined_player_cache,
                     &state.rankings_cache_squads,
                     &state.analysis,
+                    params,
+                    elo,
                 );
                 summary.win = win;
                 if let Some(extras) = extras {
@@ -1636,12 +1665,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     pre.score_home = 0;
                     pre.score_away = 0;
                     let detail = state.match_detail.get(&pre.id);
+                    let league_id = pre.league_id.unwrap_or(0);
+                    let params = state.league_params.get(&league_id);
+                    let elo = state.elo_by_league.get(&league_id);
                     let (prematch, extras) = win_prob::compute_win_prob_explainable(
                         &pre,
                         detail,
                         &state.combined_player_cache,
                         &state.rankings_cache_squads,
                         &state.analysis,
+                        params,
+                        elo,
                     );
                     if let Some(extras) = extras {
                         state.prediction_extras.insert(pre.id.clone(), extras);
@@ -1691,12 +1725,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
                 let prev_p_home = existing.win.p_home;
                 let detail_ref = state.match_detail.get(&id);
+                let league_id = existing.league_id.unwrap_or(0);
+                let params = state.league_params.get(&league_id);
+                let elo = state.elo_by_league.get(&league_id);
                 let (win, extras) = win_prob::compute_win_prob_explainable(
                     existing,
                     detail_ref,
                     &state.combined_player_cache,
                     &state.rankings_cache_squads,
                     &state.analysis,
+                    params,
+                    elo,
                 );
                 existing.win = win;
                 if let Some(extras) = extras {
@@ -1773,12 +1812,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             if let Some(existing) = state.matches.iter_mut().find(|m| m.id == id) {
                 let prev_p_home = existing.win.p_home;
                 let detail_ref = state.match_detail.get(&id);
+                let league_id = existing.league_id.unwrap_or(0);
+                let params = state.league_params.get(&league_id);
+                let elo = state.elo_by_league.get(&league_id);
                 let (win, extras) = win_prob::compute_win_prob_explainable(
                     existing,
                     detail_ref,
                     &state.combined_player_cache,
                     &state.rankings_cache_squads,
                     &state.analysis,
+                    params,
+                    elo,
                 );
                 existing.win = win;
                 if let Some(extras) = extras {
@@ -1806,12 +1850,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
         Delta::UpsertMatch(mut summary) => {
             let match_id = summary.id.clone();
             let detail = state.match_detail.get(&match_id);
+            let league_id = summary.league_id.unwrap_or(0);
+            let params = state.league_params.get(&league_id);
+            let elo = state.elo_by_league.get(&league_id);
             let (win, extras) = win_prob::compute_win_prob_explainable(
                 &summary,
                 detail,
                 &state.combined_player_cache,
                 &state.rankings_cache_squads,
                 &state.analysis,
+                params,
+                elo,
             );
             summary.win = win;
             if let Some(extras) = extras {
@@ -1851,12 +1900,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     pre.score_home = 0;
                     pre.score_away = 0;
                     let detail = state.match_detail.get(&match_id);
+                    let league_id = pre.league_id.unwrap_or(0);
+                    let params = state.league_params.get(&league_id);
+                    let elo = state.elo_by_league.get(&league_id);
                     let (prematch, extras) = win_prob::compute_win_prob_explainable(
                         &pre,
                         detail,
                         &state.combined_player_cache,
                         &state.rankings_cache_squads,
                         &state.analysis,
+                        params,
+                        elo,
                     );
                     if let Some(extras) = extras {
                         state.prediction_extras.insert(match_id.clone(), extras);
@@ -1911,12 +1965,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
                     is_live: false,
                 };
                 let detail = state.match_detail.get(&u.id);
+                let league_id = summary.league_id.unwrap_or(0);
+                let params = state.league_params.get(&league_id);
+                let elo = state.elo_by_league.get(&league_id);
                 let (prematch, extras) = win_prob::compute_win_prob_explainable(
                     &summary,
                     detail,
                     &state.combined_player_cache,
                     &state.rankings_cache_squads,
                     &state.analysis,
+                    params,
+                    elo,
                 );
                 if let Some(extras) = extras {
                     state.prediction_extras.insert(u.id.clone(), extras);
@@ -1949,6 +2008,20 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             // Rankings depend on analysis (team IDs/names); recompute next time the Rankings tab is
             // visible.
             state.rankings_dirty = true;
+            state.predictions_dirty = true;
+        }
+        Delta::SetPredictionModel {
+            league_id,
+            params,
+            elo,
+        } => {
+            state.league_params.insert(league_id, params);
+            state.elo_by_league.insert(league_id, elo);
+            state
+                .prediction_model_fetched_at
+                .insert(league_id, SystemTime::now());
+            // Best-effort persist of calibrated params only (elo is cheap to recompute).
+            let _ = league_params::save_cached_params(&state.league_params);
             state.predictions_dirty = true;
         }
         Delta::CacheSquad { team_id, players } => {
@@ -2146,6 +2219,8 @@ pub fn recompute_predictions_after_player_cache_update(state: &mut AppState) {
     let players = &state.combined_player_cache;
     let squads = &state.rankings_cache_squads;
     let analysis = &state.analysis;
+    let league_params = &state.league_params;
+    let elo_by_league = &state.elo_by_league;
 
     let matches = &mut state.matches;
     let prediction_extras = &mut state.prediction_extras;
@@ -2156,8 +2231,12 @@ pub fn recompute_predictions_after_player_cache_update(state: &mut AppState) {
     for m in matches.iter_mut() {
         let prev_p_home = m.win.p_home;
         let detail = details.get(&m.id);
-        let (win, extras) =
-            win_prob::compute_win_prob_explainable(m, detail, players, squads, analysis);
+        let league_id = m.league_id.unwrap_or(0);
+        let params = league_params.get(&league_id);
+        let elo = elo_by_league.get(&league_id);
+        let (win, extras) = win_prob::compute_win_prob_explainable(
+            m, detail, players, squads, analysis, params, elo,
+        );
         m.win = win;
         if let Some(extras) = extras {
             prediction_extras.insert(m.id.clone(), extras);

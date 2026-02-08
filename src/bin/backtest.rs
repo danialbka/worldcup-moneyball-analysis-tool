@@ -63,6 +63,8 @@ fn main() -> anyhow::Result<()> {
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &case.analysis,
+        None,
+        None,
     );
 
     println!("Home: {:.1}%", win.p_home);

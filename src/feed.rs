@@ -11,10 +11,13 @@ use rand::Rng;
 use rayon::prelude::*;
 
 use crate::analysis_fetch;
+use crate::elo::{self, EloConfig};
+use crate::league_params;
 use crate::state::{
     Delta, Event, EventKind, LineupSide, MatchDetail, MatchLineups, MatchSummary, ModelQuality,
     PlayerSlot, ProviderCommand, UpcomingMatch, WinProbRow,
 };
+use crate::team_fixtures;
 use crate::upcoming_fetch::{self, FotmobMatchRow};
 
 pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
@@ -877,6 +880,70 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                     });
                                 }
                             }
+                        });
+                    }
+                    ProviderCommand::WarmPredictionModel {
+                        league_ids,
+                        team_ids,
+                    } => {
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            let max_pages = env::var("PRED_MODEL_MAX_PAGES")
+                                .ok()
+                                .and_then(|v| v.parse::<u8>().ok())
+                                .unwrap_or(6)
+                                .clamp(1, 24);
+                            let _ = tx.send(Delta::Log(format!(
+                                "[INFO] Warming prediction model ({} teams, {} leagues, pages={})",
+                                team_ids.len(),
+                                league_ids.len(),
+                                max_pages
+                            )));
+
+                            let fixtures = std::sync::Mutex::new(Vec::new());
+                            let errors = std::sync::Mutex::new(Vec::new());
+                            let pool = build_fetch_pool();
+
+                            with_fetch_pool(&pool, || {
+                                team_ids.par_iter().for_each(|team_id| {
+                                    match team_fixtures::collect_team_fixtures(
+                                        *team_id, max_pages, false,
+                                    ) {
+                                        Ok(mut rows) => {
+                                            let mut guard =
+                                                fixtures.lock().unwrap_or_else(|e| e.into_inner());
+                                            guard.append(&mut rows);
+                                        }
+                                        Err(err) => {
+                                            let mut guard =
+                                                errors.lock().unwrap_or_else(|e| e.into_inner());
+                                            guard.push(format!("team {team_id} fixtures: {err}"));
+                                        }
+                                    }
+                                })
+                            });
+
+                            for err in errors.into_inner().unwrap_or_default() {
+                                let _ = tx.send(Delta::Log(format!("[WARN] Warm model: {err}")));
+                            }
+
+                            let mut all = fixtures.into_inner().unwrap_or_default();
+                            all.sort_by_key(|m| m.id);
+                            all.dedup_by_key(|m| m.id);
+
+                            let cfg = EloConfig::default();
+                            for league_id in league_ids {
+                                let params = league_params::compute_league_params(league_id, &all);
+                                let elo = elo::compute_elo_for_league(league_id, &all, cfg);
+                                let _ = tx.send(Delta::SetPredictionModel {
+                                    league_id,
+                                    params,
+                                    elo,
+                                });
+                            }
+                            let _ = tx.send(Delta::Log(
+                                "[INFO] Prediction model warm complete".to_string(),
+                            ));
                         });
                     }
                 }

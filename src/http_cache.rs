@@ -245,21 +245,20 @@ fn save_cache_file(cache: &HttpCacheFile) -> Result<()> {
 }
 
 fn cache_path() -> Option<PathBuf> {
+    app_cache_dir().map(|dir| dir.join(CACHE_FILE))
+}
+
+pub fn app_cache_dir() -> Option<PathBuf> {
     if let Ok(base) = env::var("XDG_CACHE_HOME")
         && !base.trim().is_empty()
     {
-        return Some(PathBuf::from(base).join(CACHE_DIR).join(CACHE_FILE));
+        return Some(PathBuf::from(base).join(CACHE_DIR));
     }
     let home = env::var("HOME").ok()?;
     if home.trim().is_empty() {
         return None;
     }
-    Some(
-        PathBuf::from(home)
-            .join(".cache")
-            .join(CACHE_DIR)
-            .join(CACHE_FILE),
-    )
+    Some(PathBuf::from(home).join(".cache").join(CACHE_DIR))
 }
 
 fn prune_cache(cache: &mut HttpCacheFile) -> bool {

@@ -48,6 +48,9 @@ struct App {
     prefetch_players_limit: usize,
     auto_warm_mode: AutoWarmMode,
     auto_warm_pending: bool,
+    prediction_model_auto_warm: bool,
+    prediction_model_warm_pending: bool,
+    prediction_model_warm_ttl: Duration,
     analysis_request_throttle: Duration,
     last_analysis_request: HashMap<LeagueMode, Instant>,
     detail_dist_cache: Option<DetailDistCache>,
@@ -134,6 +137,17 @@ impl App {
         let rankings_recompute_interval = Duration::from_millis(rankings_recompute_ms);
         let predictions_recompute_interval = Duration::from_millis(predictions_recompute_ms);
         let auto_warm_mode = parse_auto_warm_mode();
+        let prediction_model_auto_warm = std::env::var("AUTO_WARM_PREDICTION_MODEL")
+            .ok()
+            .map(|v| v != "0" && v.to_ascii_lowercase() != "false")
+            .unwrap_or(true);
+        let prediction_model_warm_ttl = Duration::from_secs(
+            std::env::var("PRED_MODEL_WARM_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(24 * 3600)
+                .max(60),
+        );
         Self {
             state: AppState::new(),
             should_quit: false,
@@ -153,6 +167,9 @@ impl App {
             prefetch_players_limit,
             auto_warm_pending: auto_warm_mode != AutoWarmMode::Off,
             auto_warm_mode,
+            prediction_model_auto_warm,
+            prediction_model_warm_pending: prediction_model_auto_warm,
+            prediction_model_warm_ttl,
             analysis_request_throttle: Duration::from_secs(analysis_request_throttle),
             last_analysis_request: HashMap::new(),
             detail_dist_cache: None,
@@ -935,6 +952,85 @@ impl App {
             if self.auto_warm_mode != AutoWarmMode::Off {
                 self.auto_warm_pending = true;
             }
+            if self.prediction_model_auto_warm {
+                self.prediction_model_warm_pending = true;
+            }
+        }
+    }
+
+    fn request_prediction_model_warm(&mut self, announce: bool) {
+        if !self.prediction_model_auto_warm {
+            return;
+        }
+        if self.state.analysis.is_empty() {
+            if announce {
+                self.state
+                    .push_log("[INFO] No teams loaded yet (fetch Analysis first)");
+            }
+            return;
+        }
+        let Some(tx) = &self.cmd_tx else {
+            if announce {
+                self.state
+                    .push_log("[INFO] Prediction model warm unavailable");
+            }
+            return;
+        };
+
+        let league_ids: Vec<u32> = match self.state.league_mode {
+            LeagueMode::PremierLeague => self.state.league_pl_ids.clone(),
+            LeagueMode::LaLiga => self.state.league_ll_ids.clone(),
+            LeagueMode::Bundesliga => self.state.league_bl_ids.clone(),
+            LeagueMode::SerieA => self.state.league_sa_ids.clone(),
+            LeagueMode::Ligue1 => self.state.league_l1_ids.clone(),
+            LeagueMode::ChampionsLeague => self.state.league_cl_ids.clone(),
+            LeagueMode::WorldCup => self.state.league_wc_ids.clone(),
+        };
+        if league_ids.is_empty() {
+            return;
+        }
+
+        // Skip if all league ids were warmed recently.
+        let mut stale = false;
+        for league_id in &league_ids {
+            let at = self
+                .state
+                .prediction_model_fetched_at
+                .get(league_id)
+                .copied();
+            let fresh = at
+                .and_then(|t| t.elapsed().ok())
+                .map(|e| e < self.prediction_model_warm_ttl)
+                .unwrap_or(false);
+            if !fresh {
+                stale = true;
+                break;
+            }
+        }
+        if !stale {
+            if announce {
+                self.state.push_log("[INFO] Prediction model warm (cached)");
+            }
+            return;
+        }
+
+        let mut team_ids: Vec<u32> = self.state.analysis.iter().map(|t| t.id).collect();
+        team_ids.sort_unstable();
+        team_ids.dedup();
+
+        if tx
+            .send(state::ProviderCommand::WarmPredictionModel {
+                league_ids,
+                team_ids,
+            })
+            .is_err()
+        {
+            if announce {
+                self.state
+                    .push_log("[WARN] Prediction model warm request failed");
+            }
+        } else if announce {
+            self.state.push_log("[INFO] Prediction model warm started");
         }
     }
 
@@ -1399,6 +1495,20 @@ impl App {
             AutoWarmMode::Off => {}
         }
         self.auto_warm_pending = false;
+    }
+
+    fn maybe_auto_warm_prediction_model(&mut self) {
+        if !self.prediction_model_auto_warm || !self.prediction_model_warm_pending {
+            return;
+        }
+        if self.state.analysis.is_empty() {
+            if !self.state.analysis_loading {
+                self.request_analysis(false);
+            }
+            return;
+        }
+        self.request_prediction_model_warm(false);
+        self.prediction_model_warm_pending = false;
     }
 
     fn toggle_placeholder_match(&mut self) {
@@ -2390,10 +2500,9 @@ fn run_app<B: Backend>(
 
         // Debounced win-prob recompute: avoid per-player recompute during warm/prefetch.
         {
-            let in_live_context = (matches!(app.state.screen, Screen::Pulse)
-                && app.state.pulse_view == PulseView::Live)
+            let in_prediction_context = matches!(app.state.screen, Screen::Pulse)
                 || matches!(app.state.screen, Screen::Terminal { .. });
-            if in_live_context && app.state.predictions_dirty {
+            if in_prediction_context && app.state.predictions_dirty {
                 let now = Instant::now();
                 if now.duration_since(app.predictions_last_recompute)
                     >= app.predictions_recompute_interval
@@ -2414,6 +2523,7 @@ fn run_app<B: Backend>(
         app.maybe_refresh_upcoming();
         app.maybe_refresh_match_details();
         app.maybe_auto_warm_rankings();
+        app.maybe_auto_warm_prediction_model();
         app.maybe_hover_prefetch_match_details();
 
         if needs_redraw || changed || last_draw.elapsed() >= heartbeat_rate {
@@ -5785,19 +5895,15 @@ fn prediction_detail_text(state: &AppState) -> String {
         lines.push(String::new());
         lines.push("Explain (pre-match):".to_string());
         lines.push(format!(
-            "Contrib (home win pp): HA {:+.1}, FIFA {:+.1}, Lineup {:+.1}",
-            ex.explain.pp_home_adv, ex.explain.pp_analysis, ex.explain.pp_lineup
+            "Contrib (home win pp): Base {:+.1}, Lineup {:+.1}",
+            ex.explain.pp_analysis, ex.explain.pp_lineup
         ));
         lines.push(format!(
             "Baseline: H{:.1} D{:.1} A{:.1}",
             ex.explain.p_home_baseline, ex.explain.p_draw_baseline, ex.explain.p_away_baseline
         ));
         lines.push(format!(
-            "HA only:  H{:.1} D{:.1} A{:.1}",
-            ex.explain.p_home_ha, ex.explain.p_draw_ha, ex.explain.p_away_ha
-        ));
-        lines.push(format!(
-            "Analysis: H{:.1} D{:.1} A{:.1}",
+            "Base:     H{:.1} D{:.1} A{:.1}",
             ex.explain.p_home_analysis, ex.explain.p_draw_analysis, ex.explain.p_away_analysis
         ));
         lines.push(format!(
@@ -5810,6 +5916,12 @@ fn prediction_detail_text(state: &AppState) -> String {
             "xG prior (pre): {:.2} - {:.2}",
             ex.lambda_home_pre, ex.lambda_away_pre
         ));
+        if let (Some(gt), Some(ha)) = (ex.goals_total_base, ex.home_adv_goals) {
+            let rho = ex.dc_rho.unwrap_or(0.0);
+            lines.push(format!(
+                "League params: goals={gt:.2} homeAdv={ha:+.2} dcRho={rho:+.2}"
+            ));
+        }
         let a_h = ex
             .s_home_analysis
             .map(|v| format!("{v:.2}"))
@@ -5818,7 +5930,17 @@ fn prediction_detail_text(state: &AppState) -> String {
             .s_away_analysis
             .map(|v| format!("{v:.2}"))
             .unwrap_or_else(|| "-".to_string());
-        lines.push(format!("Analysis strength: home={a_h} away={a_a}"));
+        lines.push(format!("FIFA strength:    home={a_h} away={a_a}"));
+
+        let e_h = ex
+            .s_home_elo
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let e_a = ex
+            .s_away_elo
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!("Elo strength:     home={e_h} away={e_a}"));
 
         let l_h = ex
             .s_home_lineup
@@ -6022,11 +6144,8 @@ fn prediction_text(state: &AppState) -> String {
                             ""
                         };
                         out.push_str(&format!(
-                            "\nWhy: HA{:+.1} ANA{:+.1} LU{:+.1}{}",
-                            ex.explain.pp_home_adv,
-                            ex.explain.pp_analysis,
-                            ex.explain.pp_lineup,
-                            disc
+                            "\nWhy: ANA{:+.1} LU{:+.1}{}",
+                            ex.explain.pp_analysis, ex.explain.pp_lineup, disc
                         ));
                     }
                 }
