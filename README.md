@@ -18,6 +18,9 @@ Bloomberg-style football terminal in the terminal. Pulse shows live match probab
 - Format: `cargo fmt --all`
 - Check: `cargo check`
 - Tests: `cargo test`
+- Ingest PL history to SQLite: `cargo run --bin pl_ingest`
+- Backtest PL pre-match model: `cargo run --bin pl_backtest`
+- Backtest + apply fitted PL params to cache: `cargo run --bin pl_backtest -- --apply`
 
 ### Notes
 

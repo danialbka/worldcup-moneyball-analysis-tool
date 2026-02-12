@@ -4315,22 +4315,33 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let player_id = state.player_last_id;
+    let cache_key = build_detail_cache_key(state);
     let cache_needs_rebuild = app
         .detail_dist_cache
         .as_ref()
-        .map(|cache| cache.player_id != player_id)
+        .map(|cache| cache.key != cache_key)
         .unwrap_or(true);
     if cache_needs_rebuild {
         let dist = build_stat_distributions(state);
-        app.detail_dist_cache = Some(DetailDistCache { player_id, dist });
+        let rank_index = build_league_stat_rank_index(state);
+        app.detail_dist_cache = Some(DetailDistCache {
+            key: cache_key,
+            dist,
+            rank_index,
+        });
     }
-    let dist = match app.detail_dist_cache.as_ref() {
-        Some(cache) => &cache.dist,
+    let (dist, rank_index) = match app.detail_dist_cache.as_ref() {
+        Some(cache) => (&cache.dist, &cache.rank_index),
         None => {
             let dist = build_stat_distributions(state);
-            app.detail_dist_cache = Some(DetailDistCache { player_id, dist });
-            &app.detail_dist_cache.as_ref().expect("detail dist").dist
+            let rank_index = build_league_stat_rank_index(state);
+            app.detail_dist_cache = Some(DetailDistCache {
+                key: cache_key,
+                dist,
+                rank_index,
+            });
+            let cache = app.detail_dist_cache.as_ref().expect("detail dist");
+            (&cache.dist, &cache.rank_index)
         }
     };
 
@@ -4355,10 +4366,10 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     let recent_lines = text_line_count(&recent_text);
 
     let info_text = Text::from(info_text);
-    let league_text = player_league_stats_text_styled(detail, dist);
-    let top_text = player_top_stats_text_styled(detail, dist);
+    let league_text = player_league_stats_text_styled(detail, dist, Some(rank_index));
+    let top_text = player_top_stats_text_styled(detail, dist, Some(rank_index));
     let traits_text = Text::from(traits_text);
-    let other_text = player_season_performance_text_styled(detail, dist);
+    let other_text = player_season_performance_text_styled(detail, dist, Some(rank_index));
     let season_text = player_season_breakdown_text_styled(detail, dist);
     let career_text = Text::from(career_text);
     let trophies_text = Text::from(trophies_text);
@@ -4582,9 +4593,191 @@ struct StatDistributions {
     ratings: Vec<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetailDistCacheKey {
+    league_mode: LeagueMode,
+    analysis_teams: usize,
+    cache_players: usize,
+    cache_players_fallback: usize,
+    squads_loaded_for_league: usize,
+    squad_players_for_league: usize,
+}
+
 struct DetailDistCache {
-    player_id: Option<u32>,
+    key: DetailDistCacheKey,
     dist: StatDistributions,
+    rank_index: LeagueStatRankIndex,
+}
+
+#[derive(Debug, Clone)]
+struct LeagueStatRankIndex {
+    total_by_title: HashMap<String, Vec<f64>>,
+    per90_by_title: HashMap<String, Vec<f64>>,
+    provisional_pool: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RankDirection {
+    HigherBetter,
+    LowerBetter,
+}
+
+#[derive(Debug, Clone)]
+struct RankDisplay {
+    text: String,
+}
+
+fn build_detail_cache_key(state: &AppState) -> DetailDistCacheKey {
+    let cache = if state.combined_player_cache.is_empty() {
+        &state.rankings_cache_players
+    } else {
+        &state.combined_player_cache
+    };
+    let team_ids: HashSet<u32> = state.analysis.iter().map(|t| t.id).collect();
+    let mut squads_loaded_for_league = 0usize;
+    let mut squad_players_for_league = 0usize;
+    for team_id in team_ids {
+        if let Some(squad) = state.rankings_cache_squads.get(&team_id) {
+            squads_loaded_for_league += 1;
+            squad_players_for_league += squad.len();
+        }
+    }
+
+    DetailDistCacheKey {
+        league_mode: state.league_mode,
+        analysis_teams: state.analysis.len(),
+        cache_players: cache.len(),
+        cache_players_fallback: state.rankings_cache_players.len(),
+        squads_loaded_for_league,
+        squad_players_for_league,
+    }
+}
+
+fn build_league_stat_rank_index(state: &AppState) -> LeagueStatRankIndex {
+    const MIN_POOL_PLAYERS: usize = 60;
+    const MIN_DETAIL_COVERAGE: f64 = 0.85;
+    const MIN_PER90_MINUTES: f64 = 180.0;
+
+    let cache = if state.combined_player_cache.is_empty() {
+        &state.rankings_cache_players
+    } else {
+        &state.combined_player_cache
+    };
+
+    let team_ids: HashSet<u32> = state.analysis.iter().map(|t| t.id).collect();
+    let mut expected_players = 0usize;
+    let mut loaded_teams = 0usize;
+    let mut league_player_ids: HashSet<u32> = HashSet::new();
+    for team_id in &team_ids {
+        if let Some(squad) = state.rankings_cache_squads.get(team_id) {
+            loaded_teams += 1;
+            expected_players += squad.len();
+            for player in squad {
+                league_player_ids.insert(player.id);
+            }
+        }
+    }
+
+    let mut candidate_details: Vec<&PlayerDetail> = Vec::new();
+    let mut details_loaded = 0usize;
+
+    if !league_player_ids.is_empty() {
+        for player_id in league_player_ids {
+            let Some(detail) = cache.get(&player_id) else {
+                continue;
+            };
+            if state::player_detail_is_stub(detail) {
+                continue;
+            }
+            details_loaded += 1;
+            candidate_details.push(detail);
+        }
+    } else {
+        // Fallback when squads are not loaded yet: use league-name matching.
+        let wanted = league_label(state.league_mode).to_ascii_lowercase();
+        for detail in cache.values() {
+            if state::player_detail_is_stub(detail) {
+                continue;
+            }
+            let matches_league = detail
+                .main_league
+                .as_ref()
+                .is_some_and(|l| l.league_name.to_ascii_lowercase().contains(&wanted));
+            if matches_league {
+                details_loaded += 1;
+                candidate_details.push(detail);
+            }
+        }
+    }
+
+    let mut total_by_title: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut per90_by_title: HashMap<String, Vec<f64>> = HashMap::new();
+
+    for detail in candidate_details {
+        let mut totals_for_player: HashMap<String, f64> = HashMap::new();
+        let mut per90_for_player: HashMap<String, f64> = HashMap::new();
+
+        collect_player_totals_if_missing(&mut totals_for_player, &detail.all_competitions);
+        if let Some(league) = detail.main_league.as_ref() {
+            collect_player_totals_if_missing(&mut totals_for_player, &league.stats);
+        }
+        collect_player_totals_if_missing(&mut totals_for_player, &detail.top_stats);
+
+        let minutes = detail_minutes(detail).unwrap_or_default();
+        for group in &detail.season_performance {
+            for item in &group.items {
+                let key = normalize_stat_title(&item.title);
+                if let Some(total) = parse_stat_value(&item.total) {
+                    totals_for_player.entry(key.clone()).or_insert(total);
+                }
+                if minutes >= MIN_PER90_MINUTES
+                    && let Some(per90) = item.per90.as_deref().and_then(parse_stat_value)
+                {
+                    per90_for_player.entry(key).or_insert(per90);
+                }
+            }
+        }
+
+        for (key, value) in totals_for_player {
+            total_by_title.entry(key).or_default().push(value);
+        }
+        for (key, value) in per90_for_player {
+            per90_by_title.entry(key).or_default().push(value);
+        }
+    }
+
+    for values in total_by_title.values_mut() {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    for values in per90_by_title.values_mut() {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    let squads_complete = !team_ids.is_empty() && loaded_teams == team_ids.len();
+    let detail_coverage = if expected_players > 0 {
+        details_loaded as f64 / expected_players as f64
+    } else {
+        0.0
+    };
+    let provisional_pool = !squads_complete
+        || expected_players == 0
+        || detail_coverage < MIN_DETAIL_COVERAGE
+        || details_loaded < MIN_POOL_PLAYERS;
+
+    LeagueStatRankIndex {
+        total_by_title,
+        per90_by_title,
+        provisional_pool,
+    }
+}
+
+fn collect_player_totals_if_missing(target: &mut HashMap<String, f64>, stats: &[PlayerStatItem]) {
+    for stat in stats {
+        let key = normalize_stat_title(&stat.title);
+        if let Some(value) = parse_stat_value(&stat.value) {
+            target.entry(key).or_insert(value);
+        }
+    }
 }
 
 fn build_stat_distributions(state: &AppState) -> StatDistributions {
@@ -4851,6 +5044,87 @@ fn style_for_rating(
         .unwrap_or_default()
 }
 
+fn rank_direction_for_title(normalized_title: &str) -> RankDirection {
+    if normalized_title.contains("goals conceded")
+        || normalized_title.contains("xg against")
+        || normalized_title.contains("against while on pitch")
+        || normalized_title.contains("fouls committed")
+        || normalized_title.contains("yellow card")
+        || normalized_title.contains("red card")
+        || normalized_title.contains("dribbled past")
+        || normalized_title.contains("error led to goal")
+        || normalized_title.contains("dispossessed")
+    {
+        RankDirection::LowerBetter
+    } else {
+        RankDirection::HigherBetter
+    }
+}
+
+fn rank_for_value(values: &[f64], value: f64, direction: RankDirection) -> Option<(usize, usize)> {
+    if values.is_empty() || !value.is_finite() {
+        return None;
+    }
+    let n = values.len();
+    let better = match direction {
+        RankDirection::HigherBetter => n.saturating_sub(values.partition_point(|v| *v <= value)),
+        RankDirection::LowerBetter => values.partition_point(|v| *v < value),
+    };
+    Some((better + 1, n))
+}
+
+fn stat_rank_suffix(
+    rank_index: Option<&LeagueStatRankIndex>,
+    title: &str,
+    total_value: Option<f64>,
+    per90_value: Option<f64>,
+) -> Option<RankDisplay> {
+    const MIN_STAT_SAMPLE: usize = 24;
+
+    let Some(rank_index) = rank_index else {
+        return None;
+    };
+    let key = normalize_stat_title(title);
+    let direction = rank_direction_for_title(&key);
+
+    let total_rank = total_value.and_then(|v| {
+        rank_index
+            .total_by_title
+            .get(&key)
+            .and_then(|vals| rank_for_value(vals, v, direction))
+    });
+    let per90_rank = per90_value.and_then(|v| {
+        rank_index
+            .per90_by_title
+            .get(&key)
+            .and_then(|vals| rank_for_value(vals, v, direction))
+    });
+
+    if total_rank.is_none() && per90_rank.is_none() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut provisional = rank_index.provisional_pool;
+    if let Some((rank, n)) = total_rank {
+        if n < MIN_STAT_SAMPLE {
+            provisional = true;
+        }
+        parts.push(format!("#{rank}/{n}"));
+    }
+    if let Some((rank, n)) = per90_rank {
+        if n < MIN_STAT_SAMPLE {
+            provisional = true;
+        }
+        parts.push(format!("p90 #{rank}/{n}"));
+    }
+    let mut text = format!("[{}]", parts.join(" | "));
+    if provisional {
+        text.push_str(" provisional");
+    }
+    Some(RankDisplay { text })
+}
+
 fn player_info_text(detail: &PlayerDetail) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Name: {}", detail.name));
@@ -4928,6 +5202,7 @@ fn player_league_stats_text(detail: &PlayerDetail) -> String {
 fn player_league_stats_text_styled(
     detail: &PlayerDetail,
     dist: &StatDistributions,
+    rank_index: Option<&LeagueStatRankIndex>,
 ) -> Text<'static> {
     let role = role_from_detail(detail);
     let mut lines: Vec<Line> = Vec::new();
@@ -4941,10 +5216,17 @@ fn player_league_stats_text_styled(
                 .unwrap_or_else(|| {
                     style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
                 });
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(format!("  {}: ", stat.title)),
                 Span::styled(value, style),
-            ]));
+            ];
+            if let Some(rank) =
+                stat_rank_suffix(rank_index, &stat.title, parse_stat_value(&stat.value), None)
+            {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+            }
+            lines.push(Line::from(spans));
         }
     }
     if let Some(league) = detail.main_league.as_ref()
@@ -4964,10 +5246,17 @@ fn player_league_stats_text_styled(
                 .unwrap_or_else(|| {
                     style_for_stat(dist, role, &stat.title, parse_stat_value(&value))
                 });
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(format!("  {}: ", stat.title)),
                 Span::styled(value, style),
-            ]));
+            ];
+            if let Some(rank) =
+                stat_rank_suffix(rank_index, &stat.title, parse_stat_value(&stat.value), None)
+            {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+            }
+            lines.push(Line::from(spans));
         }
     }
     if lines.is_empty() {
@@ -4988,7 +5277,11 @@ fn player_top_stats_text(detail: &PlayerDetail) -> String {
     lines.join("\n")
 }
 
-fn player_top_stats_text_styled(detail: &PlayerDetail, dist: &StatDistributions) -> Text<'static> {
+fn player_top_stats_text_styled(
+    detail: &PlayerDetail,
+    dist: &StatDistributions,
+    rank_index: Option<&LeagueStatRankIndex>,
+) -> Text<'static> {
     if detail.top_stats.is_empty() {
         return Text::from("No all-competitions top stats".to_string());
     }
@@ -4999,10 +5292,17 @@ fn player_top_stats_text_styled(detail: &PlayerDetail, dist: &StatDistributions)
         let style = style_from_percentile(stat.percentile_rank_per90)
             .or_else(|| style_from_percentile(stat.percentile_rank))
             .unwrap_or_else(|| style_for_stat(dist, role, &stat.title, parse_stat_value(&value)));
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::raw(format!("{}: ", stat.title)),
             Span::styled(value, style),
-        ]));
+        ];
+        if let Some(rank) =
+            stat_rank_suffix(rank_index, &stat.title, parse_stat_value(&stat.value), None)
+        {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+        }
+        lines.push(Line::from(spans));
     }
     Text::from(lines)
 }
@@ -5067,6 +5367,7 @@ fn player_season_performance_text(detail: &PlayerDetail) -> String {
 fn player_season_performance_text_styled(
     detail: &PlayerDetail,
     dist: &StatDistributions,
+    rank_index: Option<&LeagueStatRankIndex>,
 ) -> Text<'static> {
     if detail.season_performance.is_empty() {
         return Text::from("No season performance stats".to_string());
@@ -5095,12 +5396,22 @@ fn player_season_performance_text_styled(
                     style_for_stat(dist, role, &item.title, color_value)
                 });
 
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(format!("  {}: ", item.title)),
                 Span::styled(item.total.clone(), total_style),
                 Span::raw(" | "),
                 Span::styled(per90.to_string(), per90_style),
-            ]));
+            ];
+            if let Some(rank) = stat_rank_suffix(
+                rank_index,
+                &item.title,
+                parse_stat_value(&item.total),
+                item.per90.as_deref().and_then(parse_stat_value),
+            ) {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+            }
+            lines.push(Line::from(spans));
         }
     }
     Text::from(lines)
@@ -6135,9 +6446,7 @@ fn prediction_detail_text(state: &AppState) -> String {
         ));
         if let Some(gt) = ex.goals_total_base {
             let rho = ex.dc_rho.unwrap_or(0.0);
-            lines.push(format!(
-                "League params: goals={gt:.2} dcRho={rho:+.2}"
-            ));
+            lines.push(format!("League params: goals={gt:.2} dcRho={rho:+.2}"));
         }
 
         let l_h = ex

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use crate::league_params::LeagueParams;
 use crate::state::{
-    player_detail_is_stub, LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail,
-    PlayerSlot, PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis,
-    WinProbRow,
+    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, PlayerSlot,
+    PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis, WinProbRow,
+    player_detail_is_stub,
 };
 
 const GOALS_TOTAL_BASE: f64 = 2.60;
@@ -79,7 +79,7 @@ pub fn compute_win_prob_explainable(
     let goals_total_base = league_params
         .map(|p| p.goals_total_base)
         .unwrap_or(GOALS_TOTAL_BASE);
-    // Home advantage removed — model is venue-neutral.
+    let home_adv_goals = league_params.map(|p| p.home_adv_goals).unwrap_or(0.0);
     let dc_rho = league_params.map(|p| p.dc_rho).unwrap_or(-0.10);
 
     let lineup = detail.and_then(|d| d.lineups.as_ref());
@@ -166,8 +166,16 @@ pub fn compute_win_prob_explainable(
     };
 
     let diff = K_STRENGTH * (s_home - s_away);
-    let mut lambda_home_pre = clamp((goals_total_base / 2.0) + (diff / 2.0), 0.20, 3.80);
-    let mut lambda_away_pre = clamp((goals_total_base / 2.0) - (diff / 2.0), 0.20, 3.80);
+    let mut lambda_home_pre = clamp(
+        (goals_total_base / 2.0) + (home_adv_goals / 2.0) + (diff / 2.0),
+        0.20,
+        3.80,
+    );
+    let mut lambda_away_pre = clamp(
+        (goals_total_base / 2.0) - (home_adv_goals / 2.0) - (diff / 2.0),
+        0.20,
+        3.80,
+    );
 
     // Historical discipline proxy (fouls/cards) slightly boosts the opponent's scoring expectation.
     let (disc_home, disc_cov_home) = disc_home_lineup
@@ -365,6 +373,7 @@ pub fn compute_win_prob_explainable(
         let have_disc = disc_home.is_some() && disc_away.is_some();
         Some(build_prematch_extras(
             goals_total_base,
+            home_adv_goals,
             dc_rho,
             lambda_home_pre,
             lambda_away_pre,
@@ -425,6 +434,7 @@ fn compute_confidence_prematch(blend_w_lineup: f32) -> u8 {
 
 fn build_prematch_extras(
     goals_total_base: f64,
+    home_adv_goals: f64,
     dc_rho: f64,
     lambda_home_pre: f64,
     lambda_away_pre: f64,
@@ -444,9 +454,14 @@ fn build_prematch_extras(
     p_away_final: f32,
 ) -> PredictionExtras {
     let (p_home_baseline, p_draw_baseline, p_away_baseline) =
-        prematch_probs_from_params(goals_total_base, 0.0, 0.0, dc_rho);
+        prematch_probs_from_params(goals_total_base, 0.0, 0.0, 0.0, dc_rho);
+    let (p_home_ha, p_draw_ha, p_away_ha) =
+        prematch_probs_from_params(goals_total_base, home_adv_goals, 0.0, 0.0, dc_rho);
 
     let mut signals: Vec<String> = Vec::new();
+    if home_adv_goals.abs() > 0.01 {
+        signals.push(format!("HA_{:+.2}", home_adv_goals));
+    }
     if let (Some(ch), Some(ca)) = (cov_home, cov_away) {
         let n_h = (ch * 11.0).round().clamp(0.0, 11.0) as u8;
         let n_a = (ca * 11.0).round().clamp(0.0, 11.0) as u8;
@@ -465,12 +480,13 @@ fn build_prematch_extras(
         ));
     }
 
-    let pp_lineup = p_home_final - p_home_baseline;
+    let pp_home_adv = p_home_ha - p_home_baseline;
+    let pp_lineup = p_home_final - p_home_ha;
 
     PredictionExtras {
         prematch_only: true,
         goals_total_base: Some(goals_total_base),
-        home_adv_goals: None,
+        home_adv_goals: Some(home_adv_goals),
         dc_rho: Some(dc_rho),
         lambda_home_pre,
         lambda_away_pre,
@@ -493,16 +509,16 @@ fn build_prematch_extras(
             p_home_baseline,
             p_draw_baseline,
             p_away_baseline,
-            p_home_ha: p_home_baseline,
-            p_draw_ha: p_draw_baseline,
-            p_away_ha: p_away_baseline,
-            p_home_analysis: p_home_baseline,
-            p_draw_analysis: p_draw_baseline,
-            p_away_analysis: p_away_baseline,
+            p_home_ha,
+            p_draw_ha,
+            p_away_ha,
+            p_home_analysis: p_home_ha,
+            p_draw_analysis: p_draw_ha,
+            p_away_analysis: p_away_ha,
             p_home_final,
             p_draw_final,
             p_away_final,
-            pp_home_adv: 0.0,
+            pp_home_adv,
             pp_analysis: 0.0,
             pp_lineup,
             signals,
@@ -512,13 +528,22 @@ fn build_prematch_extras(
 
 fn prematch_probs_from_params(
     goals_total_base: f64,
+    home_adv_goals: f64,
     s_home: f64,
     s_away: f64,
     dc_rho: f64,
 ) -> (f32, f32, f32) {
     let diff = K_STRENGTH * (s_home - s_away);
-    let lambda_home = clamp((goals_total_base / 2.0) + (diff / 2.0), 0.20, 3.80);
-    let lambda_away = clamp((goals_total_base / 2.0) - (diff / 2.0), 0.20, 3.80);
+    let lambda_home = clamp(
+        (goals_total_base / 2.0) + (home_adv_goals / 2.0) + (diff / 2.0),
+        0.20,
+        3.80,
+    );
+    let lambda_away = clamp(
+        (goals_total_base / 2.0) - (home_adv_goals / 2.0) - (diff / 2.0),
+        0.20,
+        3.80,
+    );
     probs_percent_dc(0, 0, lambda_home, lambda_away, 10, dc_rho)
 }
 

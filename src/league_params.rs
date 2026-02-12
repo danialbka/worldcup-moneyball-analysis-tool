@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::calibration;
 use crate::http_cache::app_cache_dir;
 use crate::team_fixtures::FixtureMatch;
 
@@ -32,6 +33,7 @@ impl LeagueParams {
 
 pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> LeagueParams {
     let mut total_goals = 0.0;
+    let mut home_minus_away = 0.0;
     let mut n = 0usize;
 
     for m in fixtures {
@@ -45,6 +47,7 @@ pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> Leagu
             continue;
         }
         total_goals += (m.home_goals as f64) + (m.away_goals as f64);
+        home_minus_away += (m.home_goals as f64) - (m.away_goals as f64);
         n += 1;
     }
 
@@ -52,8 +55,7 @@ pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> Leagu
     out.sample_matches = n;
     if n > 0 {
         out.goals_total_base = total_goals / (n as f64);
-        // Home advantage removed — venue-neutral model.
-        out.home_adv_goals = 0.0;
+        out.home_adv_goals = home_minus_away / (n as f64);
     }
 
     // Shrink small samples toward defaults to avoid wild swings.
@@ -61,7 +63,13 @@ pub fn compute_league_params(league_id: u32, fixtures: &[FixtureMatch]) -> Leagu
     let w = ((n as f64) / MIN_N).clamp(0.0, 1.0);
     let d = LeagueParams::defaults(league_id);
     out.goals_total_base = (1.0 - w) * d.goals_total_base + w * out.goals_total_base;
-    out.home_adv_goals = 0.0;
+    out.home_adv_goals = (1.0 - w) * d.home_adv_goals + w * out.home_adv_goals;
+    out.dc_rho = calibration::fit_dc_rho_for_league(
+        league_id,
+        fixtures,
+        out.goals_total_base,
+        out.home_adv_goals,
+    );
     out
 }
 
