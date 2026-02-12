@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -188,6 +188,9 @@ fn spawn_prediction_worker(tx: mpsc::Sender<state::Delta>) -> mpsc::Sender<Predi
 struct App {
     state: AppState,
     should_quit: bool,
+    ui_anim_frame: u64,
+    ui_anim_started_at: Instant,
+    ui_last_anim_tick: Instant,
     cmd_tx: Option<mpsc::Sender<state::ProviderCommand>>,
     pred_tx: Option<mpsc::Sender<PredictionCommand>>,
     pred_inflight: bool,
@@ -310,9 +313,13 @@ impl App {
                 .unwrap_or(24 * 3600)
                 .max(60),
         );
+        let now = Instant::now();
         Self {
             state: AppState::new(),
             should_quit: false,
+            ui_anim_frame: 0,
+            ui_anim_started_at: now,
+            ui_last_anim_tick: now,
             cmd_tx,
             pred_tx,
             pred_inflight: false,
@@ -2614,6 +2621,13 @@ fn run_app<B: Backend>(
 ) -> io::Result<()> {
     let poll_rate = Duration::from_millis(250);
     let heartbeat_rate = Duration::from_secs(1);
+    let animation_rate = Duration::from_millis(
+        std::env::var("UI_ANIMATION_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120)
+            .clamp(60, 400),
+    );
     let mut last_draw = Instant::now() - heartbeat_rate;
     let mut needs_redraw = true;
 
@@ -2747,6 +2761,15 @@ fn run_app<B: Backend>(
         app.maybe_auto_warm_prediction_model();
         app.maybe_hover_prefetch_match_details();
 
+        if app.ui_last_anim_tick.elapsed() >= animation_rate {
+            let elapsed_ms = app.ui_last_anim_tick.elapsed().as_millis();
+            let step_ms = animation_rate.as_millis().max(1);
+            let steps = (elapsed_ms / step_ms).max(1) as u64;
+            app.ui_anim_frame = app.ui_anim_frame.wrapping_add(steps);
+            app.ui_last_anim_tick = Instant::now();
+            needs_redraw = true;
+        }
+
         if needs_redraw || changed || last_draw.elapsed() >= heartbeat_rate {
             terminal.draw(|f| ui(f, app))?;
             last_draw = Instant::now();
@@ -2768,9 +2791,11 @@ fn run_app<B: Backend>(
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
+    let anim = ui_anim_from_frame(app.ui_anim_frame);
+    let _uptime = app.ui_anim_started_at.elapsed();
     // Force a consistent dark background across the entire frame.
     frame.render_widget(
-        Block::default().style(Style::default().bg(THEME_BG)),
+        Block::default().style(Style::default().bg(theme_bg())),
         frame.size(),
     );
 
@@ -2783,84 +2808,98 @@ fn ui(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.size());
 
-    let header =
-        Paragraph::new(header_styled(&app.state)).style(Style::default().bg(THEME_CHROME_BG));
+    let header = Paragraph::new(header_styled(&app.state, anim))
+        .style(Style::default().bg(theme_chrome_bg()));
     frame.render_widget(header, chunks[0]);
 
     match app.state.screen {
-        Screen::Pulse => render_pulse(frame, chunks[1], &app.state),
-        Screen::Terminal { .. } => render_terminal(frame, chunks[1], &app.state),
-        Screen::Analysis => render_analysis(frame, chunks[1], &app.state),
-        Screen::Squad => render_squad(frame, chunks[1], &app.state),
-        Screen::PlayerDetail => render_player_detail(frame, chunks[1], app),
+        Screen::Pulse => render_pulse(frame, chunks[1], &app.state, anim),
+        Screen::Terminal { .. } => render_terminal(frame, chunks[1], &app.state, anim),
+        Screen::Analysis => render_analysis(frame, chunks[1], &app.state, anim),
+        Screen::Squad => render_squad(frame, chunks[1], &app.state, anim),
+        Screen::PlayerDetail => render_player_detail(frame, chunks[1], app, anim),
     }
 
-    let footer = Paragraph::new(footer_styled(&app.state))
-        .style(Style::default().bg(THEME_CHROME_BG))
+    let footer = Paragraph::new(footer_styled(&app.state, anim))
+        .style(Style::default().bg(theme_chrome_bg()))
         .block(
             Block::default()
                 .borders(Borders::TOP)
-                .border_style(Style::default().fg(THEME_BORDER_DIM))
-                .style(Style::default().bg(THEME_CHROME_BG)),
+                .border_style(Style::default().fg(theme_border_dim()))
+                .style(Style::default().bg(theme_chrome_bg())),
         );
     frame.render_widget(footer, chunks[2]);
 
     if app.state.export.active {
-        render_export_overlay(frame, frame.size(), &app.state);
+        render_export_overlay(frame, frame.size(), &app.state, anim);
     }
     if app.state.help_overlay {
-        render_help_overlay(frame, frame.size());
+        render_help_overlay(frame, frame.size(), anim);
     }
     if app.state.terminal_detail.is_some() {
-        render_terminal_detail_overlay(frame, frame.size(), &app.state);
+        render_terminal_detail_overlay(frame, frame.size(), &app.state, anim);
     }
 }
 
-fn header_styled(state: &AppState) -> Line<'static> {
-    let sep = Span::styled(" | ", Style::default().fg(THEME_BORDER_DIM));
+fn header_styled(state: &AppState, anim: UiAnim) -> Line<'static> {
+    let sep = Span::styled(ui_theme().glyphs.divider, Style::default().fg(theme_border_dim()));
 
     match state.screen {
-        Screen::Pulse => Line::from(vec![
-            Span::styled(
-                "WC26 PULSE",
-                Style::default()
-                    .fg(THEME_ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            sep.clone(),
-            Span::styled(
-                league_label(state.league_mode).to_string(),
-                Style::default().fg(THEME_ACCENT_2),
-            ),
-            sep.clone(),
-            Span::styled(
-                pulse_view_label(state.pulse_view).to_string(),
-                Style::default().fg(Color::LightMagenta),
-            ),
-            sep.clone(),
-            Span::styled("Sort: ", Style::default().fg(THEME_MUTED)),
-            Span::styled(
-                sort_label(state.sort).to_string(),
-                Style::default().fg(Color::LightGreen),
-            ),
-        ]),
+        Screen::Pulse => {
+            let mut spans = vec![
+                Span::styled(
+                    "WC26 PULSE",
+                    Style::default()
+                        .fg(theme_accent())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                sep.clone(),
+                Span::styled(
+                    league_label(state.league_mode).to_string(),
+                    Style::default().fg(theme_accent_2()),
+                ),
+                sep.clone(),
+                Span::styled(
+                    pulse_view_label(state.pulse_view).to_string(),
+                    Style::default().fg(Color::LightMagenta),
+                ),
+                sep.clone(),
+                Span::styled("Sort: ", Style::default().fg(theme_muted())),
+                Span::styled(
+                    sort_label(state.sort).to_string(),
+                    Style::default().fg(theme_success()),
+                ),
+            ];
+            if state.pulse_view == PulseView::Live {
+                spans.push(sep.clone());
+                spans.push(Span::styled(
+                    format!("{} LIVE", ui_live_dot(anim)),
+                    Style::default().fg(if anim.blink_on {
+                        theme_success()
+                    } else {
+                        theme_muted()
+                    }),
+                ));
+            }
+            Line::from(spans)
+        }
         Screen::Terminal { .. } => Line::from(Span::styled(
             "WC26 TERMINAL",
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         )),
         Screen::Analysis => {
             let updated = state.analysis_updated.as_deref().unwrap_or("-");
             let status_label = if state.analysis_loading {
-                "LOADING"
+                format!("{} LOADING", ui_spinner(anim))
             } else {
-                "READY"
+                "READY".to_string()
             };
             let status_color = if state.analysis_loading {
-                Color::Yellow
+                theme_warn()
             } else {
-                Color::Green
+                theme_success()
             };
             let tab = match state.analysis_tab {
                 state::AnalysisTab::Teams => "TEAMS",
@@ -2874,32 +2913,32 @@ fn header_styled(state: &AppState) -> Line<'static> {
                 Span::styled(
                     "WC26 ANALYSIS",
                     Style::default()
-                        .fg(THEME_ACCENT)
+                        .fg(theme_accent())
                         .add_modifier(Modifier::BOLD),
                 ),
                 sep.clone(),
                 Span::styled(
                     league_label(state.league_mode).to_string(),
-                    Style::default().fg(THEME_ACCENT_2),
+                    Style::default().fg(theme_accent_2()),
                 ),
                 sep.clone(),
-                Span::styled("Tab: ", Style::default().fg(THEME_MUTED)),
+                Span::styled("Tab: ", Style::default().fg(theme_muted())),
                 Span::styled(tab.to_string(), Style::default().fg(Color::LightMagenta)),
                 sep.clone(),
                 Span::styled(
                     format!("Teams: {}", state.analysis.len()),
-                    Style::default().fg(THEME_TEXT),
+                    Style::default().fg(theme_text()),
                 ),
                 sep.clone(),
-                Span::styled(format!("FIFA: {updated}"), Style::default().fg(THEME_TEXT)),
+                Span::styled(format!("FIFA: {updated}"), Style::default().fg(theme_text())),
                 sep.clone(),
                 Span::styled(
                     format!("Fetched: {fetched}"),
-                    Style::default().fg(THEME_MUTED),
+                    Style::default().fg(theme_muted()),
                 ),
                 sep.clone(),
                 Span::styled(
-                    status_label.to_string(),
+                    status_label,
                     Style::default()
                         .fg(status_color)
                         .add_modifier(if state.analysis_loading {
@@ -2913,32 +2952,32 @@ fn header_styled(state: &AppState) -> Line<'static> {
         Screen::Squad => {
             let team = state.squad_team.as_deref().unwrap_or("-");
             let status_label = if state.squad_loading {
-                "LOADING"
+                format!("{} LOADING", ui_spinner(anim))
             } else {
-                "READY"
+                "READY".to_string()
             };
             let status_color = if state.squad_loading {
-                Color::Yellow
+                theme_warn()
             } else {
-                Color::Green
+                theme_success()
             };
             Line::from(vec![
                 Span::styled(
                     "WC26 SQUAD",
                     Style::default()
-                        .fg(THEME_ACCENT)
+                        .fg(theme_accent())
                         .add_modifier(Modifier::BOLD),
                 ),
                 sep.clone(),
-                Span::styled(format!("Team: {team}"), Style::default().fg(THEME_ACCENT_2)),
+                Span::styled(format!("Team: {team}"), Style::default().fg(theme_accent_2())),
                 sep.clone(),
                 Span::styled(
                     format!("Players: {}", state.squad.len()),
-                    Style::default().fg(THEME_TEXT),
+                    Style::default().fg(theme_text()),
                 ),
                 sep.clone(),
                 Span::styled(
-                    status_label.to_string(),
+                    status_label,
                     Style::default()
                         .fg(status_color)
                         .add_modifier(if state.squad_loading {
@@ -2952,7 +2991,7 @@ fn header_styled(state: &AppState) -> Line<'static> {
         Screen::PlayerDetail => Line::from(Span::styled(
             "WC26 PLAYER",
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         )),
     }
@@ -2968,7 +3007,7 @@ fn format_fetched_at(fetched_at: Option<SystemTime>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn footer_styled(state: &AppState) -> Line<'static> {
+fn footer_styled(state: &AppState, anim: UiAnim) -> Line<'static> {
     let bindings: &[(&str, &str)] = match state.screen {
         Screen::Pulse => match state.pulse_view {
             PulseView::Live => &[
@@ -3048,33 +3087,49 @@ fn footer_styled(state: &AppState) -> Line<'static> {
             ("q", "Quit"),
         ],
     };
+    let color_mode = match ui_theme().mode {
+        UiColorMode::Truecolor => "TC",
+        UiColorMode::Ansi16 => "16c",
+    };
     let mut spans: Vec<Span> = Vec::new();
     for (i, (key, desc)) in bindings.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(THEME_BORDER_DIM)));
+            spans.push(Span::styled(
+                ui_theme().glyphs.divider,
+                Style::default().fg(theme_border_dim()),
+            ));
         }
         spans.push(Span::styled(
             key.to_string(),
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(" {desc}"),
-            Style::default().fg(THEME_MUTED),
+            Style::default().fg(theme_muted()),
         ));
     }
+    spans.push(Span::styled(
+        format!(
+            "{}{} {}",
+            ui_theme().glyphs.divider,
+            color_mode,
+            ui_spinner(anim)
+        ),
+        Style::default().fg(theme_border_dim()),
+    ));
     Line::from(spans)
 }
 
-fn render_pulse(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_pulse(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     match state.pulse_view {
-        PulseView::Live => render_pulse_live(frame, area, state),
-        PulseView::Upcoming => render_pulse_upcoming(frame, area, state),
+        PulseView::Live => render_pulse_live(frame, area, state, anim),
+        PulseView::Upcoming => render_pulse_upcoming(frame, area, state, anim),
     }
 }
 
-fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let (main_area, sidebar_area) = if area.width >= 110 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -3091,19 +3146,19 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(main_area);
 
     let widths = pulse_columns();
-    render_pulse_header(frame, sections[0], &widths);
+    render_pulse_header(frame, sections[0], &widths, anim);
 
     let list_area = sections[1];
     let rows = state.pulse_live_rows_ref();
     if rows.is_empty() {
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(
             "No matches for this league",
             on_black(empty_style),
         ))
-        .style(Style::default().bg(THEME_BG));
+        .style(Style::default().bg(theme_bg()));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -3111,13 +3166,13 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     const ROW_HEIGHT: u16 = 3;
     if list_area.height < ROW_HEIGHT {
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(
             "Pulse list needs more height",
             on_black(empty_style),
         ))
-        .style(Style::default().bg(THEME_BG));
+        .style(Style::default().bg(theme_bg()));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -3137,14 +3192,8 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.selected;
-        let base_bg = if selected {
-            THEME_FOCUS_BG
-        } else if idx % 2 == 0 {
-            THEME_PANEL_BG
-        } else {
-            THEME_BG
-        };
-        let base_style = Style::default().fg(THEME_TEXT).bg(base_bg);
+        let base_bg = pulse_row_bg(selected, idx, anim);
+        let base_style = Style::default().fg(theme_text()).bg(base_bg);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(widths)
@@ -3158,10 +3207,10 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                 let is_not_started = !m.is_live && m.minute == 0;
                 let is_finished = !m.is_live && m.minute >= 90;
 
-                let row_style = if is_not_started {
-                    base_style.fg(THEME_MUTED)
-                } else if is_finished {
-                    base_style.fg(THEME_MUTED)
+                let row_style = if selected {
+                    base_style.add_modifier(Modifier::BOLD)
+                } else if is_not_started || is_finished {
+                    base_style.fg(theme_muted())
                 } else {
                     base_style
                 };
@@ -3177,7 +3226,15 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                         .map(|u| format_countdown_short(&u.kickoff, now))
                         .unwrap_or_else(|| "KO".to_string())
                 };
-                let time = format!("{}{}", if selected { "▸" } else { " " }, time);
+                let time = format!(
+                    "{}{}",
+                    if selected {
+                        ui_theme().glyphs.row_selected
+                    } else {
+                        " "
+                    },
+                    time
+                );
                 let match_name = format!("{} vs {}", m.home, m.away);
                 let score = if is_not_started {
                     "--".to_string()
@@ -3187,9 +3244,9 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
 
                 // Time cell: green for live, dim for finished
                 let time_style = if m.is_live {
-                    row_style.fg(Color::LightGreen)
+                    row_style.fg(theme_success())
                 } else if is_finished {
-                    row_style.fg(THEME_MUTED)
+                    row_style.fg(theme_muted())
                 } else {
                     row_style
                 };
@@ -3229,29 +3286,29 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
 
                     // Delta: green for positive (home gaining), red for negative
                     let delta_color = if delta_val > 1.0 {
-                        Color::LightGreen
+                        theme_success()
                     } else if delta_val < -1.0 {
-                        Color::LightRed
+                        theme_danger()
                     } else {
-                        THEME_MUTED
+                        theme_muted()
                     };
                     render_cell_text(frame, cols[5], &delta, row_style.fg(delta_color));
 
                     // Quality badge: colored by model tier
                     let quality_color = match m.win.quality {
-                        state::ModelQuality::Track => Color::LightGreen,
-                        state::ModelQuality::Event => Color::Yellow,
-                        state::ModelQuality::Basic => THEME_MUTED,
+                        state::ModelQuality::Track => theme_success(),
+                        state::ModelQuality::Event => theme_warn(),
+                        state::ModelQuality::Basic => theme_muted(),
                     };
                     render_cell_text(frame, cols[6], &quality, row_style.fg(quality_color));
 
                     // Confidence: dim when low
                     let conf_color = if m.win.confidence >= 70 {
-                        Color::LightGreen
+                        theme_success()
                     } else if m.win.confidence >= 40 {
-                        Color::Yellow
+                        theme_warn()
                     } else {
-                        THEME_MUTED
+                        theme_muted()
                     };
                     render_cell_text(frame, cols[7], &conf, row_style.fg(conf_color));
                 }
@@ -3261,11 +3318,23 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
                     continue;
                 };
 
-                let row_style = base_style.fg(THEME_MUTED);
+                let row_style = if selected {
+                    base_style.add_modifier(Modifier::BOLD)
+                } else {
+                    base_style.fg(theme_muted())
+                };
                 frame.render_widget(Block::default().style(row_style), row_area);
 
                 let time = format_countdown_short(&u.kickoff, now);
-                let time = format!("{}{}", if selected { "▸" } else { " " }, time);
+                let time = format!(
+                    "{}{}",
+                    if selected {
+                        ui_theme().glyphs.row_selected
+                    } else {
+                        " "
+                    },
+                    time
+                );
                 let match_name = format!("{} vs {}", u.home, u.away);
 
                 render_cell_text(frame, cols[0], &time, row_style);
@@ -3281,12 +3350,12 @@ fn render_pulse_live(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     if sidebar_area.width > 0 && sidebar_area.height > 0 {
-        render_pulse_live_sidebar(frame, sidebar_area, state);
+        render_pulse_live_sidebar(frame, sidebar_area, state, anim);
     }
 }
 
-fn render_pulse_live_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = terminal_block("Selected", true);
+fn render_pulse_live_sidebar(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
+    let block = terminal_block("Selected", true, anim);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -3298,7 +3367,7 @@ fn render_pulse_live_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
         .constraints([Constraint::Min(6), Constraint::Length(6)])
         .split(inner);
 
-    let base = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+    let base = Style::default().fg(theme_text()).bg(theme_panel_bg());
 
     let mut lines: Vec<String> = Vec::new();
     let selected_id = state.selected_match_id();
@@ -3314,6 +3383,7 @@ fn render_pulse_live_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
         lines.push(format!("Score: {}-{}", m.score_home, m.score_away));
         lines.push(format!("Time: {time}"));
         lines.push(String::new());
+        lines.push(format!("Live: {}", ui_live_dot(anim)));
         lines.push(format!(
             "Win: H{:.0} D{:.0} A{:.0}",
             m.win.p_home, m.win.p_draw, m.win.p_away
@@ -3328,7 +3398,7 @@ fn render_pulse_live_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
         lines.push("Enter: Terminal   i: Details".to_string());
 
         let values = win_prob_values(state.win_prob_history.get(&m.id), m.win.p_home);
-        let chart_style = Style::default().fg(Color::LightGreen).bg(THEME_PANEL_BG);
+        let chart_style = Style::default().fg(theme_success()).bg(theme_panel_bg());
         let chart = Sparkline::default()
             .data(&values)
             .max(100)
@@ -3378,26 +3448,26 @@ fn render_pulse_live_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(hint, chunks[0]);
 }
 
-fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
     let widths = upcoming_columns();
-    render_upcoming_header(frame, sections[0], &widths);
+    render_upcoming_header(frame, sections[0], &widths, anim);
 
     let list_area = sections[1];
     let upcoming = state.filtered_upcoming();
     if upcoming.is_empty() {
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(
             "No upcoming matches for this league",
             on_black(empty_style),
         ))
-        .style(Style::default().bg(THEME_BG));
+        .style(Style::default().bg(theme_bg()));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -3421,11 +3491,11 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
             height: 1,
         };
         let row_bg = if idx % 2 == 0 {
-            THEME_PANEL_BG
+            theme_panel_bg()
         } else {
-            THEME_BG
+            theme_bg()
         };
-        let row_style = Style::default().fg(THEME_TEXT).bg(row_bg);
+        let row_style = Style::default().fg(theme_text()).bg(row_bg);
         frame.render_widget(Block::default().style(row_style), row_area);
 
         let cols = Layout::default()
@@ -3447,14 +3517,14 @@ fn render_pulse_upcoming(frame: &mut Frame, area: Rect, state: &AppState) {
             m.round.clone()
         };
 
-        let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(row_bg);
-        render_cell_text(frame, cols[0], &kickoff, row_style.fg(THEME_MUTED));
+        let sep_style = Style::default().fg(theme_border_dim()).bg(row_bg);
+        render_cell_text(frame, cols[0], &kickoff, row_style.fg(theme_muted()));
         render_vseparator(frame, cols[1], sep_style);
         render_cell_text(frame, cols[2], &match_name, row_style);
         render_vseparator(frame, cols[3], sep_style);
-        render_cell_text(frame, cols[4], &league, row_style.fg(THEME_MUTED));
+        render_cell_text(frame, cols[4], &league, row_style.fg(theme_muted()));
         render_vseparator(frame, cols[5], sep_style);
-        render_cell_text(frame, cols[6], &round, row_style.fg(THEME_MUTED));
+        render_cell_text(frame, cols[6], &round, row_style.fg(theme_muted()));
     }
 }
 
@@ -3517,17 +3587,22 @@ fn squad_columns() -> [Constraint; 13] {
     ]
 }
 
-fn render_pulse_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
+fn render_pulse_header(frame: &mut Frame, area: Rect, widths: &[Constraint], anim: UiAnim) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(THEME_ACCENT)
-        .bg(THEME_CHROME_BG)
+        .fg(theme_accent())
+        .bg(theme_chrome_bg())
         .add_modifier(Modifier::BOLD);
 
-    render_cell_text(frame, cols[0], "Time", style);
+    render_cell_text(
+        frame,
+        cols[0],
+        &format!("{} Time", ui_live_dot(anim)),
+        style,
+    );
     render_cell_text(frame, cols[1], "Match", style);
     render_cell_text(frame, cols[2], "Score", style);
     render_cell_text(frame, cols[3], "Win% Line", style);
@@ -3537,18 +3612,23 @@ fn render_pulse_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
     render_cell_text(frame, cols[7], "Conf", style);
 }
 
-fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
+fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint], anim: UiAnim) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(THEME_ACCENT)
-        .bg(THEME_CHROME_BG)
+        .fg(theme_accent())
+        .bg(theme_chrome_bg())
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(THEME_CHROME_BG);
+    let sep_style = Style::default().fg(theme_border_dim()).bg(theme_chrome_bg());
 
-    render_cell_text(frame, cols[0], "Starts In", style);
+    render_cell_text(
+        frame,
+        cols[0],
+        &format!("{} Starts In", ui_spinner(anim)),
+        style,
+    );
     render_vseparator(frame, cols[1], sep_style);
     render_cell_text(frame, cols[2], "Match", style);
     render_vseparator(frame, cols[3], sep_style);
@@ -3557,14 +3637,14 @@ fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
     render_cell_text(frame, cols[6], "Round", style);
 }
 
-fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_analysis(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     match state.analysis_tab {
-        state::AnalysisTab::Teams => render_analysis_teams(frame, area, state),
-        state::AnalysisTab::RoleRankings => render_analysis_rankings(frame, area, state),
+        state::AnalysisTab::Teams => render_analysis_teams(frame, area, state, anim),
+        state::AnalysisTab::RoleRankings => render_analysis_rankings(frame, area, state, anim),
     }
 }
 
-fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let (main_area, sidebar_area) = if area.width >= 110 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -3581,20 +3661,20 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(main_area);
 
     let widths = analysis_columns();
-    render_analysis_header(frame, sections[0], &widths);
+    render_analysis_header(frame, sections[0], &widths, anim);
 
     let list_area = sections[1];
     if state.analysis.is_empty() {
         let message = if state.analysis_loading {
-            "Loading analysis..."
+            format!("{} Loading analysis...", ui_spinner(anim))
         } else {
-            "No analysis data yet"
+            "No analysis data yet".to_string()
         };
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(THEME_BG));
+            .style(Style::default().bg(theme_bg()));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -3616,14 +3696,8 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.analysis_selected;
-        let base_bg = if selected {
-            THEME_FOCUS_BG
-        } else if idx % 2 == 0 {
-            THEME_PANEL_BG
-        } else {
-            THEME_BG
-        };
-        let row_style = Style::default().fg(THEME_TEXT).bg(base_bg);
+        let base_bg = pulse_row_bg(selected, idx, anim);
+        let row_style = Style::default().fg(theme_text()).bg(base_bg);
         frame.render_widget(Block::default().style(row_style), row_area);
 
         let cols = Layout::default()
@@ -3647,14 +3721,14 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
         // Confederation colored by region
         let confed_color = confed_color_for(row.confed);
         let confed_style = row_style.fg(confed_color);
-        let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(base_bg);
+        let sep_style = Style::default().fg(theme_border_dim()).bg(base_bg);
         render_cell_text(frame, cols[0], confed, confed_style);
         render_vseparator(frame, cols[1], sep_style);
         render_cell_text(frame, cols[2], &row.name, row_style);
         render_vseparator(frame, cols[3], sep_style);
         // Rank: highlight top 10
         let rank_style = if row.fifa_rank.map(|r| r <= 10).unwrap_or(false) {
-            row_style.fg(THEME_ACCENT_2).add_modifier(Modifier::BOLD)
+            row_style.fg(theme_accent_2()).add_modifier(Modifier::BOLD)
         } else {
             row_style
         };
@@ -3662,31 +3736,31 @@ fn render_analysis_teams(frame: &mut Frame, area: Rect, state: &AppState) {
         render_vseparator(frame, cols[5], sep_style);
         render_cell_text(frame, cols[6], &points, row_style);
         render_vseparator(frame, cols[7], sep_style);
-        render_cell_text(frame, cols[8], &updated, row_style.fg(THEME_MUTED));
+        render_cell_text(frame, cols[8], &updated, row_style.fg(theme_muted()));
         render_vseparator(frame, cols[9], sep_style);
         // Host badge: green
         let host_style = if row.host {
-            row_style.fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+            row_style.fg(theme_success()).add_modifier(Modifier::BOLD)
         } else {
-            row_style.fg(THEME_MUTED)
+            row_style.fg(theme_muted())
         };
         render_cell_text(frame, cols[10], host, host_style);
     }
 
     if sidebar_area.width > 0 && sidebar_area.height > 0 {
-        render_analysis_team_sidebar(frame, sidebar_area, state);
+        render_analysis_team_sidebar(frame, sidebar_area, state, anim);
     }
 }
 
-fn render_analysis_team_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = terminal_block("Team", true);
+fn render_analysis_team_sidebar(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
+    let block = terminal_block("Team", true, anim);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    let base = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+    let base = Style::default().fg(theme_text()).bg(theme_panel_bg());
     let mut lines: Vec<String> = Vec::new();
 
     let Some(team) = state.selected_analysis() else {
@@ -3727,7 +3801,7 @@ fn render_analysis_team_sidebar(frame: &mut Frame, area: Rect, state: &AppState)
     frame.render_widget(p, inner);
 }
 
-fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let detail_h: u16 = 7;
     let show_detail = area.height >= 2 + 1 + detail_h + 1;
     let sections = if show_detail {
@@ -3753,38 +3827,39 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let role = role_label(state.rankings_role);
     let metric = metric_label(state.rankings_metric);
-    let sep = Span::styled(" | ", Style::default().fg(THEME_BORDER_DIM));
+    let sep = Span::styled(ui_theme().glyphs.divider, Style::default().fg(theme_border_dim()));
     let mut header_spans = vec![
         Span::styled(
             "Role Rankings",
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
-        Span::styled("Role: ", Style::default().fg(THEME_MUTED)),
+        Span::styled("Role: ", Style::default().fg(theme_muted())),
         Span::styled(
             role.to_string(),
             Style::default()
-                .fg(THEME_ACCENT_2)
+                .fg(theme_accent_2())
                 .add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
-        Span::styled("Metric: ", Style::default().fg(THEME_MUTED)),
+        Span::styled("Metric: ", Style::default().fg(theme_muted())),
         Span::styled(
             metric.to_string(),
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         ),
     ];
     if state.rankings_loading {
         header_spans.push(sep.clone());
-        let progress_color = THEME_ACCENT_2;
+        let progress_color = theme_accent_2();
         if state.rankings_progress_total > 0 {
             header_spans.push(Span::styled(
                 format!(
-                    "{} ({}/{})",
+                    "{} {} ({}/{})",
+                    ui_spinner(anim),
                     state.rankings_progress_message,
                     state.rankings_progress_current,
                     state.rankings_progress_total
@@ -3795,7 +3870,7 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             ));
         } else {
             header_spans.push(Span::styled(
-                state.rankings_progress_message.clone(),
+                format!("{} {}", ui_spinner(anim), state.rankings_progress_message),
                 Style::default()
                     .fg(progress_color)
                     .add_modifier(Modifier::BOLD),
@@ -3803,11 +3878,11 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         }
     }
     frame.render_widget(
-        Block::default().style(Style::default().bg(THEME_CHROME_BG)),
+        Block::default().style(Style::default().bg(theme_chrome_bg())),
         sections[0],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(header_spans)).style(Style::default().bg(THEME_CHROME_BG)),
+        Paragraph::new(Line::from(header_spans)).style(Style::default().bg(theme_chrome_bg())),
         sections[0],
     );
 
@@ -3816,32 +3891,32 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 "Search [/]: ",
                 Style::default()
-                    .fg(THEME_ACCENT)
+                    .fg(theme_accent())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 state.rankings_search.clone(),
-                Style::default().fg(THEME_ACCENT_2),
+                Style::default().fg(theme_accent_2()),
             ),
-            Span::styled("▌", Style::default().fg(THEME_ACCENT_2)),
+            Span::styled(ui_theme().glyphs.caret, Style::default().fg(theme_accent_2())),
         ])
     } else if state.rankings_search.is_empty() {
-        Line::from(Span::styled("Search [/]", Style::default().fg(THEME_MUTED)))
+        Line::from(Span::styled("Search [/]", Style::default().fg(theme_muted())))
     } else {
         Line::from(vec![
-            Span::styled("Search [/]: ", Style::default().fg(THEME_MUTED)),
+            Span::styled("Search [/]: ", Style::default().fg(theme_muted())),
             Span::styled(
                 state.rankings_search.clone(),
-                Style::default().fg(THEME_TEXT),
+                Style::default().fg(theme_text()),
             ),
         ])
     };
     frame.render_widget(
-        Block::default().style(Style::default().bg(THEME_CHROME_BG)),
+        Block::default().style(Style::default().bg(theme_chrome_bg())),
         sections[1],
     );
     frame.render_widget(
-        Paragraph::new(search_line).style(Style::default().bg(THEME_CHROME_BG)),
+        Paragraph::new(search_line).style(Style::default().bg(theme_chrome_bg())),
         sections[1],
     );
 
@@ -3852,15 +3927,15 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
 
     if state.rankings.is_empty() {
         let message = if state.rankings_loading {
-            "Loading role rankings..."
+            format!("{} Loading role rankings...", ui_spinner(anim))
         } else {
-            "No role ranking data yet (press r to warm cache)"
+            "No role ranking data yet (press r to warm cache)".to_string()
         };
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(THEME_BG));
+            .style(Style::default().bg(theme_bg()));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -3885,10 +3960,10 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             "No players match the current search"
         };
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(THEME_BG));
+            .style(Style::default().bg(theme_bg()));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -3903,14 +3978,8 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.rankings_selected;
-        let base_bg = if selected {
-            THEME_FOCUS_BG
-        } else if idx % 2 == 0 {
-            THEME_PANEL_BG
-        } else {
-            THEME_BG
-        };
-        let row_style = Style::default().fg(THEME_TEXT).bg(base_bg);
+        let base_bg = pulse_row_bg(selected, idx, anim);
+        let row_style = Style::default().fg(theme_text()).bg(base_bg);
         frame.render_widget(Block::default().style(row_style), row_area);
 
         let entry = rows[idx];
@@ -3965,30 +4034,30 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled("Selected: ", Style::default().fg(THEME_MUTED)),
+            Span::styled("Selected: ", Style::default().fg(theme_muted())),
             Span::styled(
                 truncate(&selected.player_name, 28),
-                Style::default().fg(THEME_TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme_text()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" ({})", truncate(&selected.team_name, 22)),
-                Style::default().fg(THEME_MUTED),
+                Style::default().fg(theme_muted()),
             ),
-            Span::styled("  Score ", Style::default().fg(THEME_MUTED)),
+            Span::styled("  Score ", Style::default().fg(theme_muted())),
             Span::styled(
                 score_text,
                 Style::default()
-                    .fg(THEME_ACCENT_2)
+                    .fg(theme_accent_2())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  R ", Style::default().fg(THEME_MUTED)),
-            Span::styled(rating_text, Style::default().fg(Color::LightMagenta)),
+            Span::styled("  R ", Style::default().fg(theme_muted())),
+            Span::styled(rating_text, Style::default().fg(theme_accent())),
         ]));
 
         lines.push(Line::from(Span::styled(
             "Top contributors",
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         )));
 
@@ -3996,7 +4065,7 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             lines.push(Line::from(Span::styled(
                 "No breakdown available (warm cache / insufficient stat coverage)",
                 Style::default()
-                    .fg(THEME_MUTED)
+                    .fg(theme_muted())
                     .add_modifier(Modifier::ITALIC),
             )));
         } else {
@@ -4006,9 +4075,9 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
             {
                 let impact = f.weight * f.z;
                 let impact_style = if impact >= 0.0 {
-                    Style::default().fg(Color::LightGreen)
+                    Style::default().fg(theme_success())
                 } else {
-                    Style::default().fg(Color::LightRed)
+                    Style::default().fg(theme_danger())
                 };
                 let mut tail = String::new();
                 if let Some(pct) = f.pct {
@@ -4019,14 +4088,14 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState) {
                 tail.push_str(&format!(" ({}, w={:.2}, z={:.2})", f.source, f.weight, f.z));
                 lines.push(Line::from(vec![
                     Span::styled(format!("{impact:+.2} "), impact_style),
-                    Span::styled(truncate(&f.label, 20), Style::default().fg(THEME_TEXT)),
-                    Span::styled(tail, Style::default().fg(THEME_MUTED)),
+                    Span::styled(truncate(&f.label, 20), Style::default().fg(theme_text())),
+                    Span::styled(tail, Style::default().fg(theme_muted())),
                 ]));
             }
         }
 
         let detail = Paragraph::new(lines)
-            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
+            .style(Style::default().fg(theme_text()).bg(theme_panel_bg()))
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, detail_area);
     }
@@ -4039,18 +4108,23 @@ fn truncate(raw: &str, max: usize) -> String {
     raw.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
 }
 
-fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
+fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint], anim: UiAnim) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(THEME_ACCENT)
-        .bg(THEME_CHROME_BG)
+        .fg(theme_accent())
+        .bg(theme_chrome_bg())
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(THEME_CHROME_BG);
+    let sep_style = Style::default().fg(theme_border_dim()).bg(theme_chrome_bg());
 
-    render_cell_text(frame, cols[0], "Confed", style);
+    render_cell_text(
+        frame,
+        cols[0],
+        &format!("{} Confed", ui_spinner(anim)),
+        style,
+    );
     render_vseparator(frame, cols[1], sep_style);
     render_cell_text(frame, cols[2], "Team", style);
     render_vseparator(frame, cols[3], sep_style);
@@ -4063,7 +4137,7 @@ fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) 
     render_cell_text(frame, cols[10], "Host", style);
 }
 
-fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_squad(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let (main_area, sidebar_area) = if area.width >= 110 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -4080,20 +4154,20 @@ fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(main_area);
 
     let widths = squad_columns();
-    render_squad_header(frame, sections[0], &widths);
+    render_squad_header(frame, sections[0], &widths, anim);
 
     let list_area = sections[1];
     if state.squad.is_empty() {
         let message = if state.squad_loading {
-            "Loading squad..."
+            format!("{} Loading squad...", ui_spinner(anim))
         } else {
-            "No squad data yet"
+            "No squad data yet".to_string()
         };
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let empty = Paragraph::new(Text::styled(message, on_black(empty_style)))
-            .style(Style::default().bg(THEME_BG));
+            .style(Style::default().bg(theme_bg()));
         frame.render_widget(empty, list_area);
         return;
     }
@@ -4115,14 +4189,8 @@ fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let selected = idx == state.squad_selected;
-        let base_bg = if selected {
-            THEME_FOCUS_BG
-        } else if idx % 2 == 0 {
-            THEME_PANEL_BG
-        } else {
-            THEME_BG
-        };
-        let row_style = Style::default().fg(THEME_TEXT).bg(base_bg);
+        let base_bg = pulse_row_bg(selected, idx, anim);
+        let row_style = Style::default().fg(theme_text()).bg(base_bg);
         frame.render_widget(Block::default().style(row_style), row_area);
 
         let cols = Layout::default()
@@ -4148,36 +4216,36 @@ fn render_squad(frame: &mut Frame, area: Rect, state: &AppState) {
             .map(|v| format!("€{:.1}M", v as f64 / 1_000_000.0))
             .unwrap_or_else(|| "-".to_string());
 
-        let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(base_bg);
+        let sep_style = Style::default().fg(theme_border_dim()).bg(base_bg);
         render_cell_text(frame, cols[0], &player.name, row_style);
         render_vseparator(frame, cols[1], sep_style);
         render_cell_text(frame, cols[2], &number, row_style);
         render_vseparator(frame, cols[3], sep_style);
-        render_cell_text(frame, cols[4], &player.role, row_style.fg(THEME_MUTED));
+        render_cell_text(frame, cols[4], &player.role, row_style.fg(theme_muted()));
         render_vseparator(frame, cols[5], sep_style);
         render_cell_text(frame, cols[6], &player.club, row_style);
         render_vseparator(frame, cols[7], sep_style);
-        render_cell_text(frame, cols[8], &age, row_style.fg(THEME_MUTED));
+        render_cell_text(frame, cols[8], &age, row_style.fg(theme_muted()));
         render_vseparator(frame, cols[9], sep_style);
-        render_cell_text(frame, cols[10], &height, row_style.fg(THEME_MUTED));
+        render_cell_text(frame, cols[10], &height, row_style.fg(theme_muted()));
         render_vseparator(frame, cols[11], sep_style);
-        render_cell_text(frame, cols[12], &value, row_style.fg(THEME_ACCENT_2));
+        render_cell_text(frame, cols[12], &value, row_style.fg(theme_accent_2()));
     }
 
     if sidebar_area.width > 0 && sidebar_area.height > 0 {
-        render_squad_sidebar(frame, sidebar_area, state);
+        render_squad_sidebar(frame, sidebar_area, state, anim);
     }
 }
 
-fn render_squad_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = terminal_block("Player", true);
+fn render_squad_sidebar(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
+    let block = terminal_block("Player", true, anim);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    let base = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+    let base = Style::default().fg(theme_text()).bg(theme_panel_bg());
     let mut lines: Vec<String> = Vec::new();
 
     let Some(p) = state.selected_squad_player() else {
@@ -4239,18 +4307,23 @@ fn render_squad_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(para, inner);
 }
 
-fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
+fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint], anim: UiAnim) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(widths)
         .split(area);
     let style = Style::default()
-        .fg(THEME_ACCENT)
-        .bg(THEME_CHROME_BG)
+        .fg(theme_accent())
+        .bg(theme_chrome_bg())
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(THEME_BORDER_DIM).bg(THEME_CHROME_BG);
+    let sep_style = Style::default().fg(theme_border_dim()).bg(theme_chrome_bg());
 
-    render_cell_text(frame, cols[0], "Player", style);
+    render_cell_text(
+        frame,
+        cols[0],
+        &format!("{} Player", ui_spinner(anim)),
+        style,
+    );
     render_vseparator(frame, cols[1], sep_style);
     render_cell_text(frame, cols[2], "No", style);
     render_vseparator(frame, cols[3], sep_style);
@@ -4265,19 +4338,23 @@ fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint]) {
     render_cell_text(frame, cols[12], "Value", style);
 }
 
-fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App, anim: UiAnim) {
     let state = &app.state;
     let block = Block::default()
         .title(Span::styled(
             " Player Detail ",
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME_BORDER))
-        .style(Style::default().bg(THEME_PANEL_BG))
+        .border_style(Style::default().fg(if anim.pulse_on {
+            theme_accent_2()
+        } else {
+            theme_border()
+        }))
+        .style(Style::default().bg(theme_panel_bg()))
         .padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -4288,20 +4365,23 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
 
     if state.player_loading {
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
-        let text = Paragraph::new(Text::styled("Loading player details...", empty_style))
-            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
+        let text = Paragraph::new(Text::styled(
+            format!("{} Loading player details...", ui_spinner(anim)),
+            empty_style,
+        ))
+            .style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
         frame.render_widget(text, inner);
         return;
     }
 
     let Some(detail) = state.player_detail.as_ref() else {
         let empty_style = Style::default()
-            .fg(THEME_MUTED)
+            .fg(theme_muted())
             .add_modifier(Modifier::ITALIC);
         let text = Paragraph::new(Text::styled("No player data yet", empty_style))
-            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
+            .style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
         frame.render_widget(text, inner);
         return;
     };
@@ -4309,7 +4389,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     if inner.height < 8 {
         let text = player_detail_text(detail);
         let paragraph = Paragraph::new(text)
-            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
+            .style(Style::default().fg(theme_text()).bg(theme_panel_bg()))
             .scroll((state.player_detail_scroll, 0));
         frame.render_widget(paragraph, inner);
         return;
@@ -5224,7 +5304,7 @@ fn player_league_stats_text_styled(
                 stat_rank_suffix(rank_index, &stat.title, parse_stat_value(&stat.value), None)
             {
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+                spans.push(Span::styled(rank.text, Style::default().fg(theme_muted())));
             }
             lines.push(Line::from(spans));
         }
@@ -5254,7 +5334,7 @@ fn player_league_stats_text_styled(
                 stat_rank_suffix(rank_index, &stat.title, parse_stat_value(&stat.value), None)
             {
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+                spans.push(Span::styled(rank.text, Style::default().fg(theme_muted())));
             }
             lines.push(Line::from(spans));
         }
@@ -5300,7 +5380,7 @@ fn player_top_stats_text_styled(
             stat_rank_suffix(rank_index, &stat.title, parse_stat_value(&stat.value), None)
         {
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+            spans.push(Span::styled(rank.text, Style::default().fg(theme_muted())));
         }
         lines.push(Line::from(spans));
     }
@@ -5409,7 +5489,7 @@ fn player_season_performance_text_styled(
                 item.per90.as_deref().and_then(parse_stat_value),
             ) {
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(rank.text, Style::default().fg(THEME_MUTED)));
+                spans.push(Span::styled(rank.text, Style::default().fg(theme_muted())));
             }
             lines.push(Line::from(spans));
         }
@@ -5568,21 +5648,21 @@ fn render_detail_section(
     let (border_style, title_style) = if active {
         (
             Style::default()
-                .fg(THEME_ACCENT_2)
+                .fg(theme_accent_2())
                 .add_modifier(Modifier::BOLD),
             Style::default()
-                .fg(THEME_ACCENT_2)
+                .fg(theme_accent_2())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         (
-            Style::default().fg(THEME_BORDER_DIM),
-            Style::default().fg(THEME_MUTED),
+            Style::default().fg(theme_border_dim()),
+            Style::default().fg(theme_muted()),
         )
     };
     let scroll_indicator = Span::styled(
         format!("  {current}/{total}"),
-        Style::default().fg(THEME_MUTED),
+        Style::default().fg(theme_muted()),
     );
     let block = Block::default()
         .title(Line::from(vec![
@@ -5596,7 +5676,7 @@ fn render_detail_section(
             BorderType::Rounded
         })
         .border_style(border_style)
-        .style(Style::default().bg(THEME_PANEL_BG))
+        .style(Style::default().bg(theme_panel_bg()))
         .padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -5604,7 +5684,7 @@ fn render_detail_section(
         return;
     }
     let paragraph = Paragraph::new(body)
-        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
+        .style(Style::default().fg(theme_text()).bg(theme_panel_bg()))
         .scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
 }
@@ -5654,17 +5734,228 @@ fn player_detail_section_max_scroll(detail: &PlayerDetail, section: usize) -> u1
     text_line_count(&lines).saturating_sub(1)
 }
 
-// Visual system: keep the app cohesive and screenshot-friendly across terminal themes.
-const THEME_BG: Color = Color::Rgb(6, 9, 14);
-const THEME_PANEL_BG: Color = Color::Rgb(10, 14, 22);
-const THEME_FOCUS_BG: Color = Color::Rgb(24, 31, 45);
-const THEME_CHROME_BG: Color = Color::Rgb(9, 12, 18);
-const THEME_BORDER: Color = Color::Rgb(46, 58, 78);
-const THEME_BORDER_DIM: Color = Color::Rgb(30, 38, 52);
-const THEME_TEXT: Color = Color::Rgb(228, 234, 244);
-const THEME_MUTED: Color = Color::Rgb(138, 148, 170);
-const THEME_ACCENT: Color = Color::Rgb(0, 214, 255);
-const THEME_ACCENT_2: Color = Color::Rgb(255, 196, 61);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiColorMode {
+    Truecolor,
+    Ansi16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiPalette {
+    bg: Color,
+    panel_bg: Color,
+    focus_bg: Color,
+    chrome_bg: Color,
+    border: Color,
+    border_dim: Color,
+    text: Color,
+    muted: Color,
+    accent: Color,
+    accent_2: Color,
+    success: Color,
+    warn: Color,
+    danger: Color,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiGlyphs {
+    row_selected: &'static str,
+    panel_focus: &'static str,
+    divider: &'static str,
+    vsep: char,
+    caret: &'static str,
+    live_on: &'static str,
+    live_off: &'static str,
+    spinner: [&'static str; 8],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiTheme {
+    mode: UiColorMode,
+    palette: UiPalette,
+    glyphs: UiGlyphs,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiAnim {
+    spinner_idx: usize,
+    pulse_on: bool,
+    blink_on: bool,
+}
+
+static UI_THEME: OnceLock<UiTheme> = OnceLock::new();
+
+fn ui_theme() -> &'static UiTheme {
+    UI_THEME.get_or_init(resolve_ui_theme)
+}
+
+fn resolve_ui_theme() -> UiTheme {
+    let color_mode = detect_ui_color_mode();
+    let unicode = !std::env::var("NO_UNICODE")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let palette = match color_mode {
+        UiColorMode::Truecolor => UiPalette {
+            bg: Color::Rgb(6, 9, 14),
+            panel_bg: Color::Rgb(10, 14, 22),
+            focus_bg: Color::Rgb(92, 60, 88),
+            chrome_bg: Color::Rgb(9, 12, 18),
+            border: Color::Rgb(46, 58, 78),
+            border_dim: Color::Rgb(30, 38, 52),
+            text: Color::Rgb(228, 234, 244),
+            muted: Color::Rgb(138, 148, 170),
+            accent: Color::Rgb(0, 214, 255),
+            accent_2: Color::Rgb(255, 196, 61),
+            success: Color::LightGreen,
+            warn: Color::Yellow,
+            danger: Color::LightRed,
+        },
+        UiColorMode::Ansi16 => UiPalette {
+            bg: Color::Black,
+            panel_bg: Color::Black,
+            focus_bg: Color::Magenta,
+            chrome_bg: Color::Black,
+            border: Color::Blue,
+            border_dim: Color::DarkGray,
+            text: Color::Gray,
+            muted: Color::DarkGray,
+            accent: Color::Cyan,
+            accent_2: Color::Yellow,
+            success: Color::Green,
+            warn: Color::Yellow,
+            danger: Color::Red,
+        },
+    };
+    let glyphs = if unicode {
+        UiGlyphs {
+            row_selected: "▸",
+            panel_focus: "◆ ",
+            divider: " │ ",
+            vsep: '│',
+            caret: "▌",
+            live_on: "●",
+            live_off: "○",
+            spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"],
+        }
+    } else {
+        UiGlyphs {
+            row_selected: ">",
+            panel_focus: "* ",
+            divider: " | ",
+            vsep: '|',
+            caret: "|",
+            live_on: "*",
+            live_off: ".",
+            spinner: ["-", "\\", "|", "/", "-", "\\", "|", "/"],
+        }
+    };
+
+    UiTheme {
+        mode: color_mode,
+        palette,
+        glyphs,
+    }
+}
+
+fn detect_ui_color_mode() -> UiColorMode {
+    let no_color = std::env::var("NO_COLOR")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if no_color {
+        return UiColorMode::Ansi16;
+    }
+    let colorterm = std::env::var("COLORTERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    detect_ui_color_mode_from_values(&term, &colorterm, no_color)
+}
+
+fn detect_ui_color_mode_from_values(term: &str, colorterm: &str, no_color: bool) -> UiColorMode {
+    if no_color {
+        return UiColorMode::Ansi16;
+    }
+    if colorterm.contains("truecolor")
+        || colorterm.contains("24bit")
+        || term.contains("truecolor")
+        || term.contains("24bit")
+        || term.contains("direct")
+    {
+        UiColorMode::Truecolor
+    } else {
+        UiColorMode::Ansi16
+    }
+}
+
+fn ui_anim_from_frame(frame: u64) -> UiAnim {
+    UiAnim {
+        spinner_idx: (frame as usize) % 8,
+        pulse_on: frame % 2 == 0,
+        blink_on: frame % 2 == 0,
+    }
+}
+
+fn theme_bg() -> Color {
+    ui_theme().palette.bg
+}
+fn theme_panel_bg() -> Color {
+    ui_theme().palette.panel_bg
+}
+fn theme_focus_bg() -> Color {
+    ui_theme().palette.focus_bg
+}
+fn theme_chrome_bg() -> Color {
+    ui_theme().palette.chrome_bg
+}
+fn theme_border() -> Color {
+    ui_theme().palette.border
+}
+fn theme_border_dim() -> Color {
+    ui_theme().palette.border_dim
+}
+fn theme_text() -> Color {
+    ui_theme().palette.text
+}
+fn theme_muted() -> Color {
+    ui_theme().palette.muted
+}
+fn theme_accent() -> Color {
+    ui_theme().palette.accent
+}
+fn theme_accent_2() -> Color {
+    ui_theme().palette.accent_2
+}
+fn theme_success() -> Color {
+    ui_theme().palette.success
+}
+fn theme_warn() -> Color {
+    ui_theme().palette.warn
+}
+fn theme_danger() -> Color {
+    ui_theme().palette.danger
+}
+
+fn ui_spinner(anim: UiAnim) -> &'static str {
+    ui_theme().glyphs.spinner[anim.spinner_idx]
+}
+
+fn ui_live_dot(anim: UiAnim) -> &'static str {
+    if anim.blink_on {
+        ui_theme().glyphs.live_on
+    } else {
+        ui_theme().glyphs.live_off
+    }
+}
+
+fn pulse_row_bg(selected: bool, idx: usize, _anim: UiAnim) -> Color {
+    if selected {
+        theme_focus_bg()
+    } else if idx.is_multiple_of(2) {
+        theme_panel_bg()
+    } else {
+        theme_bg()
+    }
+}
 
 fn on_black(mut style: Style) -> Style {
     // Ratatui widgets often overwrite the entire cell style.
@@ -5672,7 +5963,7 @@ fn on_black(mut style: Style) -> Style {
     // which can show up as white in light-themed terminals (especially on loading/empty screens).
     // Force a consistent background unless a caller explicitly chose another bg.
     match style.bg {
-        None | Some(Color::Reset) => style.bg = Some(THEME_BG),
+        None | Some(Color::Reset) => style.bg = Some(theme_bg()),
         _ => {}
     }
     style
@@ -5703,7 +5994,7 @@ fn render_vseparator(frame: &mut Frame, area: Rect, style: Style) {
         if i > 0 {
             text.push('\n');
         }
-        text.push('│');
+        text.push(ui_theme().glyphs.vsep);
     }
     let paragraph = Paragraph::new(text).style(on_black(style));
     frame.render_widget(paragraph, area);
@@ -5724,7 +6015,7 @@ fn win_prob_values(history: Option<&Vec<f32>>, fallback: f32) -> Vec<u64> {
 }
 
 fn win_line_chart(values: &[u64], row_style: Style, selected: bool) -> Sparkline<'_> {
-    let mut style = row_style.fg(Color::LightGreen);
+    let mut style = row_style.fg(theme_success());
     if selected {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -5746,13 +6037,25 @@ fn visible_range(selected: usize, total: usize, visible: usize) -> (usize, usize
     (start, start + visible)
 }
 
-fn terminal_block(title: &str, focused: bool) -> Block<'_> {
+fn terminal_block(title: &str, focused: bool, anim: UiAnim) -> Block<'_> {
     let (border_color, title_color, border_type) = if focused {
-        (THEME_ACCENT_2, THEME_ACCENT_2, BorderType::Double)
+        (
+            if anim.pulse_on {
+                theme_accent_2()
+            } else {
+                theme_accent()
+            },
+            theme_accent_2(),
+            BorderType::Double,
+        )
     } else {
-        (THEME_BORDER, THEME_MUTED, BorderType::Rounded)
+        (theme_border(), theme_muted(), BorderType::Rounded)
     };
-    let marker = if focused { "◆ " } else { "  " };
+    let marker = if focused {
+        ui_theme().glyphs.panel_focus
+    } else {
+        "  "
+    };
     Block::default()
         .title(Span::styled(
             format!("{marker}{title}"),
@@ -5765,11 +6068,11 @@ fn terminal_block(title: &str, focused: bool) -> Block<'_> {
         .borders(Borders::ALL)
         .border_type(border_type)
         .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(THEME_PANEL_BG))
+        .style(Style::default().bg(theme_panel_bg()))
         .padding(Padding::new(1, 1, 0, 0))
 }
 
-fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)])
@@ -5803,7 +6106,7 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(columns[2]);
 
-    let base_panel = Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG);
+    let base_panel = Style::default().fg(theme_text()).bg(theme_panel_bg());
 
     let match_list = match_list_text(state);
     let left_match = Paragraph::new(match_list)
@@ -5811,15 +6114,16 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         .block(terminal_block(
             "Match List",
             state.terminal_focus == TerminalFocus::MatchList,
+            anim,
         ));
     frame.render_widget(left_match, left_chunks[0]);
 
     let standings = Paragraph::new("Standings placeholder")
-        .style(base_panel.fg(THEME_MUTED))
-        .block(terminal_block("Group Mini", false));
+        .style(base_panel.fg(theme_muted()))
+        .block(terminal_block("Group Mini", false, anim));
     frame.render_widget(standings, left_chunks[1]);
 
-    render_pitch(frame, middle_chunks[0], state);
+    render_pitch(frame, middle_chunks[0], state, anim);
 
     let (tape_title, tape_text, tape_focus) = match state.terminal_focus {
         TerminalFocus::Commentary => ("Commentary", commentary_tape_text(state), true),
@@ -5829,7 +6133,7 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
             state.terminal_focus == TerminalFocus::EventTape,
         ),
     };
-    let tape = Paragraph::new(tape_text).block(terminal_block(tape_title, tape_focus));
+    let tape = Paragraph::new(tape_text).block(terminal_block(tape_title, tape_focus, anim));
     let tape = tape.style(base_panel);
     frame.render_widget(tape, middle_chunks[1]);
 
@@ -5839,10 +6143,11 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         .block(terminal_block(
             "Stats",
             state.terminal_focus == TerminalFocus::Stats,
+            anim,
         ));
     frame.render_widget(stats, right_chunks[0]);
 
-    render_lineups(frame, right_chunks[1], state);
+    render_lineups(frame, right_chunks[1], state, anim);
 
     let preds_text = prediction_text(state);
     let preds = Paragraph::new(preds_text)
@@ -5850,6 +6155,7 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         .block(terminal_block(
             "Prediction",
             state.terminal_focus == TerminalFocus::Prediction,
+            anim,
         ));
     frame.render_widget(preds, right_chunks[2]);
 
@@ -5858,6 +6164,7 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState) {
         .block(terminal_block(
             "Console",
             state.terminal_focus == TerminalFocus::Console,
+            anim,
         ));
     frame.render_widget(console, rows[1]);
 }
@@ -5877,7 +6184,7 @@ fn match_list_text(state: &AppState) -> String {
     let mut lines = Vec::new();
     for m in filtered.iter() {
         let prefix = if active_id == Some(m.id.as_str()) {
-            "▸"
+            ui_theme().glyphs.row_selected
         } else {
             " "
         };
@@ -6018,8 +6325,12 @@ fn grouped_stats_lines(detail: &state::MatchDetail) -> Vec<String> {
     out
 }
 
-fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = terminal_block("Lineups", state.terminal_focus == TerminalFocus::Lineups);
+fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
+    let block = terminal_block(
+        "Lineups",
+        state.terminal_focus == TerminalFocus::Lineups,
+        anim,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -6029,21 +6340,21 @@ fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let Some(match_id) = state.selected_match_id() else {
         let empty = Paragraph::new("No match selected")
-            .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
+            .style(Style::default().fg(theme_muted()).bg(theme_panel_bg()));
         frame.render_widget(empty, inner);
         return;
     };
 
     let Some(detail) = state.match_detail.get(&match_id) else {
         let empty = Paragraph::new("No lineups yet")
-            .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
+            .style(Style::default().fg(theme_muted()).bg(theme_panel_bg()));
         frame.render_widget(empty, inner);
         return;
     };
 
     let Some(lineups) = &detail.lineups else {
         let empty = Paragraph::new("No lineups yet")
-            .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
+            .style(Style::default().fg(theme_muted()).bg(theme_panel_bg()));
         frame.render_widget(empty, inner);
         return;
     };
@@ -6062,8 +6373,8 @@ fn render_lineups(frame: &mut Frame, area: Rect, state: &AppState) {
     render_lineup_side(frame, cols[1], right);
 }
 
-fn render_pitch(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = terminal_block("Pitch", state.terminal_focus == TerminalFocus::Pitch);
+fn render_pitch(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
+    let block = terminal_block("Pitch", state.terminal_focus == TerminalFocus::Pitch, anim);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -6073,7 +6384,7 @@ fn render_pitch(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let text = pitch_text(state, inner.width as usize, inner.height as usize);
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG)),
+        Paragraph::new(text).style(Style::default().fg(theme_text()).bg(theme_panel_bg())),
         inner,
     );
 }
@@ -6178,7 +6489,7 @@ fn render_lineup_side(frame: &mut Frame, area: Rect, side: Option<&state::Lineup
     } else {
         "No lineup".to_string()
     };
-    let paragraph = Paragraph::new(text).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
+    let paragraph = Paragraph::new(text).style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
     frame.render_widget(paragraph, area);
 }
 
@@ -6802,14 +7113,21 @@ fn parse_kickoff(raw: &str) -> Option<NaiveDateTime> {
     None
 }
 
-fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let popup_area = centered_rect(70, 22, area);
     frame.render_widget(Clear, popup_area);
 
     let (title, title_color) = if state.export.done {
-        ("Export complete", Color::LightGreen)
+        ("Export complete", theme_success())
     } else {
-        ("Exporting...", THEME_ACCENT_2)
+        (
+            if anim.pulse_on {
+                "Exporting..."
+            } else {
+                "Exporting"
+            },
+            theme_accent_2(),
+        )
     };
 
     let block = Block::default()
@@ -6821,8 +7139,8 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(THEME_BORDER))
-        .style(Style::default().bg(THEME_PANEL_BG))
+        .border_style(Style::default().fg(theme_border()))
+        .style(Style::default().bg(theme_panel_bg()))
         .padding(Padding::new(1, 1, 0, 0));
     frame.render_widget(block.clone(), popup_area);
 
@@ -6853,7 +7171,7 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG)),
+        Paragraph::new(status).style(Style::default().fg(theme_text()).bg(theme_panel_bg())),
         chunks[0],
     );
 
@@ -6865,14 +7183,14 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let gauge = Gauge::default()
         .ratio(ratio)
-        .label(format!("{:.0}%", ratio * 100.0))
-        .gauge_style(Style::default().fg(Color::LightGreen).bg(THEME_PANEL_BG))
+        .label(format!("{} {:.0}%", ui_spinner(anim), ratio * 100.0))
+        .gauge_style(Style::default().fg(theme_success()).bg(theme_panel_bg()))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(THEME_BORDER_DIM))
-                .style(Style::default().bg(THEME_PANEL_BG)),
+                .border_style(Style::default().fg(theme_border_dim()))
+                .style(Style::default().bg(theme_panel_bg())),
         );
 
     frame.render_widget(gauge, chunks[1]);
@@ -6880,16 +7198,21 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let footer = if state.export.done {
         "Press any key to close"
     } else {
-        "Please wait"
+        "Please wait..."
     };
 
     frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG)),
+        Paragraph::new(footer).style(Style::default().fg(theme_muted()).bg(theme_panel_bg())),
         chunks[2],
     );
 }
 
-fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_terminal_detail_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    anim: UiAnim,
+) {
     let Some(focus) = state.terminal_detail else {
         return;
     };
@@ -6910,15 +7233,15 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
 
     let block = Block::default()
         .title(Span::styled(
-            format!(" {title} "),
+            format!(" {} {title} ", ui_spinner(anim)),
             Style::default()
-                .fg(THEME_ACCENT)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(THEME_BORDER))
-        .style(Style::default().bg(THEME_PANEL_BG))
+        .border_style(Style::default().fg(theme_border()))
+        .style(Style::default().bg(theme_panel_bg()))
         .padding(Padding::new(1, 1, 0, 0));
     frame.render_widget(block.clone(), popup_area);
 
@@ -6945,14 +7268,14 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
     let (content, line_count) = if matches!(focus, TerminalFocus::Pitch) {
         let count = text.lines().count().max(1);
         (
-            Paragraph::new(text).style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG)),
+            Paragraph::new(text).style(Style::default().fg(theme_text()).bg(theme_panel_bg())),
             count,
         )
     } else {
         let count = wrapped_line_count(&text, chunks[0].width);
         (
             Paragraph::new(text)
-                .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG))
+                .style(Style::default().fg(theme_text()).bg(theme_panel_bg()))
                 .wrap(Wrap { trim: false }),
             count.max(1),
         )
@@ -6965,7 +7288,7 @@ fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppStat
     frame.render_widget(content, chunks[0]);
 
     let footer = Paragraph::new("Arrows scroll | Enter/Esc/b close")
-        .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_BG));
+        .style(Style::default().fg(theme_muted()).bg(theme_panel_bg()));
     frame.render_widget(footer, chunks[1]);
 }
 
@@ -6980,18 +7303,18 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
         .sum()
 }
 
-fn render_help_overlay(frame: &mut Frame, area: Rect) {
+fn render_help_overlay(frame: &mut Frame, area: Rect, anim: UiAnim) {
     let popup_area = centered_rect(60, 60, area);
     frame.render_widget(Clear, popup_area);
 
     let section_style = Style::default()
-        .fg(THEME_ACCENT_2)
+        .fg(theme_accent_2())
         .add_modifier(Modifier::BOLD);
     let key_style = Style::default()
-        .fg(THEME_ACCENT)
+        .fg(theme_accent())
         .add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(THEME_TEXT);
-    let dim = Style::default().fg(THEME_MUTED);
+    let desc_style = Style::default().fg(theme_text());
+    let dim = Style::default().fg(theme_muted());
 
     let help_bindings: &[(&str, &[(&str, &str)])] = &[
         (
@@ -7043,9 +7366,9 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "WC26 Terminal — Help",
+        format!("WC26 Terminal {} Help", ui_spinner(anim)),
         Style::default()
-            .fg(THEME_ACCENT)
+            .fg(theme_accent())
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
@@ -7073,16 +7396,16 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
                 .title(Span::styled(
                     " Help ",
                     Style::default()
-                        .fg(THEME_ACCENT)
+                        .fg(theme_accent())
                         .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Double)
-                .border_style(Style::default().fg(THEME_BORDER))
-                .style(Style::default().bg(THEME_PANEL_BG))
+                .border_style(Style::default().fg(theme_border()))
+                .style(Style::default().bg(theme_panel_bg()))
                 .padding(Padding::new(1, 1, 0, 0)),
         )
-        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_BG));
+        .style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
     frame.render_widget(help, popup_area);
 }
 
@@ -7106,4 +7429,27 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1]);
 
     horizontal[1]
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::{UiColorMode, detect_ui_color_mode_from_values};
+
+    #[test]
+    fn color_mode_truecolor_when_colorterm_has_truecolor() {
+        let mode = detect_ui_color_mode_from_values("xterm-256color", "truecolor", false);
+        assert_eq!(mode, UiColorMode::Truecolor);
+    }
+
+    #[test]
+    fn color_mode_ansi16_when_no_color_is_set() {
+        let mode = detect_ui_color_mode_from_values("xterm-256color", "truecolor", true);
+        assert_eq!(mode, UiColorMode::Ansi16);
+    }
+
+    #[test]
+    fn color_mode_ansi16_without_truecolor_hints() {
+        let mode = detect_ui_color_mode_from_values("xterm-256color", "", false);
+        assert_eq!(mode, UiColorMode::Ansi16);
+    }
 }

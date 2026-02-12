@@ -139,6 +139,8 @@ Copy `.env.example` to `.env.local` and edit as needed.
 
 - FotMob expects `date=YYYYMMDD`. ISO `YYYY-MM-DD` returns `null`.
 - Win% is locally computed (simple heuristic + jitter).
+- UI color mode auto-detects truecolor support (`COLORTERM` / `TERM`) and falls back to ANSI-16 when needed.
+- Motion accents are always on; tweak cadence with `UI_ANIMATION_MS` (default `120`, clamped `60..400` ms).
 
 ## Data Sources
 
