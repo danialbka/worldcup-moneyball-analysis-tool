@@ -5798,7 +5798,7 @@ fn resolve_ui_theme() -> UiTheme {
         UiColorMode::Truecolor => UiPalette {
             bg: Color::Rgb(6, 9, 14),
             panel_bg: Color::Rgb(10, 14, 22),
-            focus_bg: Color::Rgb(92, 60, 88),
+            focus_bg: Color::Rgb(255, 197, 211),
             chrome_bg: Color::Rgb(9, 12, 18),
             border: Color::Rgb(46, 58, 78),
             border_dim: Color::Rgb(30, 38, 52),
