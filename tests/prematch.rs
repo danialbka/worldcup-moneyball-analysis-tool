@@ -25,6 +25,7 @@ fn prematch_snapshot_is_frozen_on_kickoff_transition() {
             confidence: 11,
         },
         is_live: false,
+        market_odds: None,
     });
 
     // Kickoff: the live match arrives.
@@ -50,6 +51,7 @@ fn prematch_snapshot_is_frozen_on_kickoff_transition() {
                 confidence: 0,
             },
             is_live: true,
+            market_odds: None,
         }),
     );
 

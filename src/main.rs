@@ -153,6 +153,7 @@ fn spawn_prediction_worker(tx: mpsc::Sender<state::Delta>) -> mpsc::Sender<Predi
                         confidence: 0,
                     },
                     is_live: false,
+                    market_odds: u.market_odds.clone(),
                 };
                 let detail = snapshot.match_detail.get(&u.id);
                 let league_id = summary.league_id.unwrap_or(0);
@@ -627,6 +628,7 @@ impl App {
                 }
                 // Load cache for the newly selected league.
                 persist::load_into_state(&mut self.state);
+                self.sync_odds_context(false);
                 self.request_upcoming(true);
                 if matches!(self.state.screen, Screen::Analysis) {
                     self.request_analysis(true);
@@ -1149,15 +1151,7 @@ impl App {
             return;
         };
 
-        let league_ids: Vec<u32> = match self.state.league_mode {
-            LeagueMode::PremierLeague => self.state.league_pl_ids.clone(),
-            LeagueMode::LaLiga => self.state.league_ll_ids.clone(),
-            LeagueMode::Bundesliga => self.state.league_bl_ids.clone(),
-            LeagueMode::SerieA => self.state.league_sa_ids.clone(),
-            LeagueMode::Ligue1 => self.state.league_l1_ids.clone(),
-            LeagueMode::ChampionsLeague => self.state.league_cl_ids.clone(),
-            LeagueMode::WorldCup => self.state.league_wc_ids.clone(),
-        };
+        let league_ids = self.league_ids_for_current_mode();
         if league_ids.is_empty() {
             return;
         }
@@ -1203,6 +1197,34 @@ impl App {
             }
         } else if announce {
             self.state.push_log("[INFO] Prediction model warm started");
+        }
+    }
+
+    fn league_ids_for_current_mode(&self) -> Vec<u32> {
+        match self.state.league_mode {
+            LeagueMode::PremierLeague => self.state.league_pl_ids.clone(),
+            LeagueMode::LaLiga => self.state.league_ll_ids.clone(),
+            LeagueMode::Bundesliga => self.state.league_bl_ids.clone(),
+            LeagueMode::SerieA => self.state.league_sa_ids.clone(),
+            LeagueMode::Ligue1 => self.state.league_l1_ids.clone(),
+            LeagueMode::ChampionsLeague => self.state.league_cl_ids.clone(),
+            LeagueMode::WorldCup => self.state.league_wc_ids.clone(),
+        }
+    }
+
+    fn sync_odds_context(&mut self, announce: bool) {
+        let Some(tx) = &self.cmd_tx else {
+            return;
+        };
+        let mode = self.state.league_mode;
+        let league_ids = self.league_ids_for_current_mode();
+        if tx
+            .send(state::ProviderCommand::SetOddsContext { mode, league_ids })
+            .is_err()
+        {
+            if announce {
+                self.state.push_log("[WARN] Odds context sync failed");
+            }
         }
     }
 
@@ -1801,6 +1823,7 @@ fn main() -> io::Result<()> {
     // Restore last used league mode (if any), then load its cached data.
     persist::load_last_league_mode(&mut app.state);
     persist::load_into_state(&mut app.state);
+    app.sync_odds_context(false);
     // Keep upcoming fixtures available even while browsing Live.
     app.request_upcoming(false);
     let res = run_app(&mut terminal, &mut app, rx);
@@ -2004,6 +2027,7 @@ fn render_screenshots() -> io::Result<()> {
                 away_team_id: None,
                 home: "Northbridge".to_string(),
                 away: "Southport".to_string(),
+                market_odds: None,
             },
             state::UpcomingMatch {
                 id: "up-2".to_string(),
@@ -2015,6 +2039,7 @@ fn render_screenshots() -> io::Result<()> {
                 away_team_id: None,
                 home: "Kings FC".to_string(),
                 away: "Harbor City".to_string(),
+                market_odds: None,
             },
             state::UpcomingMatch {
                 id: "up-3".to_string(),
@@ -2026,6 +2051,7 @@ fn render_screenshots() -> io::Result<()> {
                 away_team_id: None,
                 home: "Rovers".to_string(),
                 away: "United".to_string(),
+                market_odds: None,
             },
         ];
 
@@ -2842,7 +2868,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn header_styled(state: &AppState, anim: UiAnim) -> Line<'static> {
-    let sep = Span::styled(ui_theme().glyphs.divider, Style::default().fg(theme_border_dim()));
+    let sep = Span::styled(
+        ui_theme().glyphs.divider,
+        Style::default().fg(theme_border_dim()),
+    );
 
     match state.screen {
         Screen::Pulse => {
@@ -2930,7 +2959,10 @@ fn header_styled(state: &AppState, anim: UiAnim) -> Line<'static> {
                     Style::default().fg(theme_text()),
                 ),
                 sep.clone(),
-                Span::styled(format!("FIFA: {updated}"), Style::default().fg(theme_text())),
+                Span::styled(
+                    format!("FIFA: {updated}"),
+                    Style::default().fg(theme_text()),
+                ),
                 sep.clone(),
                 Span::styled(
                     format!("Fetched: {fetched}"),
@@ -2969,7 +3001,10 @@ fn header_styled(state: &AppState, anim: UiAnim) -> Line<'static> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 sep.clone(),
-                Span::styled(format!("Team: {team}"), Style::default().fg(theme_accent_2())),
+                Span::styled(
+                    format!("Team: {team}"),
+                    Style::default().fg(theme_accent_2()),
+                ),
                 sep.clone(),
                 Span::styled(
                     format!("Players: {}", state.squad.len()),
@@ -3621,7 +3656,9 @@ fn render_upcoming_header(frame: &mut Frame, area: Rect, widths: &[Constraint], 
         .fg(theme_accent())
         .bg(theme_chrome_bg())
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(theme_border_dim()).bg(theme_chrome_bg());
+    let sep_style = Style::default()
+        .fg(theme_border_dim())
+        .bg(theme_chrome_bg());
 
     render_cell_text(
         frame,
@@ -3827,7 +3864,10 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState, ani
 
     let role = role_label(state.rankings_role);
     let metric = metric_label(state.rankings_metric);
-    let sep = Span::styled(ui_theme().glyphs.divider, Style::default().fg(theme_border_dim()));
+    let sep = Span::styled(
+        ui_theme().glyphs.divider,
+        Style::default().fg(theme_border_dim()),
+    );
     let mut header_spans = vec![
         Span::styled(
             "Role Rankings",
@@ -3898,10 +3938,16 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState, ani
                 state.rankings_search.clone(),
                 Style::default().fg(theme_accent_2()),
             ),
-            Span::styled(ui_theme().glyphs.caret, Style::default().fg(theme_accent_2())),
+            Span::styled(
+                ui_theme().glyphs.caret,
+                Style::default().fg(theme_accent_2()),
+            ),
         ])
     } else if state.rankings_search.is_empty() {
-        Line::from(Span::styled("Search [/]", Style::default().fg(theme_muted())))
+        Line::from(Span::styled(
+            "Search [/]",
+            Style::default().fg(theme_muted()),
+        ))
     } else {
         Line::from(vec![
             Span::styled("Search [/]: ", Style::default().fg(theme_muted())),
@@ -4037,7 +4083,9 @@ fn render_analysis_rankings(frame: &mut Frame, area: Rect, state: &AppState, ani
             Span::styled("Selected: ", Style::default().fg(theme_muted())),
             Span::styled(
                 truncate(&selected.player_name, 28),
-                Style::default().fg(theme_text()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme_text())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" ({})", truncate(&selected.team_name, 22)),
@@ -4117,7 +4165,9 @@ fn render_analysis_header(frame: &mut Frame, area: Rect, widths: &[Constraint], 
         .fg(theme_accent())
         .bg(theme_chrome_bg())
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(theme_border_dim()).bg(theme_chrome_bg());
+    let sep_style = Style::default()
+        .fg(theme_border_dim())
+        .bg(theme_chrome_bg());
 
     render_cell_text(
         frame,
@@ -4316,7 +4366,9 @@ fn render_squad_header(frame: &mut Frame, area: Rect, widths: &[Constraint], ani
         .fg(theme_accent())
         .bg(theme_chrome_bg())
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(theme_border_dim()).bg(theme_chrome_bg());
+    let sep_style = Style::default()
+        .fg(theme_border_dim())
+        .bg(theme_chrome_bg());
 
     render_cell_text(
         frame,
@@ -4371,7 +4423,7 @@ fn render_player_detail(frame: &mut Frame, area: Rect, app: &mut App, anim: UiAn
             format!("{} Loading player details...", ui_spinner(anim)),
             empty_style,
         ))
-            .style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
+        .style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
         frame.render_widget(text, inner);
         return;
     }
@@ -5867,7 +5919,9 @@ fn detect_ui_color_mode() -> UiColorMode {
     let colorterm = std::env::var("COLORTERM")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    let term = std::env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     detect_ui_color_mode_from_values(&term, &colorterm, no_color)
 }
 
@@ -6489,7 +6543,8 @@ fn render_lineup_side(frame: &mut Frame, area: Rect, side: Option<&state::Lineup
     } else {
         "No lineup".to_string()
     };
-    let paragraph = Paragraph::new(text).style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
+    let paragraph =
+        Paragraph::new(text).style(Style::default().fg(theme_text()).bg(theme_panel_bg()));
     frame.render_widget(paragraph, area);
 }
 
@@ -6738,17 +6793,37 @@ fn prediction_detail_text(state: &AppState) -> String {
         lines.push(String::new());
         lines.push("Explain (pre-match):".to_string());
         lines.push(format!(
-            "Contrib (home win pp): Lineup {:+.1}",
-            ex.explain.pp_lineup
+            "Contrib (home win pp): Lineup {:+.1} Market {:+.1}",
+            ex.explain.pp_lineup, ex.explain.pp_market_blend
         ));
         lines.push(format!(
             "Baseline: H{:.1} D{:.1} A{:.1}",
             ex.explain.p_home_baseline, ex.explain.p_draw_baseline, ex.explain.p_away_baseline
         ));
+        if let (Some(h), Some(d), Some(a)) = (
+            ex.explain.p_home_market,
+            ex.explain.p_draw_market,
+            ex.explain.p_away_market,
+        ) {
+            lines.push(format!("Market:   H{h:.1} D{d:.1} A{a:.1}"));
+        }
+        if let (Some(h), Some(d), Some(a)) = (
+            ex.explain.p_home_blended,
+            ex.explain.p_draw_blended,
+            ex.explain.p_away_blended,
+        ) {
+            lines.push(format!("Blended:  H{h:.1} D{d:.1} A{a:.1}"));
+        }
         lines.push(format!(
             "Final:    H{:.1} D{:.1} A{:.1}",
             ex.explain.p_home_final, ex.explain.p_draw_final, ex.explain.p_away_final
         ));
+        if let Some(w_market) = ex.market_weight_used {
+            let w_model = (1.0_f32 - w_market).clamp(0.0, 1.0);
+            lines.push(format!(
+                "Blend weights: model={w_model:.2} market={w_market:.2}"
+            ));
+        }
 
         lines.push(String::new());
         lines.push(format!(
@@ -6961,9 +7036,14 @@ fn prediction_text(state: &AppState) -> String {
                         } else {
                             ""
                         };
+                        let market = if ex.explain.pp_market_blend.abs() > 0.05 {
+                            format!(" MKT{:+.1}", ex.explain.pp_market_blend)
+                        } else {
+                            String::new()
+                        };
                         out.push_str(&format!(
-                            "\nWhy: ANA{:+.1} LU{:+.1}{}",
-                            ex.explain.pp_analysis, ex.explain.pp_lineup, disc
+                            "\nWhy: ANA{:+.1} LU{:+.1}{}{}",
+                            ex.explain.pp_analysis, ex.explain.pp_lineup, market, disc
                         ));
                     }
                 }
@@ -7207,12 +7287,7 @@ fn render_export_overlay(frame: &mut Frame, area: Rect, state: &AppState, anim: 
     );
 }
 
-fn render_terminal_detail_overlay(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    anim: UiAnim,
-) {
+fn render_terminal_detail_overlay(frame: &mut Frame, area: Rect, state: &AppState, anim: UiAnim) {
     let Some(focus) = state.terminal_detail else {
         return;
     };

@@ -1,10 +1,17 @@
 use std::collections::HashMap;
+use std::env;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::calibration::{self, Prob3};
 use crate::league_params::LeagueParams;
+use crate::pl_dataset::PREMIER_LEAGUE_ID;
+use crate::pl_player_impact;
+use crate::pl_player_impact::TeamImpactFeatures;
 use crate::state::{
-    LineupSide, MatchDetail, MatchSummary, ModelQuality, PlayerDetail, PlayerSlot,
-    PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis, WinProbRow,
-    player_detail_is_stub,
+    LineupSide, MarketOddsSnapshot, MatchDetail, MatchSummary, ModelQuality, PlayerDetail,
+    PlayerSlot, PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis,
+    WinProbRow, player_detail_is_stub,
 };
 
 const GOALS_TOTAL_BASE: f64 = 2.60;
@@ -18,6 +25,17 @@ const FORM_BLEND: f64 = 0.30;
 const DISC_COVERAGE_MIN: f32 = 0.40;
 const K_DISC: f64 = 0.08;
 const DISC_MULT_MAX: f64 = 1.06;
+const DEFAULT_MODEL_WEIGHT: f32 = 0.65;
+const DEFAULT_MARKET_WEIGHT: f32 = 0.35;
+const DEFAULT_ODDS_STALE_TTL_SECS: i64 = 30 * 60;
+
+#[derive(Debug, Clone, Copy)]
+struct MarketBlendConfig {
+    enabled: bool,
+    model_weight: f32,
+    market_weight: f32,
+    stale_ttl_secs: i64,
+}
 
 pub fn compute_win_prob(
     summary: &MatchSummary,
@@ -81,6 +99,8 @@ pub fn compute_win_prob_explainable(
         .unwrap_or(GOALS_TOTAL_BASE);
     let home_adv_goals = league_params.map(|p| p.home_adv_goals).unwrap_or(0.0);
     let dc_rho = league_params.map(|p| p.dc_rho).unwrap_or(-0.10);
+    let prematch_logit_scale = league_params.map(|p| p.prematch_logit_scale).unwrap_or(1.0);
+    let prematch_draw_bias = league_params.map(|p| p.prematch_draw_bias).unwrap_or(0.0);
 
     let lineup = detail.and_then(|d| d.lineups.as_ref());
     let (home_side, away_side): (Option<&LineupSide>, Option<&LineupSide>) =
@@ -165,7 +185,23 @@ pub fn compute_win_prob_explainable(
         (0.0, 0.0, 0.0)
     };
 
-    let diff = K_STRENGTH * (s_home - s_away);
+    let player_impact_home = premier_league_player_impact_side(summary, detail, squads, true);
+    let player_impact_away = premier_league_player_impact_side(summary, detail, squads, false);
+    let player_impact_signal = if summary.league_id == Some(PREMIER_LEAGUE_ID) {
+        match (player_impact_home, player_impact_away) {
+            (Some(h), Some(a)) => pl_player_impact::global_model()
+                .map(|m| m.impact_signal(h, a))
+                .unwrap_or(0.0),
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+
+    let player_impact_cov_home = player_impact_home.map(|v| v.coverage);
+    let player_impact_cov_away = player_impact_away.map(|v| v.coverage);
+
+    let diff = K_STRENGTH * ((s_home - s_away) + player_impact_signal);
     let mut lambda_home_pre = clamp(
         (goals_total_base / 2.0) + (home_adv_goals / 2.0) + (diff / 2.0),
         0.20,
@@ -322,7 +358,7 @@ pub fn compute_win_prob_explainable(
         quality = ModelQuality::Event;
     }
 
-    let (p_home, p_draw, p_away) = if is_prematch {
+    let (mut p_home_prob, mut p_draw_prob, mut p_away_prob) = if is_prematch {
         outcome_probs_poisson_dc(
             summary.score_home as u32,
             summary.score_away as u32,
@@ -341,9 +377,19 @@ pub fn compute_win_prob_explainable(
         )
     };
 
-    let mut p_home = (p_home * 100.0) as f32;
-    let mut p_draw = (p_draw * 100.0) as f32;
-    let mut p_away = (p_away * 100.0) as f32;
+    if is_prematch {
+        (p_home_prob, p_draw_prob, p_away_prob) = apply_prematch_logit_calibration(
+            p_home_prob,
+            p_draw_prob,
+            p_away_prob,
+            prematch_logit_scale,
+            prematch_draw_bias,
+        );
+    }
+
+    let mut p_home = (p_home_prob * 100.0) as f32;
+    let mut p_draw = (p_draw_prob * 100.0) as f32;
+    let mut p_away = (p_away_prob * 100.0) as f32;
 
     // Normalize to exactly 100.0 to keep UI stable.
     let sum = (p_home + p_draw + p_away).max(0.0001);
@@ -353,6 +399,51 @@ pub fn compute_win_prob_explainable(
     // Put any tiny rounding residue into draw (least visually jarring).
     let residue = 100.0 - (p_home + p_draw + p_away);
     p_draw += residue;
+    let p_home_model = p_home;
+    let p_draw_model = p_draw;
+    let p_away_model = p_away;
+
+    let mut market_probs_used: Option<(f32, f32, f32, u8)> = None;
+    let mut market_signal: Option<String> = None;
+    let mut market_weight_used: Option<f32> = None;
+    if is_prematch {
+        let market_cfg = market_blend_config();
+        if market_cfg.enabled {
+            match summary.market_odds.as_ref() {
+                Some(snapshot) => {
+                    if market_snapshot_stale(snapshot, market_cfg.stale_ttl_secs) {
+                        market_signal = Some("MARKET_STALE".to_string());
+                    } else if let Some((m_home, m_draw, m_away)) =
+                        market_implied_probs_percent(snapshot)
+                    {
+                        let w_model = market_cfg.model_weight;
+                        let w_market = market_cfg.market_weight;
+                        p_home = p_home * w_model + m_home * w_market;
+                        p_draw = p_draw * w_model + m_draw * w_market;
+                        p_away = p_away * w_model + m_away * w_market;
+                        let sum = (p_home + p_draw + p_away).max(0.0001);
+                        p_home = p_home / sum * 100.0;
+                        p_draw = p_draw / sum * 100.0;
+                        p_away = p_away / sum * 100.0;
+                        let residue = 100.0 - (p_home + p_draw + p_away);
+                        p_draw += residue;
+                        market_probs_used =
+                            Some((m_home, m_draw, m_away, snapshot.bookmakers_used));
+                        market_weight_used = Some(w_market);
+                        market_signal = Some(format!(
+                            "MARKET_BLEND_{w_market:.2}_BK{}",
+                            snapshot.bookmakers_used
+                        ));
+                    } else {
+                        market_signal = Some("MARKET_INCOMPLETE".to_string());
+                    }
+                }
+                None => {
+                    market_signal = Some("MARKET_UNAVAILABLE".to_string());
+                }
+            }
+        }
+    }
 
     let confidence = if is_prematch {
         compute_confidence_prematch(blend_w_lineup)
@@ -379,8 +470,12 @@ pub fn compute_win_prob_explainable(
             lambda_away_pre,
             lineup_s_home,
             lineup_s_away,
+            player_impact_home,
+            player_impact_away,
             lineup_cov_home,
             lineup_cov_away,
+            player_impact_cov_home,
+            player_impact_cov_away,
             blend_w_lineup,
             disc_home,
             disc_away,
@@ -404,9 +499,25 @@ pub fn compute_win_prob_explainable(
             } else {
                 None
             },
+            p_home_model,
+            p_draw_model,
+            p_away_model,
             win.p_home,
             win.p_draw,
             win.p_away,
+            if is_prematch {
+                Some(prematch_logit_scale)
+            } else {
+                None
+            },
+            if is_prematch {
+                Some(prematch_draw_bias)
+            } else {
+                None
+            },
+            market_probs_used,
+            market_weight_used,
+            market_signal,
         ))
     } else {
         None
@@ -432,6 +543,72 @@ fn compute_confidence_prematch(blend_w_lineup: f32) -> u8 {
     clamp(score, 5.0, 95.0).round() as u8
 }
 
+fn market_blend_config() -> MarketBlendConfig {
+    static CONFIG: OnceLock<MarketBlendConfig> = OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        // Temporarily paused by product request: market odds must not alter model outputs.
+        let enabled = false;
+
+        let model_raw = env::var("ODDS_MODEL_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(DEFAULT_MODEL_WEIGHT)
+            .max(0.0);
+        let market_raw = env::var("ODDS_MARKET_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(DEFAULT_MARKET_WEIGHT)
+            .max(0.0);
+        let sum = (model_raw + market_raw).max(0.0001);
+        let model_weight = (model_raw / sum).clamp(0.0, 1.0);
+        let market_weight = (market_raw / sum).clamp(0.0, 1.0);
+
+        let stale_ttl_secs = env::var("ODDS_STALE_TTL_MIN")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|mins| mins.clamp(1, 24 * 60) * 60)
+            .unwrap_or(DEFAULT_ODDS_STALE_TTL_SECS);
+
+        MarketBlendConfig {
+            enabled,
+            model_weight,
+            market_weight,
+            stale_ttl_secs,
+        }
+    })
+}
+
+fn market_snapshot_stale(snapshot: &MarketOddsSnapshot, stale_ttl_secs: i64) -> bool {
+    if snapshot.stale {
+        return true;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(snapshot.fetched_at_unix);
+    now.saturating_sub(snapshot.fetched_at_unix) > stale_ttl_secs
+}
+
+fn market_implied_probs_percent(snapshot: &MarketOddsSnapshot) -> Option<(f32, f32, f32)> {
+    let mut home = snapshot.implied_home?;
+    let mut draw = snapshot.implied_draw?;
+    let mut away = snapshot.implied_away?;
+    if home <= 0.0 || draw <= 0.0 || away <= 0.0 {
+        return None;
+    }
+    let sum = home + draw + away;
+    if sum <= 0.0 {
+        return None;
+    }
+    home = home / sum * 100.0;
+    draw = draw / sum * 100.0;
+    away = away / sum * 100.0;
+    let residue = 100.0 - (home + draw + away);
+    draw += residue;
+    Some((home, draw, away))
+}
+
 fn build_prematch_extras(
     goals_total_base: f64,
     home_adv_goals: f64,
@@ -440,8 +617,12 @@ fn build_prematch_extras(
     lambda_away_pre: f64,
     s_home_lineup: Option<f64>,
     s_away_lineup: Option<f64>,
+    s_home_player_impact: Option<TeamImpactFeatures>,
+    s_away_player_impact: Option<TeamImpactFeatures>,
     cov_home: Option<f32>,
     cov_away: Option<f32>,
+    player_cov_home: Option<f32>,
+    player_cov_away: Option<f32>,
     blend_w_lineup: f32,
     disc_home: Option<f32>,
     disc_away: Option<f32>,
@@ -449,9 +630,17 @@ fn build_prematch_extras(
     disc_cov_away: Option<f32>,
     disc_mult_home: Option<f32>,
     disc_mult_away: Option<f32>,
+    p_home_model: f32,
+    _p_draw_model: f32,
+    _p_away_model: f32,
     p_home_final: f32,
     p_draw_final: f32,
     p_away_final: f32,
+    prematch_logit_scale: Option<f64>,
+    prematch_draw_bias: Option<f64>,
+    market_probs_used: Option<(f32, f32, f32, u8)>,
+    market_weight_used: Option<f32>,
+    market_signal: Option<String>,
 ) -> PredictionExtras {
     let (p_home_baseline, p_draw_baseline, p_away_baseline) =
         prematch_probs_from_params(goals_total_base, 0.0, 0.0, 0.0, dc_rho);
@@ -479,9 +668,58 @@ fn build_prematch_extras(
             dh, da, n_h, n_a, mh, ma
         ));
     }
+    if let Some(signal) = market_signal {
+        signals.push(signal);
+    }
+    if let (Some(scale), Some(draw_bias)) = (prematch_logit_scale, prematch_draw_bias) {
+        if (scale - 1.0).abs() > 0.01 || draw_bias.abs() > 0.01 {
+            signals.push(format!("CAL_S{:.2}_D{:+.2}", scale, draw_bias));
+        }
+    }
+    if let (Some(h), Some(a), Some(ch), Some(ca)) = (
+        s_home_player_impact,
+        s_away_player_impact,
+        player_cov_home,
+        player_cov_away,
+    ) {
+        let (tag, weight, coeff0) = pl_player_impact::global_model()
+            .map(|m| {
+                if let Some(v2) = m.v2_model() {
+                    (
+                        "V2",
+                        v2.coeffs.len() as i32,
+                        v2.coeffs.first().copied().unwrap_or(0.0),
+                    )
+                } else {
+                    ("V1", 1, m.k_player_impact())
+                }
+            })
+            .unwrap_or(("NA", 0, 0.0));
+        signals.push(format!(
+            "PLAYER_IMPACT_{}_I{:+.2}/{:+.2}_R{:+.2}/{:+.2}_C{:.0}/{:.0}_W{}_K0{:+.2}",
+            tag,
+            h.impact,
+            a.impact,
+            h.rating,
+            a.rating,
+            (ch * 100.0).round(),
+            (ca * 100.0).round(),
+            weight,
+            coeff0
+        ));
+    }
 
     let pp_home_adv = p_home_ha - p_home_baseline;
-    let pp_lineup = p_home_final - p_home_ha;
+    let (p_home_ha_lineup, _, _) = prematch_probs_from_params(
+        goals_total_base,
+        home_adv_goals,
+        s_home_lineup.unwrap_or(0.0),
+        s_away_lineup.unwrap_or(0.0),
+        dc_rho,
+    );
+    let pp_lineup = p_home_ha_lineup - p_home_ha;
+    let pp_player_impact = p_home_model - p_home_ha_lineup;
+    let pp_market_blend = p_home_final - p_home_model;
 
     PredictionExtras {
         prematch_only: true,
@@ -496,9 +734,14 @@ fn build_prematch_extras(
         s_away_elo: None,
         s_home_lineup,
         s_away_lineup,
+        s_home_player_impact: s_home_player_impact.map(|v| v.impact),
+        s_away_player_impact: s_away_player_impact.map(|v| v.impact),
         lineup_coverage_home: cov_home,
         lineup_coverage_away: cov_away,
+        player_impact_cov_home: player_cov_home,
+        player_impact_cov_away: player_cov_away,
         blend_w_lineup,
+        market_weight_used,
         disc_home,
         disc_away,
         disc_cov_home,
@@ -515,15 +758,71 @@ fn build_prematch_extras(
             p_home_analysis: p_home_ha,
             p_draw_analysis: p_draw_ha,
             p_away_analysis: p_away_ha,
+            p_home_market: market_probs_used.map(|(home, _, _, _)| home),
+            p_draw_market: market_probs_used.map(|(_, draw, _, _)| draw),
+            p_away_market: market_probs_used.map(|(_, _, away, _)| away),
+            p_home_blended: market_probs_used.map(|_| p_home_final),
+            p_draw_blended: market_probs_used.map(|_| p_draw_final),
+            p_away_blended: market_probs_used.map(|_| p_away_final),
             p_home_final,
             p_draw_final,
             p_away_final,
             pp_home_adv,
             pp_analysis: 0.0,
             pp_lineup,
+            pp_player_impact,
+            pp_market_blend,
             signals,
         },
     }
+}
+
+fn premier_league_player_impact_side(
+    summary: &MatchSummary,
+    detail: Option<&MatchDetail>,
+    squads: &HashMap<u32, Vec<SquadPlayer>>,
+    home: bool,
+) -> Option<TeamImpactFeatures> {
+    if summary.league_id != Some(PREMIER_LEAGUE_ID) {
+        return None;
+    }
+    let Some(model) = pl_player_impact::global_model() else {
+        return None;
+    };
+
+    let (team_name, team_id) = if home {
+        (summary.home.as_str(), summary.home_team_id)
+    } else {
+        (summary.away.as_str(), summary.away_team_id)
+    };
+
+    if let Some(lineups) = detail.and_then(|d| d.lineups.as_ref()) {
+        let side = if home {
+            lineups.sides.first()
+        } else {
+            lineups.sides.get(1)
+        };
+        if let Some(side) = side {
+            let names = side
+                .starting
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>();
+            if let Some(features) = model.team_features(&side.team, names.iter().copied()) {
+                return Some(features);
+            }
+        }
+    }
+
+    if let Some(id) = team_id
+        && let Some(squad) = squads.get(&id)
+    {
+        let names = squad.iter().map(|p| p.name.as_str()).collect::<Vec<_>>();
+        if let Some(features) = model.team_features(team_name, names.iter().copied()) {
+            return Some(features);
+        }
+    }
+    None
 }
 
 fn prematch_probs_from_params(
@@ -545,6 +844,25 @@ fn prematch_probs_from_params(
         3.80,
     );
     probs_percent_dc(0, 0, lambda_home, lambda_away, 10, dc_rho)
+}
+
+fn apply_prematch_logit_calibration(
+    p_home: f64,
+    p_draw: f64,
+    p_away: f64,
+    logit_scale: f64,
+    draw_bias: f64,
+) -> (f64, f64, f64) {
+    let q = calibration::apply_logit_calibration(
+        Prob3 {
+            home: p_home,
+            draw: p_draw,
+            away: p_away,
+        },
+        logit_scale,
+        draw_bias,
+    );
+    (q.home, q.draw, q.away)
 }
 
 fn probs_percent_dc(
@@ -1747,6 +2065,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: true,
+            market_odds: None,
         };
         let win = compute_win_prob(
             &summary,
@@ -1783,6 +2102,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: true,
+            market_odds: None,
         };
         let win = compute_win_prob(
             &summary,
@@ -1794,6 +2114,83 @@ mod tests {
             None,
         );
         assert!(win.p_home > 95.0);
+    }
+
+    #[test]
+    fn market_odds_blend_moves_prematch_toward_market_when_enabled() {
+        let mut summary = MatchSummary {
+            id: "mkt".to_string(),
+            league_id: Some(47),
+            league_name: "Premier League".to_string(),
+            home_team_id: Some(1),
+            away_team_id: Some(2),
+            home: "LIV".to_string(),
+            away: "MCI".to_string(),
+            minute: 0,
+            score_home: 0,
+            score_away: 0,
+            win: WinProbRow {
+                p_home: 0.0,
+                p_draw: 0.0,
+                p_away: 0.0,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 0,
+            },
+            is_live: false,
+            market_odds: None,
+        };
+        let model_only = compute_win_prob(
+            &summary,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+        );
+
+        summary.market_odds = Some(MarketOddsSnapshot {
+            source: "theoddsapi".to_string(),
+            fetched_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            bookmakers_used: 5,
+            home_decimal: Some(1.60),
+            draw_decimal: Some(4.20),
+            away_decimal: Some(5.20),
+            implied_home: Some(68.0),
+            implied_draw: Some(18.0),
+            implied_away: Some(14.0),
+            stale: false,
+        });
+        let (with_market, extras) = compute_win_prob_explainable(
+            &summary,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+        );
+        let extras = extras.expect("prematch extras");
+
+        if let Some(w_market) = extras.market_weight_used {
+            if w_market > 0.0 {
+                assert!(with_market.p_home > model_only.p_home);
+            }
+            assert!(
+                extras
+                    .explain
+                    .signals
+                    .iter()
+                    .any(|s| s.starts_with("MARKET_BLEND_"))
+            );
+        } else {
+            assert!((with_market.p_home - model_only.p_home).abs() < 0.01);
+        }
     }
 
     #[test]
@@ -1818,6 +2215,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: true,
+            market_odds: None,
         };
 
         let detail = MatchDetail {
@@ -1901,6 +2299,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: false,
+            market_odds: None,
         };
 
         let lineup_home = LineupSide {
@@ -2012,6 +2411,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: false,
+            market_odds: None,
         };
 
         let lineup_home = LineupSide {
@@ -2095,6 +2495,8 @@ mod tests {
             goals_total_base: 2.60,
             home_adv_goals: 0.0,
             dc_rho: -0.10,
+            prematch_logit_scale: 1.0,
+            prematch_draw_bias: 0.0,
         };
         let win = compute_win_prob(
             &summary,
@@ -2131,6 +2533,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: false,
+            market_odds: None,
         };
 
         let lineup_home = LineupSide {
@@ -2252,6 +2655,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: false,
+            market_odds: None,
         };
 
         let lineup_home = LineupSide {
@@ -2360,6 +2764,7 @@ mod tests {
                 confidence: 0,
             },
             is_live: false,
+            market_odds: None,
         };
 
         let analysis = vec![
@@ -2399,8 +2804,11 @@ mod tests {
         assert!((extras.explain.p_away_final - win.p_away).abs() < 0.01);
 
         let total_shift = extras.explain.p_home_final - extras.explain.p_home_baseline;
-        let contrib_sum =
-            extras.explain.pp_home_adv + extras.explain.pp_analysis + extras.explain.pp_lineup;
+        let contrib_sum = extras.explain.pp_home_adv
+            + extras.explain.pp_analysis
+            + extras.explain.pp_lineup
+            + extras.explain.pp_player_impact
+            + extras.explain.pp_market_blend;
         assert!((total_shift - contrib_sum).abs() < 0.05);
 
         // All snapshots should remain normalized.
@@ -2417,5 +2825,98 @@ mod tests {
         assert!((sum_ha - 100.0).abs() < 0.01);
         assert!((sum_analysis - 100.0).abs() < 0.01);
         assert!((sum_final - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn premier_league_player_impact_uses_squad_fallback() {
+        let summary = MatchSummary {
+            id: "m".to_string(),
+            league_id: Some(crate::pl_dataset::PREMIER_LEAGUE_ID),
+            league_name: "Premier League".to_string(),
+            home_team_id: Some(1),
+            away_team_id: Some(2),
+            home: "Home FC".to_string(),
+            away: "Away FC".to_string(),
+            minute: 0,
+            score_home: 0,
+            score_away: 0,
+            win: WinProbRow {
+                p_home: 0.0,
+                p_draw: 0.0,
+                p_away: 0.0,
+                delta_home: 0.0,
+                quality: ModelQuality::Basic,
+                confidence: 0,
+            },
+            is_live: false,
+            market_odds: None,
+        };
+
+        let mut squads: HashMap<u32, Vec<SquadPlayer>> = HashMap::new();
+        squads.insert(
+            1,
+            vec![
+                SquadPlayer {
+                    id: 11,
+                    name: "Player A".to_string(),
+                    role: "F".to_string(),
+                    club: "Home FC".to_string(),
+                    age: None,
+                    height: None,
+                    shirt_number: None,
+                    market_value: None,
+                },
+                SquadPlayer {
+                    id: 12,
+                    name: "Player B".to_string(),
+                    role: "M".to_string(),
+                    club: "Home FC".to_string(),
+                    age: None,
+                    height: None,
+                    shirt_number: None,
+                    market_value: None,
+                },
+            ],
+        );
+        squads.insert(
+            2,
+            vec![
+                SquadPlayer {
+                    id: 21,
+                    name: "Player C".to_string(),
+                    role: "F".to_string(),
+                    club: "Away FC".to_string(),
+                    age: None,
+                    height: None,
+                    shirt_number: None,
+                    market_value: None,
+                },
+                SquadPlayer {
+                    id: 22,
+                    name: "Player D".to_string(),
+                    role: "M".to_string(),
+                    club: "Away FC".to_string(),
+                    age: None,
+                    height: None,
+                    shirt_number: None,
+                    market_value: None,
+                },
+            ],
+        );
+
+        let (_win, extras) =
+            compute_win_prob_explainable(&summary, None, &HashMap::new(), &squads, &[], None, None);
+        let extras = extras.expect("prematch extras");
+        assert!(extras.s_home_player_impact.is_some());
+        assert!(extras.s_away_player_impact.is_some());
+        assert!(extras.player_impact_cov_home.is_some());
+        assert!(extras.player_impact_cov_away.is_some());
+        assert!(
+            extras
+                .explain
+                .signals
+                .iter()
+                .any(|s| s.starts_with("PLAYER_IMPACT_"))
+        );
     }
 }

@@ -18,6 +18,12 @@ rust_xlsxwriter = "0.64"
 rayon = "1.11.0"
 once_cell = "1.21.3"
 rusqlite = { version = "0.37", features = ["bundled"] }
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+parquet = "54"
 
 [dev-dependencies]
 criterion = "0.8.1"

@@ -20,6 +20,12 @@ pub struct PredictionExplain {
     pub p_home_analysis: f32,
     pub p_draw_analysis: f32,
     pub p_away_analysis: f32,
+    pub p_home_market: Option<f32>,
+    pub p_draw_market: Option<f32>,
+    pub p_away_market: Option<f32>,
+    pub p_home_blended: Option<f32>,
+    pub p_draw_blended: Option<f32>,
+    pub p_away_blended: Option<f32>,
     pub p_home_final: f32,
     pub p_draw_final: f32,
     pub p_away_final: f32,
@@ -28,6 +34,8 @@ pub struct PredictionExplain {
     pub pp_home_adv: f32,
     pub pp_analysis: f32,
     pub pp_lineup: f32,
+    pub pp_player_impact: f32,
+    pub pp_market_blend: f32,
 
     // Short tags describing what signals were available (best-effort).
     pub signals: Vec<String>,
@@ -48,9 +56,14 @@ pub struct PredictionExtras {
     pub s_away_elo: Option<f64>,
     pub s_home_lineup: Option<f64>,
     pub s_away_lineup: Option<f64>,
+    pub s_home_player_impact: Option<f64>,
+    pub s_away_player_impact: Option<f64>,
     pub lineup_coverage_home: Option<f32>,
     pub lineup_coverage_away: Option<f32>,
+    pub player_impact_cov_home: Option<f32>,
+    pub player_impact_cov_away: Option<f32>,
     pub blend_w_lineup: f32,
+    pub market_weight_used: Option<f32>,
 
     // Discipline (historical) proxy signal, 0..=100 where higher means more undisciplined.
     pub disc_home: Option<f32>,
@@ -62,6 +75,27 @@ pub struct PredictionExtras {
     pub disc_mult_away: Option<f32>,
 
     pub explain: PredictionExplain,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketOddsSnapshot {
+    pub source: String,
+    pub fetched_at_unix: i64,
+    pub bookmakers_used: u8,
+    #[serde(default)]
+    pub home_decimal: Option<f64>,
+    #[serde(default)]
+    pub draw_decimal: Option<f64>,
+    #[serde(default)]
+    pub away_decimal: Option<f64>,
+    #[serde(default)]
+    pub implied_home: Option<f32>,
+    #[serde(default)]
+    pub implied_draw: Option<f32>,
+    #[serde(default)]
+    pub implied_away: Option<f32>,
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +153,7 @@ pub fn placeholder_match_summary(mode: LeagueMode) -> MatchSummary {
             confidence: 74,
         },
         is_live: true,
+        market_odds: None,
     }
 }
 
@@ -1284,6 +1319,7 @@ pub struct MatchSummary {
     pub score_away: u8,
     pub win: WinProbRow,
     pub is_live: bool,
+    pub market_odds: Option<MarketOddsSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -1325,6 +1361,8 @@ pub struct UpcomingMatch {
     pub away_team_id: Option<u32>,
     pub home: String,
     pub away: String,
+    #[serde(default)]
+    pub market_odds: Option<MarketOddsSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1590,6 +1628,7 @@ pub enum Delta {
     },
     UpsertMatch(MatchSummary),
     SetUpcoming(Vec<UpcomingMatch>),
+    SetMarketOdds(HashMap<String, MarketOddsSnapshot>),
     AddEvent {
         id: String,
         event: Event,
@@ -1657,6 +1696,10 @@ pub enum Delta {
 
 #[derive(Debug, Clone)]
 pub enum ProviderCommand {
+    SetOddsContext {
+        mode: LeagueMode,
+        league_ids: Vec<u32>,
+    },
     FetchMatchDetails {
         fixture_id: String,
     },
@@ -1844,6 +1887,17 @@ pub fn apply_delta(state: &mut AppState, delta: Delta) {
             state.upcoming_cached_at = Some(SystemTime::now());
             // Always reset scroll so new data is immediately visible when the user visits Upcoming.
             state.upcoming_scroll = 0;
+            state.predictions_dirty = true;
+        }
+        Delta::SetMarketOdds(odds_by_id) => {
+            for m in &mut state.matches {
+                m.market_odds = odds_by_id.get(&m.id).cloned();
+            }
+            for u in &mut state.upcoming {
+                u.market_odds = odds_by_id.get(&u.id).cloned();
+            }
+            state.bump_matches_version();
+            state.bump_upcoming_version();
             state.predictions_dirty = true;
         }
         Delta::AddEvent { id, event } => {

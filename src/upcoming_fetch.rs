@@ -327,6 +327,7 @@ fn build_upcoming_from_response(data: FotmobResponse) -> Vec<UpcomingMatch> {
                 away_team_id: (fixture.away.id > 0).then_some(fixture.away.id),
                 home,
                 away,
+                market_odds: None,
             });
         }
     }

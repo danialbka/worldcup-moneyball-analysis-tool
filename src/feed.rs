@@ -13,9 +13,10 @@ use rayon::prelude::*;
 use crate::analysis_fetch;
 use crate::elo::{self, EloConfig};
 use crate::league_params;
+use crate::odds_fetch::{self, OddsFetchConfig, OddsFixtureRef};
 use crate::state::{
-    Delta, Event, EventKind, LineupSide, MatchDetail, MatchLineups, MatchSummary, ModelQuality,
-    PlayerSlot, ProviderCommand, UpcomingMatch, WinProbRow,
+    Delta, Event, EventKind, LeagueMode, LineupSide, MarketOddsSnapshot, MatchDetail, MatchLineups,
+    MatchSummary, ModelQuality, PlayerSlot, ProviderCommand, UpcomingMatch, WinProbRow,
 };
 use crate::team_fixtures;
 use crate::upcoming_fetch::{self, FotmobMatchRow};
@@ -45,6 +46,33 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
         let mut pending_basic_set: HashSet<String> = HashSet::new();
 
         let allowed_league_ids = allowed_league_ids();
+        let odds_cfg = OddsFetchConfig::from_env();
+        let odds_runtime_enabled = odds_cfg.enabled
+            && (odds_cfg.provider == "oddsportal"
+                || (odds_cfg.api_key.is_some() && odds_cfg.provider == "theoddsapi"));
+        let odds_refresh_interval = Duration::from_secs(
+            env::var("ODDS_REFRESH_SECS")
+                .ok()
+                .and_then(|val| val.parse::<u64>().ok())
+                .unwrap_or(120)
+                .clamp(10, 3600),
+        );
+        let mut last_odds_refresh = Instant::now() - odds_refresh_interval;
+        let mut active_odds_mode = LeagueMode::PremierLeague;
+        let mut active_odds_league_ids = league_ids_for_mode(active_odds_mode);
+        let mut odds_by_match_id: HashMap<String, MarketOddsSnapshot> = HashMap::new();
+        let mut upcoming_cache: Vec<UpcomingMatch> = Vec::new();
+
+        if odds_cfg.enabled && !odds_runtime_enabled {
+            let reason = if odds_cfg.provider != "theoddsapi" {
+                format!("unsupported provider '{}'", odds_cfg.provider)
+            } else {
+                "missing ODDS_API_KEY".to_string()
+            };
+            let _ = tx.send(Delta::Log(format!(
+                "[WARN] Odds disabled: {reason} (set ODDS_ENABLED=false to silence)"
+            )));
+        }
 
         let upcoming_source = env::var("UPCOMING_SOURCE")
             .unwrap_or_else(|_| "fotmob".to_string())
@@ -82,7 +110,9 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
         let minute_interval = Duration::from_secs(60);
         let mut matches: Vec<MatchSummary> = Vec::new();
 
-        if let Err(err) = refresh_live_matches(&mut matches, pulse_date.as_deref(), &tx) {
+        if let Err(err) =
+            refresh_live_matches(&mut matches, pulse_date.as_deref(), &tx, &odds_by_match_id)
+        {
             let _ = tx.send(Delta::Log(format!("[WARN] Live fetch error: {err}")));
         }
 
@@ -90,10 +120,49 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
             thread::sleep(Duration::from_millis(900));
 
             if last_live_fetch.elapsed() >= live_interval {
-                if let Err(err) = refresh_live_matches(&mut matches, pulse_date.as_deref(), &tx) {
+                if let Err(err) = refresh_live_matches(
+                    &mut matches,
+                    pulse_date.as_deref(),
+                    &tx,
+                    &odds_by_match_id,
+                ) {
                     let _ = tx.send(Delta::Log(format!("[WARN] Live fetch error: {err}")));
                 }
                 last_live_fetch = Instant::now();
+            }
+
+            if odds_runtime_enabled && last_odds_refresh.elapsed() >= odds_refresh_interval {
+                let fixtures =
+                    collect_odds_fixtures(&matches, &upcoming_cache, &active_odds_league_ids);
+                if fixtures.is_empty() {
+                    if !odds_by_match_id.is_empty() {
+                        odds_by_match_id.clear();
+                        let _ = tx.send(Delta::SetMarketOdds(HashMap::new()));
+                    }
+                } else {
+                    match odds_fetch::fetch_market_odds_for_fixtures(
+                        &fixtures,
+                        active_odds_mode,
+                        &active_odds_league_ids,
+                        &odds_cfg,
+                    ) {
+                        Ok(fetched) => {
+                            if fetched != odds_by_match_id {
+                                odds_by_match_id = fetched.clone();
+                                apply_market_odds_to_matches(&mut matches, &odds_by_match_id);
+                                apply_market_odds_to_upcoming(
+                                    &mut upcoming_cache,
+                                    &odds_by_match_id,
+                                );
+                                let _ = tx.send(Delta::SetMarketOdds(fetched));
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Delta::Log(format!("[WARN] Odds fetch error: {err}")));
+                        }
+                    }
+                }
+                last_odds_refresh = Instant::now();
             }
 
             if last_minute_tick.elapsed() >= minute_interval {
@@ -320,6 +389,9 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                 &allowed_league_ids,
                             ) {
                                 Ok(items) if !items.is_empty() => {
+                                    let mut items = items;
+                                    apply_market_odds_to_upcoming(&mut items, &odds_by_match_id);
+                                    upcoming_cache = items.clone();
                                     let _ = tx.send(Delta::SetUpcoming(items));
                                     fetched = true;
                                 }
@@ -335,6 +407,12 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                             &allowed_league_ids,
                                         ) {
                                             Ok(items) if !items.is_empty() => {
+                                                let mut items = items;
+                                                apply_market_odds_to_upcoming(
+                                                    &mut items,
+                                                    &odds_by_match_id,
+                                                );
+                                                upcoming_cache = items.clone();
                                                 let _ = tx.send(Delta::SetUpcoming(items));
                                                 fetched = true;
                                             }
@@ -356,9 +434,24 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                         }
 
                         if !fetched {
-                            let _ = tx.send(Delta::SetUpcoming(seed_upcoming()));
+                            let mut seeded = seed_upcoming();
+                            apply_market_odds_to_upcoming(&mut seeded, &odds_by_match_id);
+                            upcoming_cache = seeded.clone();
+                            let _ = tx.send(Delta::SetUpcoming(seeded));
                         }
                         last_upcoming = Instant::now();
+                    }
+                    ProviderCommand::SetOddsContext { mode, league_ids } => {
+                        active_odds_mode = mode;
+                        active_odds_league_ids = league_ids.into_iter().collect();
+                        if !odds_by_match_id.is_empty() {
+                            odds_by_match_id.clear();
+                            apply_market_odds_to_matches(&mut matches, &odds_by_match_id);
+                            apply_market_odds_to_upcoming(&mut upcoming_cache, &odds_by_match_id);
+                            let _ = tx.send(Delta::SetMarketOdds(HashMap::new()));
+                        }
+                        // Refresh quickly after a league switch.
+                        last_odds_refresh = Instant::now() - odds_refresh_interval;
                     }
                     ProviderCommand::FetchAnalysis { mode } => {
                         let result = match mode {
@@ -1166,9 +1259,10 @@ fn refresh_live_matches(
     matches: &mut Vec<MatchSummary>,
     date: Option<&str>,
     tx: &Sender<Delta>,
+    odds_by_match_id: &HashMap<String, MarketOddsSnapshot>,
 ) -> anyhow::Result<()> {
     let rows = upcoming_fetch::fetch_matches_from_fotmob(date)?;
-    let updated = merge_fotmob_matches(rows, std::mem::take(matches), tx);
+    let updated = merge_fotmob_matches(rows, std::mem::take(matches), tx, odds_by_match_id);
     *matches = updated;
     let _ = tx.send(Delta::SetMatches(matches.clone()));
     Ok(())
@@ -1178,6 +1272,7 @@ fn merge_fotmob_matches(
     rows: Vec<FotmobMatchRow>,
     existing: Vec<MatchSummary>,
     tx: &Sender<Delta>,
+    odds_by_match_id: &HashMap<String, MarketOddsSnapshot>,
 ) -> Vec<MatchSummary> {
     let mut previous: HashMap<String, MatchSummary> =
         existing.into_iter().map(|m| (m.id.clone(), m)).collect();
@@ -1249,6 +1344,7 @@ fn merge_fotmob_matches(
             score_away: row.away_score,
             win,
             is_live,
+            market_odds: odds_by_match_id.get(&row.id).cloned(),
         });
     }
 
@@ -1344,6 +1440,96 @@ fn extend_ids_env_or_default(out: &mut HashSet<u32>, key: &str, defaults: &[u32]
     }
 }
 
+fn league_ids_for_mode(mode: LeagueMode) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    match mode {
+        LeagueMode::PremierLeague => {
+            extend_ids_env_or_default(&mut ids, "APP_LEAGUE_PREMIER_IDS", &[47])
+        }
+        LeagueMode::LaLiga => extend_ids_env_or_default(&mut ids, "APP_LEAGUE_LALIGA_IDS", &[87]),
+        LeagueMode::Bundesliga => {
+            extend_ids_env_or_default(&mut ids, "APP_LEAGUE_BUNDESLIGA_IDS", &[54])
+        }
+        LeagueMode::SerieA => extend_ids_env_or_default(&mut ids, "APP_LEAGUE_SERIE_A_IDS", &[55]),
+        LeagueMode::Ligue1 => extend_ids_env_or_default(&mut ids, "APP_LEAGUE_LIGUE1_IDS", &[53]),
+        LeagueMode::ChampionsLeague => {
+            extend_ids_env_or_default(&mut ids, "APP_LEAGUE_CHAMPIONS_LEAGUE_IDS", &[42])
+        }
+        LeagueMode::WorldCup => {
+            extend_ids_env_or_default(&mut ids, "APP_LEAGUE_WORLDCUP_IDS", &[77])
+        }
+    }
+    ids
+}
+
+fn collect_odds_fixtures(
+    matches: &[MatchSummary],
+    upcoming: &[UpcomingMatch],
+    active_league_ids: &HashSet<u32>,
+) -> Vec<OddsFixtureRef> {
+    let mut out: HashMap<String, OddsFixtureRef> = HashMap::new();
+
+    for u in upcoming {
+        if !active_league_ids.is_empty()
+            && u.league_id
+                .map(|id| !active_league_ids.contains(&id))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        out.insert(
+            u.id.clone(),
+            OddsFixtureRef {
+                id: u.id.clone(),
+                league_id: u.league_id,
+                home: u.home.clone(),
+                away: u.away.clone(),
+                kickoff: Some(u.kickoff.clone()),
+            },
+        );
+    }
+
+    for m in matches {
+        if m.is_live || m.minute > 0 {
+            continue;
+        }
+        if !active_league_ids.is_empty()
+            && m.league_id
+                .map(|id| !active_league_ids.contains(&id))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        out.entry(m.id.clone()).or_insert_with(|| OddsFixtureRef {
+            id: m.id.clone(),
+            league_id: m.league_id,
+            home: m.home.clone(),
+            away: m.away.clone(),
+            kickoff: None,
+        });
+    }
+
+    out.into_values().collect()
+}
+
+fn apply_market_odds_to_matches(
+    matches: &mut [MatchSummary],
+    odds_by_match_id: &HashMap<String, MarketOddsSnapshot>,
+) {
+    for m in matches {
+        m.market_odds = odds_by_match_id.get(&m.id).cloned();
+    }
+}
+
+fn apply_market_odds_to_upcoming(
+    upcoming: &mut [UpcomingMatch],
+    odds_by_match_id: &HashMap<String, MarketOddsSnapshot>,
+) {
+    for u in upcoming {
+        u.market_odds = odds_by_match_id.get(&u.id).cloned();
+    }
+}
+
 fn upcoming_dates(base_date: Option<&str>, days: usize) -> Vec<String> {
     let base = parse_date(base_date).unwrap_or_else(|| Utc::now().date_naive());
     let total = days.max(1);
@@ -1395,6 +1581,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "ARS".to_string(),
             away: "CHE".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-pl-2".to_string(),
@@ -1406,6 +1593,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "MCI".to_string(),
             away: "LIV".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-ll-1".to_string(),
@@ -1417,6 +1605,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "RMA".to_string(),
             away: "BAR".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-ll-2".to_string(),
@@ -1428,6 +1617,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "ATM".to_string(),
             away: "SEV".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-bl-1".to_string(),
@@ -1439,6 +1629,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "BAY".to_string(),
             away: "DOR".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-bl-2".to_string(),
@@ -1450,6 +1641,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "RBL".to_string(),
             away: "LEV".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-sa-1".to_string(),
@@ -1461,6 +1653,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "JUV".to_string(),
             away: "INT".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-sa-2".to_string(),
@@ -1472,6 +1665,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "ACM".to_string(),
             away: "NAP".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-l1-1".to_string(),
@@ -1483,6 +1677,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "PSG".to_string(),
             away: "MAR".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-l1-2".to_string(),
@@ -1494,6 +1689,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "LYO".to_string(),
             away: "MON".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-cl-1".to_string(),
@@ -1505,6 +1701,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "RMA".to_string(),
             away: "MCI".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-cl-2".to_string(),
@@ -1516,6 +1713,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "BAR".to_string(),
             away: "BAY".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-wc-1".to_string(),
@@ -1527,6 +1725,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "USA".to_string(),
             away: "CAN".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "upc-wc-2".to_string(),
@@ -1538,6 +1737,7 @@ fn seed_upcoming() -> Vec<UpcomingMatch> {
             away_team_id: None,
             home: "MEX".to_string(),
             away: "BRA".to_string(),
+            market_odds: None,
         },
     ]
 }

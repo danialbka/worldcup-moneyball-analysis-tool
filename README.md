@@ -21,6 +21,11 @@ Bloomberg-style football terminal in the terminal. Pulse shows live match probab
 - Ingest PL history to SQLite: `cargo run --bin pl_ingest`
 - Backtest PL pre-match model: `cargo run --bin pl_backtest`
 - Backtest + apply fitted PL params to cache: `cargo run --bin pl_backtest -- --apply`
+- Override apply gate (not recommended): `cargo run --bin pl_backtest -- --apply --force-apply`
+- Tune calibration weighting: `cargo run --bin pl_backtest -- --cal-half-life-matches=1200 --cal-season-decay=0.90 --min-val-gain=0.0005`
+- Sweep calibration configs: `cargo run --bin pl_backtest -- --sweep --sweep-top=10`
+- Sweep with custom grids: `cargo run --bin pl_backtest -- --sweep --sweep-half-lives=600,900,1200,1600,2400,3200 --sweep-season-decays=0.85,0.90,0.95,1.00`
+- One-time fit PL player-impact v2 artifact from Baselight: `cargo run --bin pl_fit_player_impact`
 
 ### Notes
 
@@ -134,11 +139,18 @@ Copy `.env.example` to `.env.local` and edit as needed.
 - `UPCOMING_WINDOW_DAYS`: Number of days to fetch (1-14). Use 7 for a full weekend slate.
 - `DETAILS_POLL_SECS`: Auto-refresh interval for match details (lineups/events/stats) when live.
 - `AUTO_WARM_CACHE`: `off`, `missing`, or `full` to prefetch squads + player details in the background.
+- `ODDS_ENABLED`: Enable market-odds ingestion and pre-match blending.
+- `ODDS_PROVIDER`: Odds provider key (`theoddsapi`).
+- `ODDS_API_KEY`: API key for The Odds API.
+- `ODDS_MODEL_WEIGHT` / `ODDS_MARKET_WEIGHT`: Blend weights (auto-normalized to sum to 1).
+- `ODDS_STALE_TTL_MIN`: Max age of odds snapshot before fallback to model-only.
+- `ODDS_REFRESH_SECS`: Odds refresh interval.
+- `ODDS_MATCH_TIME_TOLERANCE_MIN`: Kickoff matching tolerance when mapping odds events to fixtures.
 
 ### Configuration Notes
 
 - FotMob expects `date=YYYYMMDD`. ISO `YYYY-MM-DD` returns `null`.
-- Win% is locally computed (simple heuristic + jitter).
+- Win% is locally computed from pre-match priors + live match signals; optional market odds can blend into pre-match probabilities.
 - UI color mode auto-detects truecolor support (`COLORTERM` / `TERM`) and falls back to ANSI-16 when needed.
 - Motion accents are always on; tweak cadence with `UI_ANIMATION_MS` (default `120`, clamped `60..400` ms).
 
@@ -152,6 +164,14 @@ Live + upcoming:
 Detailed (manual wiring if needed later):
 
 - `https://www.fotmob.com/api/data/matchDetails?matchId=...`
+
+Optional odds (if enabled):
+
+- `https://api.the-odds-api.com/v4/sports/{sport}/odds`
+
+One-time calibration source (Premier League player impact):
+
+- `https://baselight.app/u/blt/dataset/ultimate_soccer_dataset`
 
 ## Troubleshooting
 

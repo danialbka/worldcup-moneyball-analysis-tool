@@ -17,6 +17,7 @@ fn pulse_rows_dedup_upcoming_ids() {
             away_team_id: None,
             home: "H".to_string(),
             away: "A".to_string(),
+            market_odds: None,
         },
         UpcomingMatch {
             id: "u1".to_string(),
@@ -28,6 +29,7 @@ fn pulse_rows_dedup_upcoming_ids() {
             away_team_id: None,
             home: "H".to_string(),
             away: "A".to_string(),
+            market_odds: None,
         },
     ];
 
@@ -55,6 +57,7 @@ fn selected_match_id_returns_upcoming_id_in_pulse_live_rows() {
         away_team_id: None,
         home: "LIV".to_string(),
         away: "MCI".to_string(),
+        market_odds: None,
     }];
 
     // With no matches, pulse_live_rows() will consist solely of upcoming rows.

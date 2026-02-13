@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
             confidence: 0,
         },
         is_live: case.is_live,
+        market_odds: None,
     };
 
     // This binary is intentionally simple: it loads one snapshot and prints the model output.
