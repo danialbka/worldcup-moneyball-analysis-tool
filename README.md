@@ -2,6 +2,16 @@
 
 Bloomberg-style football terminal in the terminal. Pulse shows live match probabilities; Terminal view drills into a single match.
 
+## Terminal Screenshots
+
+### Build / Run Output
+
+![WC26 terminal build output](docs/screenshots/terminal-build-output.png)
+
+### Test Output
+
+![WC26 terminal test output](docs/screenshots/terminal-test-output.png)
+
 ## Repo Guide (WC26 Terminal)
 
 ### Entry points
@@ -29,7 +39,7 @@ Bloomberg-style football terminal in the terminal. Pulse shows live match probab
 
 ### Notes
 
-- Generated artifacts (XLSX exports, `target/`, screenshots, cache files) should stay out of the repo.
+- Generated artifacts (XLSX exports, `target/`, ad-hoc cache files) should stay out of the repo.
 
 ## Installation
 
