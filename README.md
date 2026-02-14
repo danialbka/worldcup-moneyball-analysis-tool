@@ -110,9 +110,10 @@ The application provides a terminal-based interface with multiple views:
 
 **Global Controls:**
 - `1`: Switch to Pulse view
+- `2` / `a`: Switch to Analysis view
 - `Enter` / `d`: Open Terminal view (for selected live match, triggers match details)
 - `b` / `Esc`: Go back to previous view
-- `l`: Toggle league mode (Premier League / World Cup)
+- `l`: Cycle league mode (Premier League, La Liga, Bundesliga, Serie A, Ligue 1, Champions League, World Cup)
 - `u`: Toggle Upcoming view and fetch matchday list
 - `i`: Fetch match details (lineups/events/stats)
 - `e`: Export analysis XLSX (from Analysis screen, current league)
@@ -129,7 +130,7 @@ The application provides a terminal-based interface with multiple views:
 2. Press `1` to view the Pulse screen with live matches
 3. Use `j/k` or arrow keys to navigate through matches
 4. Press `Enter` or `d` to view detailed match information
-5. Press `l` to switch between Premier League, La Liga, and World Cup leagues
+5. Press `l` to cycle between Premier League, La Liga, Bundesliga, Serie A, Ligue 1, Champions League, and World Cup
 6. Press `u` to view upcoming matches
 7. Press `?` anytime to see available keyboard shortcuts
 8. Press `q` to quit
@@ -140,18 +141,31 @@ Copy `.env.example` to `.env.local` and edit as needed.
 
 ### Key Configuration Variables
 
-- `APP_LEAGUE_PREMIER_IDS` / `APP_LEAGUE_LALIGA_IDS` / `APP_LEAGUE_WORLDCUP_IDS`: League filters (FotMob IDs: 47 = PL, 87 = La Liga, 77 = World Cup).
+- `APP_LEAGUE_PREMIER_IDS` / `APP_LEAGUE_LALIGA_IDS` / `APP_LEAGUE_BUNDESLIGA_IDS` / `APP_LEAGUE_SERIE_A_IDS` / `APP_LEAGUE_LIGUE1_IDS` / `APP_LEAGUE_CHAMPIONS_LEAGUE_IDS` / `APP_LEAGUE_WORLDCUP_IDS`: League filters (default FotMob IDs: 47, 87, 54, 55, 53, 42, 77).
 - `PULSE_POLL_SECS`: Live match refresh interval (seconds).
 - `PULSE_DATE`: Optional matchday override (YYYYMMDD). Empty uses FotMob default (today).
 - `UPCOMING_SOURCE`: `fotmob` or `auto` (same behavior right now).
 - `UPCOMING_POLL_SECS`: Minimum seconds between manual upcoming fetches.
 - `UPCOMING_DATE`: Optional matchday override (YYYYMMDD) for upcoming list.
 - `UPCOMING_WINDOW_DAYS`: Number of days to fetch (1-14). Use 7 for a full weekend slate.
+- `UPCOMING_EXPAND_DAYS`: Fallback day expansion when no fixtures are returned.
+- `UPCOMING_CACHE_SECS`: Upcoming cache freshness window before re-fetch.
 - `DETAILS_POLL_SECS`: Auto-refresh interval for match details (lineups/events/stats) when live.
+- `COMMENTARY_POLL_SECS`: Auto-refresh interval for commentary/ticker while live.
+- `DETAILS_THROTTLE_SECS`: Minimum spacing between detail requests for the same match.
+- `DETAILS_CACHE_SECS`: Match detail cache TTL.
+- `PREFETCH_MATCH_DETAILS_MS`: Hover delay before background detail prefetch.
+- `PREFETCH_PLAYERS`: Max players preloaded when opening squad/player flows.
 - `AUTO_WARM_CACHE`: `off`, `missing`, or `full` to prefetch squads + player details in the background.
+- `AUTO_WARM_PREDICTION_MODEL`: Enable/disable automatic league model warm-up.
+- `PRED_MODEL_WARM_TTL_SECS`: Minimum age before re-warming prediction model by league.
+- `ANALYSIS_THROTTLE_SECS`: Request throttle for analysis fetches.
+- `RANKINGS_RECOMPUTE_MS` / `RANKINGS_RECOMPUTE_MIN_UPDATES`: Debounce controls for rankings recompute.
+- `PREDICTIONS_RECOMPUTE_MS`: Debounce control for win/prematch recompute.
 - `ODDS_ENABLED`: Enable market-odds ingestion and pre-match blending.
-- `ODDS_PROVIDER`: Odds provider key (`theoddsapi`).
-- `ODDS_API_KEY`: API key for The Odds API.
+- `ODDS_PROVIDER`: Odds provider (`oddsportal` or `theoddsapi`).
+- `ODDS_API_KEY`: API key for The Odds API (required only for `theoddsapi`).
+- `ODDS_REGIONS`: Regions passed to The Odds API.
 - `ODDS_MODEL_WEIGHT` / `ODDS_MARKET_WEIGHT`: Blend weights (auto-normalized to sum to 1).
 - `ODDS_STALE_TTL_MIN`: Max age of odds snapshot before fallback to model-only.
 - `ODDS_REFRESH_SECS`: Odds refresh interval.
@@ -178,6 +192,7 @@ Detailed (manual wiring if needed later):
 Optional odds (if enabled):
 
 - `https://api.the-odds-api.com/v4/sports/{sport}/odds`
+- `https://www.oddsportal.com`
 
 One-time calibration source (Premier League player impact):
 
