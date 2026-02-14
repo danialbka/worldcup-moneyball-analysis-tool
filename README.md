@@ -4,13 +4,13 @@ Bloomberg-style football terminal in the terminal. Pulse shows live match probab
 
 ## Terminal Screenshots
 
-### Build / Run Output
+### Pulse View (Live)
 
-![WC26 terminal build output](docs/screenshots/terminal-build-output.png)
+![WC26 Pulse view](docs/screenshots/tui-pulse-live.png)
 
-### Test Output
+### Terminal View (Match List)
 
-![WC26 terminal test output](docs/screenshots/terminal-test-output.png)
+![WC26 Terminal view](docs/screenshots/tui-terminal-matchlist.png)
 
 ## Repo Guide (WC26 Terminal)
 
