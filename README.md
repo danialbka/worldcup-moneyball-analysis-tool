@@ -12,6 +12,14 @@ Bloomberg-style football terminal in the terminal. Pulse shows live match probab
 
 ![WC26 Terminal view](docs/screenshots/tui-terminal-matchlist.png)
 
+### Team Analysis
+
+![WC26 Team analysis](docs/screenshots/tui-analysis-teams.png)
+
+### Individual Rankings
+
+![WC26 Individual rankings](docs/screenshots/tui-analysis-rankings.png)
+
 ## Repo Guide (WC26 Terminal)
 
 ### Entry points
