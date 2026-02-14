@@ -36,6 +36,10 @@ Bloomberg-style football terminal in the terminal. Pulse shows live match probab
 - Format: `cargo fmt --all`
 - Check: `cargo check`
 - Tests: `cargo test`
+- Ingest historical matches for configured leagues: `cargo run --bin hist_ingest`
+- Fit multi-league player-impact registry artifact: `cargo run --bin fit_player_impact`
+- Backtest multi-league pre-match model: `cargo run --bin multi_backtest`
+- Backtest + apply fitted multi-league params to cache: `cargo run --bin multi_backtest -- --apply`
 - Ingest PL history to SQLite: `cargo run --bin pl_ingest`
 - Backtest PL pre-match model: `cargo run --bin pl_backtest`
 - Backtest + apply fitted PL params to cache: `cargo run --bin pl_backtest -- --apply`
@@ -170,6 +174,10 @@ Copy `.env.example` to `.env.local` and edit as needed.
 - `ANALYSIS_THROTTLE_SECS`: Request throttle for analysis fetches.
 - `RANKINGS_RECOMPUTE_MS` / `RANKINGS_RECOMPUTE_MIN_UPDATES`: Debounce controls for rankings recompute.
 - `PREDICTIONS_RECOMPUTE_MS`: Debounce control for win/prematch recompute.
+- `HIST_DB_PATH`: Optional override path for historical fixtures SQLite used by warm/backtest/fallback jobs.
+- `PLAYER_IMPACT_ARTIFACT_PATH`: Optional override path for player-impact registry artifact.
+- `PLAYER_IMPACT_MIN_LEAGUE_SAMPLES`: Minimum per-player sample threshold used in fitting.
+- `PLAYER_IMPACT_USE_SHARED_PRIOR`: Enable shared-prior fallback across leagues when league-specific coverage is sparse.
 - `ODDS_ENABLED`: Enable market-odds ingestion and pre-match blending.
 - `ODDS_PROVIDER`: Odds provider (`oddsportal` or `theoddsapi`).
 - `ODDS_API_KEY`: API key for The Odds API (required only for `theoddsapi`).

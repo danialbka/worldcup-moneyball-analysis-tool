@@ -5,9 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::calibration::{self, Prob3};
 use crate::league_params::LeagueParams;
-use crate::pl_dataset::PREMIER_LEAGUE_ID;
-use crate::pl_player_impact;
-use crate::pl_player_impact::TeamImpactFeatures;
+use crate::player_impact;
+use crate::player_impact::TeamImpactFeatures;
 use crate::state::{
     LineupSide, MarketOddsSnapshot, MatchDetail, MatchSummary, ModelQuality, PlayerDetail,
     PlayerSlot, PredictionExplain, PredictionExtras, RoleCategory, SquadPlayer, TeamAnalysis,
@@ -185,17 +184,13 @@ pub fn compute_win_prob_explainable(
         (0.0, 0.0, 0.0)
     };
 
-    let player_impact_home = premier_league_player_impact_side(summary, detail, squads, true);
-    let player_impact_away = premier_league_player_impact_side(summary, detail, squads, false);
-    let player_impact_signal = if summary.league_id == Some(PREMIER_LEAGUE_ID) {
-        match (player_impact_home, player_impact_away) {
-            (Some(h), Some(a)) => pl_player_impact::global_model()
-                .map(|m| m.impact_signal(h, a))
-                .unwrap_or(0.0),
-            _ => 0.0,
-        }
-    } else {
-        0.0
+    let player_impact_home = league_player_impact_side(summary, detail, squads, true);
+    let player_impact_away = league_player_impact_side(summary, detail, squads, false);
+    let player_impact_signal = match (player_impact_home, player_impact_away) {
+        (Some(h), Some(a)) => player_impact::global_registry()
+            .map(|r| r.impact_signal_for_league(summary.league_id, h, a))
+            .unwrap_or(0.0),
+        _ => 0.0,
     };
 
     let player_impact_cov_home = player_impact_home.map(|v| v.coverage);
@@ -463,6 +458,7 @@ pub fn compute_win_prob_explainable(
     let extras = if is_prematch {
         let have_disc = disc_home.is_some() && disc_away.is_some();
         Some(build_prematch_extras(
+            summary.league_id,
             goals_total_base,
             home_adv_goals,
             dc_rho,
@@ -610,6 +606,7 @@ fn market_implied_probs_percent(snapshot: &MarketOddsSnapshot) -> Option<(f32, f
 }
 
 fn build_prematch_extras(
+    league_id: Option<u32>,
     goals_total_base: f64,
     home_adv_goals: f64,
     dc_rho: f64,
@@ -682,18 +679,8 @@ fn build_prematch_extras(
         player_cov_home,
         player_cov_away,
     ) {
-        let (tag, weight, coeff0) = pl_player_impact::global_model()
-            .map(|m| {
-                if let Some(v2) = m.v2_model() {
-                    (
-                        "V2",
-                        v2.coeffs.len() as i32,
-                        v2.coeffs.first().copied().unwrap_or(0.0),
-                    )
-                } else {
-                    ("V1", 1, m.k_player_impact())
-                }
-            })
+        let (tag, weight, coeff0) = player_impact::global_registry()
+            .map(|r| r.model_debug_tag(league_id))
             .unwrap_or(("NA", 0, 0.0));
         signals.push(format!(
             "PLAYER_IMPACT_{}_I{:+.2}/{:+.2}_R{:+.2}/{:+.2}_C{:.0}/{:.0}_W{}_K0{:+.2}",
@@ -777,16 +764,13 @@ fn build_prematch_extras(
     }
 }
 
-fn premier_league_player_impact_side(
+fn league_player_impact_side(
     summary: &MatchSummary,
     detail: Option<&MatchDetail>,
     squads: &HashMap<u32, Vec<SquadPlayer>>,
     home: bool,
 ) -> Option<TeamImpactFeatures> {
-    if summary.league_id != Some(PREMIER_LEAGUE_ID) {
-        return None;
-    }
-    let Some(model) = pl_player_impact::global_model() else {
+    let Some(registry) = player_impact::global_registry() else {
         return None;
     };
 
@@ -808,7 +792,11 @@ fn premier_league_player_impact_side(
                 .iter()
                 .map(|p| p.name.as_str())
                 .collect::<Vec<_>>();
-            if let Some(features) = model.team_features(&side.team, names.iter().copied()) {
+            if let Some(features) = registry.team_features_for_league(
+                summary.league_id,
+                &side.team,
+                names.iter().copied(),
+            ) {
                 return Some(features);
             }
         }
@@ -818,7 +806,9 @@ fn premier_league_player_impact_side(
         && let Some(squad) = squads.get(&id)
     {
         let names = squad.iter().map(|p| p.name.as_str()).collect::<Vec<_>>();
-        if let Some(features) = model.team_features(team_name, names.iter().copied()) {
+        if let Some(features) =
+            registry.team_features_for_league(summary.league_id, team_name, names.iter().copied())
+        {
             return Some(features);
         }
     }

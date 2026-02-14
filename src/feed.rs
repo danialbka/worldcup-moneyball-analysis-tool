@@ -12,6 +12,7 @@ use rayon::prelude::*;
 
 use crate::analysis_fetch;
 use crate::elo::{self, EloConfig};
+use crate::historical_dataset;
 use crate::league_params;
 use crate::odds_fetch::{self, OddsFetchConfig, OddsFixtureRef};
 use crate::state::{
@@ -1017,34 +1018,102 @@ pub fn spawn_provider(tx: Sender<Delta>, cmd_rx: Receiver<ProviderCommand>) {
                                 max_pages
                             )));
 
-                            let fixtures = std::sync::Mutex::new(Vec::new());
-                            let errors = std::sync::Mutex::new(Vec::new());
-                            let pool = build_fetch_pool();
+                            let mut all = Vec::new();
+                            let mut missing_leagues: std::collections::HashSet<u32> =
+                                league_ids.iter().copied().collect();
 
-                            with_fetch_pool(&pool, || {
-                                team_ids.par_iter().for_each(|team_id| {
-                                    match team_fixtures::collect_team_fixtures(
-                                        *team_id, max_pages, false,
-                                    ) {
-                                        Ok(mut rows) => {
-                                            let mut guard =
-                                                fixtures.lock().unwrap_or_else(|e| e.into_inner());
-                                            guard.append(&mut rows);
-                                        }
-                                        Err(err) => {
-                                            let mut guard =
-                                                errors.lock().unwrap_or_else(|e| e.into_inner());
-                                            guard.push(format!("team {team_id} fixtures: {err}"));
+                            let hist_db_path = env::var("HIST_DB_PATH")
+                                .ok()
+                                .map(std::path::PathBuf::from)
+                                .or_else(historical_dataset::default_db_path);
+                            if let Some(path) = hist_db_path {
+                                match historical_dataset::open_db(&path) {
+                                    Ok(conn) => {
+                                        for league_id in &league_ids {
+                                            match historical_dataset::load_finished_matches(
+                                                &conn, *league_id,
+                                            ) {
+                                                Ok(rows) => {
+                                                    let mut count = 0usize;
+                                                    for row in rows {
+                                                        if let Some(fx) = row.as_fixture_match() {
+                                                            all.push(fx);
+                                                            count += 1;
+                                                        }
+                                                    }
+                                                    if count > 0 {
+                                                        missing_leagues.remove(league_id);
+                                                        let _ = tx.send(Delta::Log(format!(
+                                                            "[INFO] Warm model: loaded {} historical fixtures for league {} from {}",
+                                                            count,
+                                                            league_id,
+                                                            path.display()
+                                                        )));
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    let _ = tx.send(Delta::Log(format!(
+                                                        "[WARN] Warm model: historical load failed league {}: {}",
+                                                        league_id, err
+                                                    )));
+                                                }
+                                            }
                                         }
                                     }
-                                })
-                            });
-
-                            for err in errors.into_inner().unwrap_or_default() {
-                                let _ = tx.send(Delta::Log(format!("[WARN] Warm model: {err}")));
+                                    Err(err) => {
+                                        let _ = tx.send(Delta::Log(format!(
+                                            "[WARN] Warm model: unable to open historical DB {}: {}",
+                                            path.display(),
+                                            err
+                                        )));
+                                    }
+                                }
                             }
 
-                            let mut all = fixtures.into_inner().unwrap_or_default();
+                            if !missing_leagues.is_empty() {
+                                let fixtures = std::sync::Mutex::new(Vec::new());
+                                let errors = std::sync::Mutex::new(Vec::new());
+                                let pool = build_fetch_pool();
+
+                                with_fetch_pool(&pool, || {
+                                    team_ids.par_iter().for_each(|team_id| {
+                                        match team_fixtures::collect_team_fixtures(
+                                            *team_id, max_pages, false,
+                                        ) {
+                                            Ok(mut rows) => {
+                                                let mut guard = fixtures
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                guard.append(&mut rows);
+                                            }
+                                            Err(err) => {
+                                                let mut guard = errors
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                guard.push(format!(
+                                                    "team {team_id} fixtures: {err}"
+                                                ));
+                                            }
+                                        }
+                                    })
+                                });
+
+                                for err in errors.into_inner().unwrap_or_default() {
+                                    let _ =
+                                        tx.send(Delta::Log(format!("[WARN] Warm model: {err}")));
+                                }
+
+                                let mut scraped = fixtures.into_inner().unwrap_or_default();
+                                if !scraped.is_empty() {
+                                    let _ = tx.send(Delta::Log(format!(
+                                        "[INFO] Warm model: scraped {} fallback fixtures for missing leagues {:?}",
+                                        scraped.len(),
+                                        missing_leagues
+                                    )));
+                                    all.append(&mut scraped);
+                                }
+                            }
+
                             all.sort_by_key(|m| m.id);
                             all.dedup_by_key(|m| m.id);
 
